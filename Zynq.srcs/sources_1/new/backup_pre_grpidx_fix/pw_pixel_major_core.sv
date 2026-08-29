@@ -1,0 +1,800 @@
+`timescale 1ns/1ps
+
+module pw_pixel_major_core #(
+  parameter int DATA_WIDTH      = 8,
+  parameter int ACC_WIDTH       = 32,
+  parameter int CIN_MAX         = 240,
+  parameter int COUT_MAX        = 240,
+  parameter int N_LANES         = 8,
+  parameter int N_OC            = 5
+)(
+  input  logic                              clk,
+  input  logic                              rst_n,
+
+  input  logic                              start_in,
+  output logic                              done_out,
+
+  input  logic [31:0]                       tile_pixels,
+  input  logic [11:0]                       cin_run,
+  input  logic [11:0]                       cout_run,    // total output channels
+
+  input  logic [7:0]                        zp_in,
+  input  logic [7:0]                        zp_out,
+  input  logic                              relu_en,
+
+  // Weight BRAM read interface (all N_OC banks, 1-cycle latency)
+  output logic [$clog2((COUT_MAX/N_OC)*CIN_MAX)-1:0] w_rd_addr,
+  output logic                              w_rd_en,
+  input  logic signed [DATA_WIDTH-1:0]      w_rd_data  [0:N_OC-1],
+
+  // Param BRAM read interface (bias/mult/shift, 1-cycle latency)
+  output logic [$clog2(COUT_MAX)-1:0]       param_rd_addr,
+  output logic                              param_rd_en,
+  input  logic signed [31:0]                param_bias_data,
+  input  logic [31:0]                       param_mult_data,
+  input  logic [7:0]                        param_shift_data,
+
+  // Pixel input from input FIFO
+  input  logic                              valid_in,
+  input  logic [N_LANES*DATA_WIDTH-1:0]     pixel_in,
+  output logic                              consume_in,
+
+  // Pixel output to output FIFO
+  output logic [N_LANES*DATA_WIDTH-1:0]     pixel_out,
+  output logic                              valid_out,
+
+  // Backpressure from output FIFO
+  input  logic                              out_stall
+);
+
+  // ------------------------------------------------------------
+  // Constants
+  // ------------------------------------------------------------
+  localparam int LANE_SHIFT   = $clog2(N_LANES);
+  localparam int W_DEPTH      = (COUT_MAX / N_OC) * CIN_MAX;
+  localparam int W_AW         = (W_DEPTH <= 1) ? 1 : $clog2(W_DEPTH);
+  localparam int PB_AW        = (CIN_MAX <= 1) ? 1 : $clog2(CIN_MAX);
+  localparam int PARAM_AW     = (COUT_MAX <= 1) ? 1 : $clog2(COUT_MAX);
+  localparam int PB_WIDTH     = N_LANES * DATA_WIDTH;
+
+  // Registered at start — removes division from critical path
+  logic [31:0] tile_groups_r;
+  logic [11:0] cout_batches_r;
+  logic [7:0]  zp_in_r;
+  logic [7:0]  zp_out_r;
+  logic        relu_en_r;
+  // Per-lane replicated zp_in copies — each drives only N_OC DSP pre-adders
+  // (not max_fanout attribute which Vivado may ignore on arrays; explicit replication is guaranteed)
+  (* dont_touch = "true" *) logic [7:0] zp_in_lane [0:N_LANES-1];
+  generate
+    for (genvar g = 0; g < N_LANES; g++) begin : G_ZP_REPLICATE
+      always_ff @(posedge clk or negedge rst_n)
+        if (!rst_n) zp_in_lane[g] <= '0;
+        else if (start_in) zp_in_lane[g] <= zp_in;
+    end
+  endgenerate
+
+  // ------------------------------------------------------------
+  // FSM types
+  // ------------------------------------------------------------
+  // Main FSM
+  typedef enum logic [2:0] {
+    S_IDLE       = 3'd0,
+    S_LOAD_FIRST = 3'd1,   // load very first pixel group into buffer A
+    S_COMPUTE    = 3'd2,   // MAC accumulation (Cin cycles per batch)
+    S_BATCH_DONE = 3'd3,   // batch complete — trigger PPU, setup next
+    S_WAIT_PPU   = 3'd4,   // wait for last PPU drain + group transition
+    S_DONE       = 3'd5
+  } state_t;
+  state_t st;
+
+  // PPU background sub-FSM
+  typedef enum logic [1:0] {
+    P_IDLE       = 2'd0,
+    P_PARAM_WAIT = 2'd1,   // 1-cycle wait for param BRAM read latency
+    P_DRAIN      = 2'd2    // feed shadow_acc to PPU, count outputs
+  } ppu_st_t;
+  ppu_st_t ppu_st;
+
+  // Load background sub-FSM
+  typedef enum logic [1:0] {
+    L_IDLE    = 2'd0,
+    L_LOADING = 2'd1,      // loading next group from input FIFO
+    L_READY   = 2'd2       // next group fully loaded
+  } load_st_t;
+  load_st_t load_st;
+
+  // ------------------------------------------------------------
+  // Double Pixel Buffer BRAMs (A and B)
+  //   Compute reads from active buffer (compute_buf)
+  //   Load writes to inactive buffer (!compute_buf)
+  // ------------------------------------------------------------
+  logic compute_buf;   // 0 = buffer A active, 1 = buffer B active
+
+  // Buffer A ports
+  logic [PB_AW-1:0]   pb_a_wr_addr, pb_a_rd_addr;
+  logic                pb_a_wr_en,   pb_a_rd_en;
+  logic [PB_WIDTH-1:0] pb_a_wr_data, pb_a_rd_data;
+
+  // Buffer B ports
+  logic [PB_AW-1:0]   pb_b_wr_addr, pb_b_rd_addr;
+  logic                pb_b_wr_en,   pb_b_rd_en;
+  logic [PB_WIDTH-1:0] pb_b_wr_data, pb_b_rd_data;
+
+  xpm_memory_sdpram #(
+    .ADDR_WIDTH_A        (PB_AW),
+    .ADDR_WIDTH_B        (PB_AW),
+    .AUTO_SLEEP_TIME     (0),
+    .BYTE_WRITE_WIDTH_A  (PB_WIDTH),
+    .CLOCKING_MODE       ("common_clock"),
+    .ECC_MODE            ("no_ecc"),
+    .MEMORY_INIT_FILE    ("none"),
+    .MEMORY_INIT_PARAM   ("0"),
+    .MEMORY_OPTIMIZATION ("true"),
+    .MEMORY_PRIMITIVE    ("auto"),
+    .MEMORY_SIZE         (CIN_MAX * PB_WIDTH),
+    .MESSAGE_CONTROL     (0),
+    .READ_DATA_WIDTH_B   (PB_WIDTH),
+    .READ_LATENCY_B      (1),
+    .READ_RESET_VALUE_B  ("0"),
+    .RST_MODE_A          ("SYNC"),
+    .RST_MODE_B          ("SYNC"),
+    .SIM_ASSERT_CHK      (0),
+    .USE_MEM_INIT        (0),
+    .WAKEUP_TIME         ("disable_sleep"),
+    .WRITE_DATA_WIDTH_A  (PB_WIDTH),
+    .WRITE_MODE_B        ("read_first")
+  ) u_pixel_buf_a (
+    .clka  (clk), .ena (1'b1), .wea (pb_a_wr_en),
+    .addra (pb_a_wr_addr), .dina (pb_a_wr_data),
+    .injectsbiterra(1'b0), .injectdbiterra(1'b0),
+    .clkb  (clk), .enb (pb_a_rd_en), .rstb (1'b0), .regceb (1'b1),
+    .addrb (pb_a_rd_addr), .doutb (pb_a_rd_data),
+    .sbiterrb(), .dbiterrb(), .sleep(1'b0)
+  );
+
+  xpm_memory_sdpram #(
+    .ADDR_WIDTH_A        (PB_AW),
+    .ADDR_WIDTH_B        (PB_AW),
+    .AUTO_SLEEP_TIME     (0),
+    .BYTE_WRITE_WIDTH_A  (PB_WIDTH),
+    .CLOCKING_MODE       ("common_clock"),
+    .ECC_MODE            ("no_ecc"),
+    .MEMORY_INIT_FILE    ("none"),
+    .MEMORY_INIT_PARAM   ("0"),
+    .MEMORY_OPTIMIZATION ("true"),
+    .MEMORY_PRIMITIVE    ("auto"),
+    .MEMORY_SIZE         (CIN_MAX * PB_WIDTH),
+    .MESSAGE_CONTROL     (0),
+    .READ_DATA_WIDTH_B   (PB_WIDTH),
+    .READ_LATENCY_B      (1),
+    .READ_RESET_VALUE_B  ("0"),
+    .RST_MODE_A          ("SYNC"),
+    .RST_MODE_B          ("SYNC"),
+    .SIM_ASSERT_CHK      (0),
+    .USE_MEM_INIT        (0),
+    .WAKEUP_TIME         ("disable_sleep"),
+    .WRITE_DATA_WIDTH_A  (PB_WIDTH),
+    .WRITE_MODE_B        ("read_first")
+  ) u_pixel_buf_b (
+    .clka  (clk), .ena (1'b1), .wea (pb_b_wr_en),
+    .addra (pb_b_wr_addr), .dina (pb_b_wr_data),
+    .injectsbiterra(1'b0), .injectdbiterra(1'b0),
+    .clkb  (clk), .enb (pb_b_rd_en), .rstb (1'b0), .regceb (1'b1),
+    .addrb (pb_b_rd_addr), .doutb (pb_b_rd_data),
+    .sbiterrb(), .dbiterrb(), .sleep(1'b0)
+  );
+
+  // Compute-side read data mux: select active buffer
+  wire [PB_WIDTH-1:0] pb_rd_data = compute_buf ? pb_b_rd_data : pb_a_rd_data;
+
+  // ------------------------------------------------------------
+  // Accumulators: N_OC × N_LANES
+  // shadow_acc replaced by BRAM to eliminate 10,240 FFs
+  // ------------------------------------------------------------
+  logic signed [ACC_WIDTH-1:0] acc [0:N_OC-1][0:N_LANES-1];
+
+  // Shadow BRAM: depth=N_OC, width=N_LANES*ACC_WIDTH
+  localparam int SA_DEPTH = (N_OC > 1) ? N_OC : 2;
+  localparam int SA_AW    = $clog2(SA_DEPTH);
+  localparam int SA_DW    = N_LANES * ACC_WIDTH;
+
+  logic [SA_AW-1:0]  sha_wr_addr;
+  logic [SA_DW-1:0]  sha_wr_data;
+  logic              sha_wr_en;
+  logic [SA_AW-1:0]  sha_rd_addr;
+  logic              sha_rd_en;
+  logic [SA_DW-1:0]  sha_rd_data;
+
+  // Combinationally pack acc[shadow_copy_idx] into sha_wr_data
+  logic [SA_AW-1:0]  shadow_copy_idx;
+  logic              shadow_copying;
+  logic              shadow_copy_trig;  // 1-cycle pulse from main FSM -> shadow block
+
+  genvar _g;
+  generate
+    for (_g = 0; _g < N_LANES; _g++) begin : G_SHA_PACK
+      assign sha_wr_data[_g*ACC_WIDTH +: ACC_WIDTH] = acc[shadow_copy_idx][_g];
+    end
+  endgenerate
+
+  xpm_memory_sdpram #(
+    .ADDR_WIDTH_A        (SA_AW),
+    .ADDR_WIDTH_B        (SA_AW),
+    .AUTO_SLEEP_TIME     (0),
+    .BYTE_WRITE_WIDTH_A  (SA_DW),
+    .CLOCKING_MODE       ("common_clock"),
+    .ECC_MODE            ("no_ecc"),
+    .MEMORY_INIT_FILE    ("none"),
+    .MEMORY_INIT_PARAM   ("0"),
+    .MEMORY_OPTIMIZATION ("true"),
+    .MEMORY_PRIMITIVE    ("block"),
+    .MEMORY_SIZE         (SA_DEPTH * SA_DW),
+    .MESSAGE_CONTROL     (0),
+    .READ_DATA_WIDTH_B   (SA_DW),
+    .READ_LATENCY_B      (1),
+    .READ_RESET_VALUE_B  ("0"),
+    .RST_MODE_A          ("SYNC"),
+    .RST_MODE_B          ("SYNC"),
+    .SIM_ASSERT_CHK      (0),
+    .USE_MEM_INIT        (0),
+    .WAKEUP_TIME         ("disable_sleep"),
+    .WRITE_DATA_WIDTH_A  (SA_DW),
+    .WRITE_MODE_B        ("no_change")
+  ) u_shadow_bram (
+    .clka  (clk), .ena (1'b1), .wea (sha_wr_en),
+    .addra (sha_wr_addr), .dina (sha_wr_data),
+    .injectsbiterra(1'b0), .injectdbiterra(1'b0),
+    .clkb  (clk), .enb (sha_rd_en), .rstb (1'b0), .regceb (1'b1),
+    .addrb (sha_rd_addr), .doutb (sha_rd_data),
+    .sbiterrb(), .dbiterrb(), .sleep(1'b0)
+  );
+
+  // ------------------------------------------------------------
+  // ------------------------------------------------------------
+  // MAC pipeline (4-stage: BRAM read → pixel reg → multiply reg → accumulate)
+  //   Stage 1: BRAM read issue
+  //   Stage 2: Register BRAM output (pb_pixel_r and w_rd_data_r)
+  //   Stage 3: subtract + multiply → prod_reg
+  //   Stage 4: accumulate from prod_reg
+  // ------------------------------------------------------------
+  logic signed [DATA_WIDTH-1:0] w_rd_data_r   [0:N_OC-1]; // Fixes 1-cycle weight alignment bug
+  logic signed [DATA_WIDTH-1:0] w_rd_data_rr  [0:N_OC-1]; // stage-2.5 registered weights for DSP path
+  logic signed [24:0]           a_packed_r    [0:(N_LANES/2)-1]; // stage-2.5 registered packed activations
+  logic signed [32:0] p_packed_reg [0:N_OC-1][0:(N_LANES/2)-1]; // Dual-MAC packed product register
+  logic                         mul_valid;  // p_packed_reg contains valid data
+  logic [DATA_WIDTH-1:0]        pb_pixel_r [0:N_LANES-1];  // registered BRAM output (raw)
+  logic                         rd_issued_d1;  // delayed rd_issued (BRAM data registered)
+  logic                         rd_issued_d2;  // delayed rd_issued_d1 (a_packed_r valid)
+
+  // Unpack pixel buffer read data into per-lane values (combinational, used for registration)
+  logic [DATA_WIDTH-1:0] pb_pixel [0:N_LANES-1];
+  generate
+    for (genvar g = 0; g < N_LANES; g++) begin : G_PB_UNPACK
+      assign pb_pixel[g] = pb_rd_data[g*DATA_WIDTH +: DATA_WIDTH];
+    end
+  endgenerate
+
+  // Dual-MAC Combinational Packing
+  logic signed [9:0]  act1_adj [0:(N_LANES/2)-1];
+  logic signed [24:0] a_packed [0:(N_LANES/2)-1];
+  logic signed [32:0] p_packed_comb [0:N_OC-1][0:(N_LANES/2)-1];
+  logic signed [8:0]  act_diff [0:N_LANES-1];
+
+  always_comb begin
+    for (int i = 0; i < N_LANES; i++) begin
+      act_diff[i] = $signed({1'b0, pb_pixel_r[i]}) - $signed({1'b0, zp_in_lane[i]});
+    end
+    for (int p = 0; p < N_LANES/2; p++) begin
+      act1_adj[p] = $signed(act_diff[p*2 + 1]) - $signed({1'b0, act_diff[p*2][8]});
+      a_packed[p] = $signed({act1_adj[p][8:0], {7{act_diff[p*2][8]}}, act_diff[p*2]});
+    end
+    for (int oc = 0; oc < N_OC; oc++) begin
+      for (int p = 0; p < N_LANES/2; p++) begin
+        // Use stage-2.5 registered operands so the multiply sees clean flip-flop inputs
+        // and Vivado maps it to a DSP48 P-register rather than fabric CARRY4 chains.
+        p_packed_comb[oc][p] = a_packed_r[p] * w_rd_data_rr[oc];
+      end
+    end
+  end
+
+  // Generate block to map each element to a dedicated DSP multiplier/register
+  generate
+    for (genvar oc = 0; oc < N_OC; oc++) begin : G_DSP_OC
+      for (genvar p = 0; p < N_LANES/2; p++) begin : G_DSP_P
+        (* use_dsp = "yes" *) logic signed [32:0] p_reg;
+        always_ff @(posedge clk) begin
+          if (rd_issued_d2) begin
+            p_reg <= p_packed_comb[oc][p];
+          end
+        end
+        assign p_packed_reg[oc][p] = p_reg;
+      end
+    end
+  endgenerate
+
+  // ------------------------------------------------------------
+  // N_LANES PPUs (reused across OCs sequentially)
+  // ------------------------------------------------------------
+  logic                              ppu_valid_in;
+  logic signed [ACC_WIDTH-1:0]       ppu_acc_in    [0:N_LANES-1];
+  logic [DATA_WIDTH-1:0]             ppu_pixel_out [0:N_LANES-1];
+  logic [N_LANES-1:0]                ppu_valid_out_vec;
+
+  // PPU params (latched from param BRAM)
+  logic signed [31:0] ppu_bias_q;
+  logic [23:0]        ppu_mult_q;  // 24-bit: INT8 mult always fits, saves DSPs
+  logic [7:0]         ppu_shift_q;
+
+  generate
+    for (genvar g = 0; g < N_LANES; g++) begin : G_PPU
+      ppu #(.DATA_WIDTH(DATA_WIDTH), .ACC_WIDTH(ACC_WIDTH)) u_ppu (
+        .clk(clk), .rst_n(rst_n),
+        .relu_en(relu_en_r),
+        .mult_conv(ppu_mult_q), .shift_conv(ppu_shift_q), .bias_in(ppu_bias_q),
+        .zp_out(zp_out_r),
+        .valid_in(ppu_valid_in), .conv_acc_in(ppu_acc_in[g]),
+        .pixel_out(ppu_pixel_out[g]), .valid_out(ppu_valid_out_vec[g])
+      );
+    end
+  endgenerate
+
+  wire ppu_valid_out = ppu_valid_out_vec[0];
+
+  // Pack PPU output into pixel_out bus
+  generate
+    for (genvar g = 0; g < N_LANES; g++) begin : G_PX_OUT
+      assign pixel_out[g*DATA_WIDTH +: DATA_WIDTH] = ppu_pixel_out[g];
+    end
+  endgenerate
+  assign valid_out = ppu_valid_out;
+
+  // ------------------------------------------------------------
+  // Counters
+  // ------------------------------------------------------------
+  // Main FSM
+  logic [31:0]                        grp_idx;
+  logic [$clog2(CIN_MAX)-1:0]        ic_idx;
+  logic [11:0]                        oc_batch_idx;
+  logic [W_AW-1:0]                    w_addr_base;
+  logic                               rd_issued;
+  logic                               first_ic;
+  // mul_valid is declared above with prod_reg
+
+  // Load sub-FSM
+  logic [$clog2(CIN_MAX)-1:0]        load_ic_idx;
+  logic                               next_grp_ready;
+
+  // PPU sub-FSM
+  logic [$clog2(N_OC>1?N_OC:2)-1:0]  ppu_issue_idx;
+  logic [31:0]                        ppu_out_cnt;
+  logic [11:0]                        ppu_oc_batch;  // which OC batch PPU is draining
+
+  // ------------------------------------------------------------
+  // Main Controller
+  //   Three concurrent processes in one always_ff:
+  //   1. Main FSM (compute scheduling)
+  //   2. Load sub-FSM (background pixel preload)
+  //   3. PPU sub-FSM (background accumulator drain)
+  // ------------------------------------------------------------
+  integer li, oci;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      st            <= S_IDLE;
+      done_out      <= 1'b0;
+      consume_in    <= 1'b0;
+      grp_idx       <= 32'd0;
+      ic_idx        <= '0;
+      oc_batch_idx  <= 12'd0;
+      w_addr_base   <= '0;
+      w_rd_addr     <= '0;
+      w_rd_en       <= 1'b0;
+      rd_issued     <= 1'b0;
+      rd_issued_d1  <= 1'b0;
+      rd_issued_d2  <= 1'b0;
+      mul_valid     <= 1'b0;
+      first_ic      <= 1'b1;
+      // Removed datapath array resets to fix high-fanout recovery violations
+      compute_buf     <= 1'b0;
+      load_st         <= L_IDLE;
+      load_ic_idx     <= '0;
+      next_grp_ready  <= 1'b0;
+      ppu_st          <= P_IDLE;
+      ppu_valid_in    <= 1'b0;
+      ppu_issue_idx   <= '0;
+      ppu_out_cnt     <= 32'd0;
+      ppu_oc_batch    <= 12'd0;
+      param_rd_addr   <= '0;
+      param_rd_en     <= 1'b0;
+      // ppu_bias_q / ppu_mult_q / ppu_shift_q intentionally omitted from async reset.
+      // They are always loaded from BRAM in P_PARAM_WAIT before ppu_valid_in fires,
+      // so their value at reset time is irrelevant. Including them drove the CLR pin
+      // of e.g. ppu_mult_q_reg[11] via a 9.2 ns routed path (fo=35270 reset net),
+      // causing a Recovery violation identical to the one already fixed above.
+      // shadow_copying/shadow_copy_idx/sha_wr_en: synchronous reset (separate block)
+      shadow_copy_trig <= 1'b0;
+      sha_rd_en       <= 1'b0;
+      pb_a_wr_en <= 1'b0; pb_a_wr_addr <= '0; pb_a_wr_data <= '0;
+      pb_a_rd_en <= 1'b0; pb_a_rd_addr <= '0;
+      pb_b_wr_en <= 1'b0; pb_b_wr_addr <= '0; pb_b_wr_data <= '0;
+      pb_b_rd_en <= 1'b0; pb_b_rd_addr <= '0;
+    end else begin
+      // Default deasserts (active-high pulses cleared every cycle)
+      done_out     <= 1'b0;
+      consume_in   <= 1'b0;
+      w_rd_en      <= 1'b0;
+      ppu_valid_in <= 1'b0;
+      param_rd_en  <= 1'b0;
+      pb_a_wr_en   <= 1'b0;
+      pb_b_wr_en   <= 1'b0;
+      pb_a_rd_en   <= 1'b0;
+      pb_b_rd_en   <= 1'b0;
+      sha_rd_en        <= 1'b0;
+      shadow_copy_trig <= 1'b0;  // default deassert; set in S_COMPUTE when batch done
+
+      // ========================================================
+      // [1] MAIN FSM
+      // ========================================================
+      case (st)
+
+        // --------------------------------------------------------
+        // S_IDLE: wait for start
+        // --------------------------------------------------------
+        S_IDLE: begin
+          if (start_in) begin
+            // Latch derived constants (removes division from critical path)
+            tile_groups_r  <= tile_pixels >> LANE_SHIFT;
+            cout_batches_r <= cout_run / N_OC;
+            zp_in_r        <= zp_in;
+            zp_out_r       <= zp_out;
+            relu_en_r      <= relu_en;
+            grp_idx        <= 32'd0;
+            ic_idx         <= '0;
+            oc_batch_idx   <= 12'd0;
+            w_addr_base    <= '0;
+            rd_issued      <= 1'b0;
+            first_ic       <= 1'b1;
+            compute_buf    <= 1'b0;
+            load_st        <= L_IDLE;
+            ppu_st         <= P_IDLE;
+            next_grp_ready <= 1'b0;
+            ppu_out_cnt    <= 32'd0;
+            if ((tile_pixels == 0) || (cin_run == 0) || (cout_run == 0))
+              st <= S_DONE;
+            else
+              st <= S_LOAD_FIRST;
+          end
+        end
+
+        // --------------------------------------------------------
+        // S_LOAD_FIRST: load very first pixel group into buffer A
+        //   (no compute to overlap with yet)
+        // --------------------------------------------------------
+        S_LOAD_FIRST: begin
+          if (valid_in) begin
+            consume_in   <= 1'b1;
+            pb_a_wr_en   <= 1'b1;
+            pb_a_wr_addr <= ic_idx[PB_AW-1:0];
+            pb_a_wr_data <= pixel_in;
+
+            if (($unsigned(ic_idx) + 1) == cin_run) begin
+              // First group loaded — setup compute
+              ic_idx       <= '0;
+              oc_batch_idx <= 12'd0;
+              w_addr_base  <= '0;
+              rd_issued    <= 1'b0;
+              first_ic     <= 1'b1;
+              compute_buf  <= 1'b0;  // compute reads buffer A
+              // acc clear NOT needed: first_ic=1 makes S_COMPUTE
+              // use '0 on the first valid MAC (line 457)
+              // Start background preload of group 1 into buffer B
+              if ((grp_idx + 1) < tile_groups_r) begin
+                load_st        <= L_LOADING;
+                load_ic_idx    <= '0;
+                next_grp_ready <= 1'b0;
+              end
+              st <= S_COMPUTE;
+            end else begin
+              ic_idx <= ic_idx + 1'b1;
+            end
+          end
+        end
+
+        // --------------------------------------------------------
+        // S_COMPUTE: MAC accumulation for current OC batch
+        //   Cin cycles reading pixel buffer + weight BRAM
+        //   Load sub-FSM and PPU sub-FSM run concurrently
+        // --------------------------------------------------------
+        S_COMPUTE: begin
+          // Pipeline stage 4: accumulate from registered multiply output
+          if (mul_valid) begin
+            for (oci = 0; oci < N_OC; oci++) begin
+              for (int p = 0; p < N_LANES/2; p++) begin
+                acc[oci][p*2]     <= (first_ic ? '0 : acc[oci][p*2])     + $signed(p_packed_reg[oci][p][15:0]);
+                acc[oci][p*2 + 1] <= (first_ic ? '0 : acc[oci][p*2 + 1]) + $signed(p_packed_reg[oci][p][32:16]);
+              end
+            end
+            first_ic <= 1'b0;
+          end
+
+          // Pipeline stage 3: multiply (now in DSP48) and register result.
+          // Triggered one cycle later than before (rd_issued_d2) because the new
+          // stage 2.5 below captures a_packed_r/w_rd_data_rr first.
+          if (rd_issued_d2) begin
+            mul_valid <= 1'b1;
+          end else begin
+            mul_valid <= 1'b0;
+          end
+
+          // Pipeline stage 2.5: register packed activations and weights.
+          // Breaks the timing-critical path: previously a_packed (from
+          // pb_pixel_r and zp_in_lane via two 9-bit subtracts + packing)
+          // fed the multiply in the same cycle, causing 17 logic levels
+          // and -2.7 ns slack. Now only registered signals enter the DSP48.
+          rd_issued_d2 <= rd_issued_d1;
+
+          // Pipeline stage 2: register BRAM output (data arrived from read)
+          rd_issued_d1 <= rd_issued;
+
+          // Pipeline stage 1: issue BRAM reads
+          if ($unsigned(ic_idx) < cin_run) begin
+            // Read from active compute buffer
+            if (!compute_buf) begin
+              pb_a_rd_en   <= 1'b1;
+              pb_a_rd_addr <= ic_idx[PB_AW-1:0];
+            end else begin
+              pb_b_rd_en   <= 1'b1;
+              pb_b_rd_addr <= ic_idx[PB_AW-1:0];
+            end
+            w_rd_en    <= 1'b1;
+            w_rd_addr  <= w_addr_base + ic_idx;
+            rd_issued  <= 1'b1;
+            ic_idx     <= ic_idx + 1'b1;
+          end else begin
+            rd_issued <= 1'b0;
+            if (!rd_issued && !rd_issued_d1 && !rd_issued_d2 && !mul_valid) begin
+              if (ppu_st == P_IDLE) begin
+                // Trigger shadow block to copy acc -> shadow BRAM
+                shadow_copy_trig <= 1'b1;
+                st <= S_BATCH_DONE;
+              end
+            end
+          end
+        end
+
+        // --------------------------------------------------------
+        // S_BATCH_DONE: trigger PPU drain + decide next step
+        //   Waits for previous PPU drain to complete (if still busy)
+        // --------------------------------------------------------
+        S_BATCH_DONE: begin
+          if (ppu_st == P_IDLE) begin
+            // Previous PPU drain (if any) is complete — safe to trigger new one
+            // Issue first param BRAM read for this batch
+            ppu_st        <= P_PARAM_WAIT;
+            ppu_oc_batch  <= oc_batch_idx;
+            ppu_issue_idx <= '0;
+            ppu_out_cnt   <= 32'd0;
+            param_rd_en   <= 1'b1;
+            param_rd_addr <= oc_batch_idx * N_OC;
+
+            if (($unsigned(oc_batch_idx) + 1) < cout_batches_r) begin
+              // Not the last batch — start next batch immediately
+              oc_batch_idx <= oc_batch_idx + 12'd1;
+              w_addr_base  <= w_addr_base + cin_run;
+              ic_idx       <= '0;
+              rd_issued    <= 1'b0;
+              first_ic     <= 1'b1;
+              // acc clear NOT needed: first_ic handles it
+              st <= S_COMPUTE;
+            end else begin
+              // Last batch of this group — wait for PPU to finish
+              st <= S_WAIT_PPU;
+            end
+          end
+          // else: PPU still busy from previous batch — wait here
+        end
+
+        // --------------------------------------------------------
+        // S_WAIT_PPU: wait for last batch's PPU drain, then
+        //   either swap buffers for next group or finish
+        // --------------------------------------------------------
+        S_WAIT_PPU: begin
+          if (ppu_st == P_IDLE) begin
+            // Last batch's PPU drain is complete
+            grp_idx <= grp_idx + 32'd1;
+            if ((grp_idx + 1) >= tile_groups_r) begin
+              // All groups done
+              st <= S_DONE;
+            end else if (next_grp_ready) begin
+              // Next group is preloaded — swap buffers and continue
+              compute_buf  <= !compute_buf;
+              oc_batch_idx <= 12'd0;
+              w_addr_base  <= '0;
+              ic_idx       <= '0;
+              rd_issued    <= 1'b0;
+              first_ic     <= 1'b1;
+              // acc clear NOT needed: first_ic handles it
+              // Start preloading next-next group (if any)
+              next_grp_ready <= 1'b0;
+              if ((grp_idx + 2) < tile_groups_r) begin
+                load_st     <= L_LOADING;
+                load_ic_idx <= '0;
+              end else begin
+                load_st <= L_IDLE;
+              end
+              st <= S_COMPUTE;
+            end
+            // else: next group not ready yet (rare) — stay here
+          end
+        end
+
+        // --------------------------------------------------------
+        // S_DONE: pulse done
+        // --------------------------------------------------------
+        S_DONE: begin
+          done_out <= 1'b1;
+          st       <= S_IDLE;
+        end
+
+        default: st <= S_IDLE;
+      endcase
+
+      // ========================================================
+      // [2] LOAD SUB-FSM (runs concurrently with main FSM)
+      //   Preloads next pixel group into inactive buffer
+      //   Only active during S_COMPUTE / S_BATCH_DONE / S_WAIT_PPU
+      // ========================================================
+      case (load_st)
+        L_IDLE:  begin end  // nothing to do
+        L_LOADING: begin
+          if (valid_in) begin
+            consume_in <= 1'b1;
+            // Write to inactive buffer (opposite of compute_buf)
+            if (compute_buf) begin
+              // Compute reads B → load writes A
+              pb_a_wr_en   <= 1'b1;
+              pb_a_wr_addr <= load_ic_idx[PB_AW-1:0];
+              pb_a_wr_data <= pixel_in;
+            end else begin
+              // Compute reads A → load writes B
+              pb_b_wr_en   <= 1'b1;
+              pb_b_wr_addr <= load_ic_idx[PB_AW-1:0];
+              pb_b_wr_data <= pixel_in;
+            end
+
+            if (($unsigned(load_ic_idx) + 1) == cin_run) begin
+              next_grp_ready <= 1'b1;
+              load_st        <= L_READY;
+            end else begin
+              load_ic_idx <= load_ic_idx + 1'b1;
+            end
+          end
+        end
+        L_READY: begin end  // hold until main FSM resets us
+        default: load_st <= L_IDLE;
+      endcase
+
+      // ========================================================
+      // [3] PPU SUB-FSM (runs concurrently with main FSM)
+      //   Drains shadow_acc through PPU instances in background
+      //   Triggered from S_BATCH_DONE, runs during S_COMPUTE
+      // ========================================================
+      case (ppu_st)
+        P_IDLE: begin end  // waiting for trigger
+
+        // 1-cycle wait for param BRAM read latency
+        // Also issue shadow BRAM pre-read for OC 0 (data arrives 1st cycle of P_DRAIN)
+        P_PARAM_WAIT: begin
+          ppu_bias_q  <= param_bias_data;
+          ppu_mult_q  <= param_mult_data[23:0];  // upper 8b ignored (INT8 quant fits in 24b)
+          ppu_shift_q <= param_shift_data;
+          // Pre-read OC 1 params
+          if (1 < N_OC) begin
+            param_rd_en   <= 1'b1;
+            param_rd_addr <= ppu_oc_batch * N_OC + 1;
+          end
+          // Pre-read shadow BRAM OC 0 (1-cycle BRAM latency → data ready at P_DRAIN cycle 0)
+          sha_rd_en   <= 1'b1;
+          sha_rd_addr <= '0;
+          ppu_st <= P_DRAIN;
+        end
+
+        // Feed shadow BRAM accumulators to PPU, one OC per cycle
+        P_DRAIN: begin
+          if (!out_stall) begin
+            if ($unsigned(ppu_issue_idx) < N_OC) begin
+              ppu_valid_in <= 1'b1;
+              // Unpack sha_rd_data (arrived from pre-read issued previous cycle)
+              for (li = 0; li < N_LANES; li++)
+                ppu_acc_in[li] <= $signed(sha_rd_data[li*ACC_WIDTH +: ACC_WIDTH]);
+              ppu_issue_idx <= ppu_issue_idx + 1'b1;
+
+              // Pre-read NEXT OC from shadow BRAM (data arrives next cycle)
+              if ((ppu_issue_idx + 1) < N_OC) begin
+                sha_rd_en   <= 1'b1;
+                sha_rd_addr <= SA_AW'(ppu_issue_idx + 1);
+              end
+
+              // Param pipeline: latch arriving, pre-read next
+              if ((ppu_issue_idx + 1) < N_OC) begin
+                ppu_bias_q  <= param_bias_data;
+                ppu_mult_q  <= param_mult_data[23:0];
+                ppu_shift_q <= param_shift_data;
+                if ((ppu_issue_idx + 2) < N_OC) begin
+                  param_rd_en   <= 1'b1;
+                  param_rd_addr <= ppu_oc_batch * N_OC + ppu_issue_idx + 2;
+                end
+              end
+            end
+
+            // Count PPU outputs
+            if (ppu_valid_out) begin
+              ppu_out_cnt <= ppu_out_cnt + 32'd1;
+              if ((ppu_out_cnt + 1) == N_OC)
+                ppu_st <= P_IDLE;
+            end
+          end
+        end
+
+        default: ppu_st <= P_IDLE;
+      endcase
+
+    end
+  end
+
+  // Synchronous-only datapath registers to map optimally to the DSP48 input pipeline
+  always_ff @(posedge clk) begin
+    if (rd_issued) begin
+      for (int li = 0; li < N_LANES; li++) begin
+        pb_pixel_r[li] <= pb_pixel[li];
+      end
+      for (int oci = 0; oci < N_OC; oci++) begin
+        w_rd_data_r[oci] <= w_rd_data[oci];
+      end
+    end
+    if (rd_issued_d1) begin
+      for (int p = 0; p < N_LANES/2; p++) begin
+        a_packed_r[p] <= a_packed[p];
+      end
+      for (int oci = 0; oci < N_OC; oci++) begin
+        w_rd_data_rr[oci] <= w_rd_data_r[oci];
+      end
+    end
+  end
+
+  // ---------------------------------------------------------------
+  // shadow_copy_idx / shadow_copying / sha_wr_en: synchronous reset only
+  //   Owned entirely by this block. main FSM issues shadow_copy_trig
+  //   to start a copy; this block runs it to completion.
+  //   Using synchronous reset removes these FFs from the async-reset
+  //   fanout cone, eliminating recovery-time violations on CLR pins.
+  // ---------------------------------------------------------------
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      shadow_copying  <= 1'b0;
+      shadow_copy_idx <= '0;
+      sha_wr_en       <= 1'b0;
+    end else begin
+      sha_wr_en <= 1'b0;  // default deassert
+      if (shadow_copy_trig) begin
+        // Latch trigger; start copy from idx 0
+        shadow_copying  <= 1'b1;
+        shadow_copy_idx <= '0;
+      end else if (shadow_copying) begin
+        sha_wr_en   <= 1'b1;
+        sha_wr_addr <= shadow_copy_idx;
+        // sha_wr_data driven combinationally from acc[shadow_copy_idx]
+        if (shadow_copy_idx == SA_AW'(N_OC - 1)) begin
+          shadow_copying  <= 1'b0;
+          shadow_copy_idx <= '0;
+        end else begin
+          shadow_copy_idx <= shadow_copy_idx + 1'b1;
+        end
+      end
+    end
+  end
+
+endmodule
+
+`default_nettype wire

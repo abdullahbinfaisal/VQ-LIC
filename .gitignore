@@ -1,0 +1,51 @@
+# Ignore build output directory
+/build
+/export
+
+# Ignore object files and dependent files
+.o
+.d
+
+#Ignore logs folder and log files
+/logs
+.log
+
+#Ignore lock files
+.lock
+
+.bin
+.pdi
+.vitisWorkspace.json
+
+_ide/logs
+_ide/.wsdata
+# ---- Vivado build output (regenerable, hundreds of MB) ----
+/Zynq.cache/
+/Zynq.gen/
+/Zynq.runs/
+/Zynq.sim/
+/Zynq.ip_user_files/
+/Zynq.tmp/
+/Zynq.hw/
+/.Xil/
+*.jou
+*.log
+*.str
+*.xsa
+*.bit
+*.ltx
+
+# ---- Vitis / IDE ----
+/_ide/
+**/_ide/
+/Final_code_2/build/
+/Final_code_2/compile_commands.json
+
+# ---- local backups and scratch (kept on disk, not versioned) ----
+/_bd_backup_*/
+/_rtl_backup_*/
+*.bak_*
+*.backup.jou
+*.backup.log
+/results/
+/archive/
