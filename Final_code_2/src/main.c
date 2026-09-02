@@ -584,6 +584,14 @@ static int g_cascade_accum = 0;
  * unmodified, so setting this to 0 reproduces the legacy B1/B2 numbers. */
 #define RUN_EDGE_VALIDATION 1
 
+/* RUN_OOS_VALIDATION: 1 = run the out-of-sample service-model validation
+ * sweep (oos_validation.c) INSTEAD of the complete-edge-encoder validation.
+ * It measures the per-block PL/DMA service window for six channel schedules
+ * on one bitstream and one binary, and runs no VQ and no range coding.
+ * Takes precedence over RUN_EDGE_VALIDATION; set to 0 to restore the normal
+ * edge-encoder run, which is otherwise untouched. */
+#define RUN_OOS_VALIDATION 1
+
 
 typedef unsigned long long u64_cycles;
 
@@ -4389,11 +4397,156 @@ int cnn_run_full_network(const runner_cfg_t *cfg)
  *       aliases the line buffers in blocks 1, 2 and 5 -- no error, wrong data. */
 #define SURR_MODEL_ENCODER 1
 
-#if SURR_MODEL_ENCODER
-#  define SURR_NUM_LAYERS 12
-#else
-#  define SURR_NUM_LAYERS 6
+/* ---------------------------------------------------------------------------
+ * SCHEDULE SELECTION (2026-08-29)
+ *
+ * Kept selectable rather than overwritten: each of these produced published
+ * measurements, and a number cannot be reproduced once its schedule is gone.
+ *
+ *   SCHED_LEGACY3  3 pairs,  8-16-64          every measurement up to 2026-07-30
+ *                                             (HW = 15.44 ms on this fabric)
+ *   SCHED_ENC6     6 pairs, 16-32-32-32-64-64 all 2026-08 measurements,
+ *                                             B1 = 18.87 ms, pair6 = 2.8518 ms
+ *   SCHED_ENC3     3 pairs, 16-48-64, all stride 2      <-- current
+ *
+ * All three land on the same 160x90x64 latent (three stride-2 stages from
+ * 1280x720), so VQ_DIM=64, 14,400 positions and 1,800 groups are invariant.
+ * The VQ block and its golden vectors are unaffected by this choice.
+ *
+ * NOTE for SCHED_ENC3: pw_cout=48 is NOT a multiple of Q=32, so pair 2 runs
+ * B=2 with Q_last=16. That is the first time the Q_last != Q branch of the
+ * group-period model is exercised on hardware.
+ *
+ * LINE-BUFFER CAPACITY. MAX_CG_PRODUCT must be >= max(G*C) over the DW layers,
+ * where G = W/8. Exceeding it aliases the line buffers with NO error and wrong
+ * data, so this is checked here rather than discovered later:
+ *      SCHED_LEGACY3   3x160, 8x80,  16x40                        -> max  640
+ *      SCHED_ENC6      3x160, 16x80, 32x40, 32x20, 32x20, 64x20   -> max 1280
+ *      SCHED_ENC3      3x160, 16x80, 48x40                        -> max 1920
+ * dw_banked_window_8x.sv has MAX_CG_PRODUCT = 2048, so SCHED_ENC3 fits with
+ * 6% headroom -- against 37% for SCHED_ENC6. Any further channel growth at
+ * 320 px width breaks it silently; 48 -> 64 at that stage would need 2560.
+ * ------------------------------------------------------------------------- */
+#define SCHED_LEGACY3 1
+#define SCHED_ENC6    2
+#define SCHED_ENC3    3
+
+#ifndef SURR_SCHEDULE
+#  define SURR_SCHEDULE SCHED_ENC3
 #endif
+
+/* SURR_NUM_LAYERS is now the MAXIMUM (6 blocks x 2 layers). The live layer
+ * count is 2 * surr_npairs(), set by the runtime schedule table below. */
+#define SURR_NUM_LAYERS 12
+#define SURR_MAX_BLOCKS 6
+
+/* ---- runtime-selectable channel schedules (2026-09-02) --------------------
+ * The out-of-sample service-model validation must measure six topologies on
+ * ONE bitstream and ONE binary, so the schedule moved from `#if SURR_SCHEDULE`
+ * to this table. SURR_SCHEDULE now only picks the power-on default.
+ *
+ * Convention carried over from the compile-time tables and REQUIRED by the
+ * rest of the pipeline: the first three blocks are stride 2 (so the latent is
+ * always 90x160 = 14,400 positions) and the final Cout is always 64 = VQ_DIM.
+ * dw_c[b] is block b's Cin and MUST equal pw_cout[b-1]; checked at selection.
+ *
+ * FEASIBILITY: dw_banked_window_8x.sv has MAX_CG_PRODUCT = 2048 and its
+ * slot_idx resets per row, so every DW layer needs G*Cin <= 2048. Overflow
+ * ALIASES SILENTLY -- wrong data, no error. surr_select_schedule() refuses any
+ * schedule that violates it rather than measuring corrupt hardware. With the
+ * 3x stride-2 front end (G = 160, 80, 40, then 20) this is exactly
+ *   c_out,1 <= 25,  c_out,2 <= 51,  c_out,j <= 102 for j >= 3.
+ * 16-64-64-64 fails it at block 3 (40*64 = 2560) and is NOT hardware-feasible. */
+typedef struct {
+    const char *name;
+    int npairs;
+    int dw_c   [SURR_MAX_BLOCKS];   /* block b's Cin  (dw_c[0] == 3) */
+    int pw_cout[SURR_MAX_BLOCKS];
+    int dw_str [SURR_MAX_BLOCKS];
+} surr_sched_t;
+
+static const surr_sched_t g_surr_scheds[] = {
+  /* name                np  dw_c (= Cin)         pw_cout               stride  */
+  { "16-48-64",           3, {3,16,48, 0, 0, 0}, {16,48,64, 0, 0, 0}, {2,2,2,0,0,0} },
+  { "16-32-32-32-64-64",  6, {3,16,32,32,32,64}, {16,32,32,32,64,64}, {2,2,2,1,1,1} },
+  { "16-16-16-16-32-64",  6, {3,16,16,16,16,32}, {16,16,16,16,32,64}, {2,2,2,1,1,1} },
+  { "16-16-48-32-64",     5, {3,16,16,48,32, 0}, {16,16,48,32,64, 0}, {2,2,2,1,1,0} },
+  { "16-16-64-64",        4, {3,16,16,64, 0, 0}, {16,16,64,64, 0, 0}, {2,2,2,1,0,0} },
+  { "16-32-48-64-32-64",  6, {3,16,32,48,64,32}, {16,32,48,64,32,64}, {2,2,2,1,1,1} },
+  { "8-16-64 (legacy)",   3, {3, 8,16, 0, 0, 0}, { 8,16,64, 0, 0, 0}, {2,2,2,0,0,0} },
+};
+#define SURR_NSCHED ((int)(sizeof(g_surr_scheds) / sizeof(g_surr_scheds[0])))
+
+/* Power-on default keeps every previously reported measurement reproducible
+ * from this binary: SCHED_ENC3 -> index 0 (16-48-64). */
+static int g_surr_sched =
+#if   SURR_SCHEDULE == SCHED_ENC6
+    1;
+#elif SURR_SCHEDULE == SCHED_ENC3
+    0;
+#else
+    6;
+#endif
+
+static int surr_npairs(void) { return g_surr_scheds[g_surr_sched].npairs; }
+int  surr_sched_count(void)  { return SURR_NSCHED; }
+int  surr_sched_current(void){ return g_surr_sched; }
+const char *surr_sched_name(int i)
+{ return (i >= 0 && i < SURR_NSCHED) ? g_surr_scheds[i].name : "?"; }
+
+/* Returns 0 on success, <0 if the schedule is not hardware-feasible or is
+ * internally inconsistent. Does NOT touch accelerator state; the caller must
+ * invalidate cached descriptors/blobs (edge_select_schedule does). */
+int surr_select_schedule(int idx)
+{
+    if (idx < 0 || idx >= SURR_NSCHED) return -1;
+    const surr_sched_t *sc = &g_surr_scheds[idx];
+    int H = SURR_IN_H, W = SURR_IN_W, maxcg = 0, bad = 0;
+
+    if (sc->dw_c[0] != 3) {
+        printf("[SCHED] %s: block 0 Cin=%d, expected 3\n", sc->name, sc->dw_c[0]);
+        bad = 1;
+    }
+    for (int b = 0; b < sc->npairs; b++) {
+        const int G  = ((W + 7) & ~7) / 8;
+        const int cg = sc->dw_c[b] * G;
+        if (cg > maxcg) maxcg = cg;
+        if (cg > 2048) {
+            printf("[SCHED] %s INFEASIBLE: block %d G*Cin = %d*%d = %d > "
+                   "MAX_CG_PRODUCT 2048\n", sc->name, b + 1, G, sc->dw_c[b], cg);
+            bad = 1;
+        }
+        if (b > 0 && sc->dw_c[b] != sc->pw_cout[b - 1]) {
+            printf("[SCHED] %s: block %d Cin=%d != previous Cout=%d\n",
+                   sc->name, b + 1, sc->dw_c[b], sc->pw_cout[b - 1]);
+            bad = 1;
+        }
+        if (sc->dw_c[b] > 240 || sc->pw_cout[b] > 224) {
+            printf("[SCHED] %s: block %d Cin=%d/Cout=%d exceeds CIN_MAX 240 /"
+                   " PW Cout max 224\n", sc->name, b + 1, sc->dw_c[b], sc->pw_cout[b]);
+            bad = 1;
+        }
+        if (sc->dw_str[b] == 2) {
+            H = calc_out_dim(H, 1, 3, 2);
+            W = calc_out_dim(W, 1, 3, 2);
+        }
+    }
+    if (sc->pw_cout[sc->npairs - 1] != 64) {
+        printf("[SCHED] %s: final Cout=%d != 64 (VQ_DIM)\n",
+               sc->name, sc->pw_cout[sc->npairs - 1]);
+        bad = 1;
+    }
+    if (H != 90 || W != 160) {
+        printf("[SCHED] %s: latent %dx%d != 90x160\n", sc->name, H, W);
+        bad = 1;
+    }
+    if (bad) return -2;
+
+    g_surr_sched = idx;
+    printf("[SCHED] selected [%d] %s : %d pairs, max G*Cin = %d / 2048\n",
+           idx, sc->name, sc->npairs, maxcg);
+    return 0;
+}
 #define SURR_IN_H        720
 #define SURR_IN_W       1280
 
@@ -4433,24 +4586,18 @@ static void surr_build_schedule(layer_desc_t descs[SURR_NUM_LAYERS])
      * is what this harness measures, but it is a real fidelity gap for
      * correctness work. BatchNorm folds into the conv weights/bias at
      * quantisation time and needs no hardware support. */
-#if SURR_MODEL_ENCODER
-    static const int dw_c   [SURR_NUM_LAYERS / 2] = {  3, 16, 32, 32, 32, 64 };
-    static const int pw_cout[SURR_NUM_LAYERS / 2] = { 16, 32, 32, 32, 64, 64 };
-    static const int dw_str [SURR_NUM_LAYERS / 2] = {  2,  2,  2,  1,  1,  1 };
-#else
-    /* Legacy 3-pair surrogate: the configuration every measurement up to
-     * 2026-07-30 was taken on. Kept so the cost model can be checked against
-     * a known result (HW = 15.44 ms) on the current fabric. */
-    static const int dw_c   [SURR_NUM_LAYERS / 2] = {  3,  8, 16 };
-    static const int pw_cout[SURR_NUM_LAYERS / 2] = {  8, 16, 64 };
-    static const int dw_str [SURR_NUM_LAYERS / 2] = {  2,  2,  2 };
-#endif
+    /* Runtime table -- see g_surr_scheds above. */
+    const surr_sched_t *sc = &g_surr_scheds[g_surr_sched];
+    const int *dw_c    = sc->dw_c;
+    const int *pw_cout = sc->pw_cout;
+    const int *dw_str  = sc->dw_str;
+    const int  nblocks = sc->npairs;
 
     int H = SURR_IN_H, W = SURR_IN_W;
 
     memset(descs, 0, SURR_NUM_LAYERS * sizeof(descs[0]));
 
-    for (int b = 0; b < SURR_NUM_LAYERS / 2; b++) {
+    for (int b = 0; b < nblocks; b++) {
         layer_desc_t *dw = &descs[2 * b];
         layer_desc_t *pw = &descs[2 * b + 1];
 
@@ -4484,7 +4631,7 @@ static void surr_build_schedule(layer_desc_t descs[SURR_NUM_LAYERS])
         pw->zp_in     = 128;
         pw->zp_out    = 128;
         /* block 5's PW is the encoder output: BatchNorm only, no activation */
-        pw->relu_en   = (b == (SURR_NUM_LAYERS / 2) - 1) ? 0 : 1;
+        pw->relu_en   = (b == nblocks - 1) ? 0 : 1;
     }
 }
 
@@ -5219,7 +5366,8 @@ static int cnn_run_surrogate_cascade_estimate(void)
     uint8_t     *raw_in = (uint8_t *)DDR_BUF_CUR_ADDR;
     uint8_t     *gm_in  = (uint8_t *)DDR_SKIP1_ADDR;
     uint8_t     *pw_out = (uint8_t *)DDR_SKIP0_ADDR;
-    int npairs = SURR_NUM_LAYERS / 2;
+    int npairs = surr_npairs();
+    const int nlayers = 2 * npairs;
 
     /* Chaining ping-pong. The DMA must never read and write the same region in
      * one pass, so successive pairs alternate between two buffers:
@@ -5260,7 +5408,7 @@ static int cnn_run_surrogate_cascade_estimate(void)
 
     surr_build_schedule(descs);
 
-    for (int i = 0; i < SURR_NUM_LAYERS; i++) {
+    for (int i = 0; i < nlayers; i++) {
         int rc = (descs[i].kind == KIND_DW)
                ? surr_alloc_dw_blobs(descs[i].Cin, &w_blob[i], &p_blob[i])
                : surr_alloc_pw_blobs(descs[i].Cin, descs[i].Cout, &w_blob[i], &p_blob[i]);
@@ -5956,7 +6104,14 @@ int main(void)
     cfg.stop_on_fail = 0;
     cfg.dump_failed_outputs = 0;
 
-#if RUN_EDGE_VALIDATION
+#if RUN_OOS_VALIDATION
+    /* OUT-OF-SAMPLE SERVICE-MODEL VALIDATION (2026-09-02). Measurement only:
+     * no model constants live in the firmware and nothing here is fitted. */
+    {
+        extern int edge_oos_validation_run(void);
+        rc = edge_oos_validation_run();
+    }
+#elif RUN_EDGE_VALIDATION
     /* COMPLETE EDGE ENCODER VALIDATION (2026-08-25).
      * Runs PL analysis -> VQ -> range coding and reports every timing
      * primitive plus one directly measured end-to-end bracket. Takes
@@ -6005,8 +6160,53 @@ static int           g_edge_ready = 0;
 uint8_t *edge_raw_ptr(void) { return (uint8_t *)DDR_BUF_NEXT_ADDR; }
 uint8_t *edge_chw_ptr(void) { return (uint8_t *)DDR_BUF_ADD_ADDR;  }
 
-/* block-5 output. With 6 pairs the last write lands in chainB (p=5 is odd). */
-const uint8_t *edge_latent_ptr(void) { return (const uint8_t *)DDR_SKIP2_ADDR; }
+/* ---------------------------------------------------------------------------
+ * Block-5 output. With 6 pairs the last write lands in chainB (p=5 is odd).
+ *
+ * LATENT DOUBLE BUFFERING (2026-08-29). chainB and the latent were the SAME
+ * address, so starting frame N+1's analysis while frame N's search was still
+ * reading the latent would overwrite it mid-read. That is exactly the overlap
+ * the PL VQ block exists to enable, so chainB now alternates between two
+ * regions and edge_latent_ptr() returns the one the LAST COMPLETED frame wrote.
+ *
+ * WHICH CHAIN HOLDS THE LATENT DEPENDS ON THE PAIR COUNT (2026-08-29).
+ * out_buf alternates chainA, chainB, chainA, ... so the FINAL pair writes
+ *      chainA when (npairs-1) is even,  chainB when it is odd.
+ * With 6 pairs that was chainB; with the 3-pair 16-48-64 schedule it is
+ * chainA. Hard-coding chainB here was silently wrong for any odd pair count,
+ * and -- worse -- undetectable: vq_pq_encode_frame() and vq_pl_encode_frame()
+ * both read edge_latent_ptr(), so they would consume the SAME wrong buffer,
+ * agree perfectly, and report 0 mismatches. Both chains are therefore
+ * double-buffered and the final one is selected from npairs.
+ *
+ * Peak content per chain, worst case over the supported schedules:
+ *      chainA  640x360x16 = 3,686,400 B      DDR_SKIP0 = 176 MB
+ *      chainB  320x180x48 = 2,764,800 B      DDR_SKIP2 =  48 MB
+ * An 8 MB stride clears both with room to spare.
+ * ------------------------------------------------------------------------- */
+#define EDGE_CHAIN_STRIDE 0x00800000u           /* 8 MB */
+/* Power-on initialiser ONLY (default schedule 16-48-64, 3 pairs). The live
+ * value is recomputed from the runtime pair count at the end of every
+ * edge_run_six_pairs() and by edge_select_schedule(). Do not use elsewhere. */
+#define EDGE_NPAIRS       3
+#define EDGE_FINAL_IS_A   (((EDGE_NPAIRS - 1) % 2) == 0)
+
+static int g_edge_parity = 0;                   /* buffers the NEXT frame uses */
+
+static inline uint8_t *edge_chainA_for(int parity)
+{
+    return (uint8_t *)(DDR_SKIP0_ADDR + (parity ? EDGE_CHAIN_STRIDE : 0u));
+}
+static inline uint8_t *edge_chainB_for(int parity)
+{
+    return (uint8_t *)(DDR_SKIP2_ADDR + (parity ? EDGE_CHAIN_STRIDE : 0u));
+}
+
+/* last completed frame's latent; initialised to the parity-0 final buffer */
+static uint8_t *g_edge_latent =
+    (uint8_t *)(EDGE_FINAL_IS_A ? DDR_SKIP0_ADDR : DDR_SKIP2_ADDR);
+
+const uint8_t *edge_latent_ptr(void) { return (const uint8_t *)g_edge_latent; }
 
 /* VQ codebook. NO TRAINED CODEBOOK IS AVAILABLE ON THIS BOARD, so a fixed
  * deterministic synthetic codebook is used. This makes VQ TIMING valid (the
@@ -6063,7 +6263,7 @@ void edge_read_accums(double *pack, double *prog, double *cache,
  * The caller snapshots after each frame and differences, which is what gives
  * per-frame min/max without any per-frame state living in main.c.
  * ------------------------------------------------------------------------- */
-int edge_num_pairs(void)  { return SURR_NUM_LAYERS / 2; }
+int edge_num_pairs(void)  { return surr_npairs(); }
 int edge_split_mode(void) { return CASCADE_ENGINE_SPLIT; }
 
 void edge_reset_pair_accums(void)
@@ -6088,6 +6288,38 @@ void edge_read_pair_cycles(unsigned long long *hw, unsigned long long *pack,
 /* Output geometry of pair p is the geometry of its PW half, layer 2p+1.
  * Taken from the live descriptors rather than restated, so the group counts
  * cannot drift from the schedule the hardware actually ran. */
+/* ---------------------------------------------------------------------------
+ * PMBus access for the edge harness (2026-08-30).
+ *
+ * pm_init/pm_scan are compiled unconditionally; only the surrogate's A/B
+ * driver sits behind RUN_POWER_MEASUREMENT. Exposing them lets the edge
+ * harness measure the workload it actually runs -- analysis + PL VQ -- instead
+ * of the surrogate's analysis-only frame.
+ *
+ * These read regulator OUTPUT power. They EXCLUDE regulator conversion losses
+ * and the unmonitored 5 V USB rail, so this is NOT 12 V connector input power.
+ * ------------------------------------------------------------------------- */
+int edge_pm_init(void)      { return (pm_init() == XST_SUCCESS) ? 0 : -1; }
+int edge_pm_nrails(void)    { return (int)PM_NRAILS; }
+
+const char *edge_pm_rail_name(int i)
+{
+    return (i >= 0 && i < (int)PM_NRAILS) ? pm_rails[i].name : "?";
+}
+const char *edge_pm_group_name(int i)
+{
+    return (i >= 0 && i < (int)PM_NRAILS) ? pm_group_name[pm_rails[i].group] : "?";
+}
+
+/* Fills w[0..n-1] with per-rail watts. Returns 0 on success. */
+int edge_pm_scan(double *w, int n)
+{
+    pm_sample_t s[PM_NRAILS];
+    if (pm_scan(s) != XST_SUCCESS) return -1;
+    for (int i = 0; i < n && i < (int)PM_NRAILS; i++) w[i] = (double)s[i].p;
+    return 0;
+}
+
 void edge_read_pair_dims(int *cout, int *hout, int *wout, int *groups, int n)
 {
     for (int p = 0; p < n && p < SURR_MAX_PAIRS; p++) {
@@ -6105,17 +6337,42 @@ void edge_read_pair_dims(int *cout, int *hout, int *wout, int *groups, int n)
 
 /* One complete analysis transform: six DW->PW pairs, chained on-chip.
  * Mirrors surr_run_one_frame() exactly. */
+/* Switch the live schedule. Frees the cached per-layer blobs, forces
+ * edge_run_six_pairs() to rebuild descriptors on its next call, and re-points
+ * g_edge_latent at the chain the NEW pair count will finish in -- getting that
+ * wrong is undetectable downstream, because both the NEON and PL search paths
+ * read edge_latent_ptr() and would agree on the same wrong buffer.
+ * Returns 0 on success, <0 if the schedule is not hardware-feasible. */
+int edge_select_schedule(int idx)
+{
+    if (surr_select_schedule(idx) != 0) return -1;
+    if (g_edge_ready) {
+        for (int j = 0; j < SURR_NUM_LAYERS; j++) {
+            free_blob(&g_edge_w[j]);
+            free_blob(&g_edge_p[j]);
+        }
+        memset(g_edge_w, 0, sizeof(g_edge_w));
+        memset(g_edge_p, 0, sizeof(g_edge_p));
+        g_edge_ready = 0;
+    }
+    g_edge_parity = 0;
+    g_edge_latent = ((surr_npairs() - 1) % 2 == 0)
+                  ? edge_chainA_for(0) : edge_chainB_for(0);
+    edge_reset_pair_accums();
+    return 0;
+}
+
 int edge_run_six_pairs(const uint8_t *gm_in_frame)
 {
-    uint8_t *chainA = (uint8_t *)DDR_SKIP0_ADDR;
-    uint8_t *chainB = (uint8_t *)DDR_SKIP2_ADDR;
+    uint8_t *chainA = edge_chainA_for(g_edge_parity);   /* both alternate, so   */
+    uint8_t *chainB = edge_chainB_for(g_edge_parity);   /* either may be final  */
     uint8_t *gm_in  = (uint8_t *)DDR_SKIP1_ADDR;
     uint8_t *raw_in = (uint8_t *)gm_in_frame;
-    const int npairs = SURR_NUM_LAYERS / 2;
+    const int npairs = surr_npairs();
 
     if (!g_edge_ready) {
         surr_build_schedule(g_edge_descs);
-        for (int j = 0; j < SURR_NUM_LAYERS; j++) {
+        for (int j = 0; j < 2 * npairs; j++) {
             int rc = (g_edge_descs[j].kind == KIND_DW)
                    ? surr_alloc_dw_blobs(g_edge_descs[j].Cin,
                                          &g_edge_w[j], &g_edge_p[j])
@@ -6133,6 +6390,23 @@ int edge_run_six_pairs(const uint8_t *gm_in_frame)
                                  NORM_NONCACHE);
         printf("[EDGE] gm_in @ %p mapped NORM_NONCACHE across 4 MB\n", (void *)gm_in);
 #endif
+        /* Make the schedule and the latent buffer visible. Which chain holds
+         * the latent depends on the pair count, and getting it wrong is
+         * undetectable by the index comparison (both the NEON and PL paths
+         * read edge_latent_ptr(), so they would agree on the wrong data). */
+        printf("[EDGE] schedule=[%d] %s, %d pairs, latent in chain%s @ %p\n",
+               surr_sched_current(), surr_sched_name(surr_sched_current()), npairs, ((npairs - 1) % 2 == 0) ? "A" : "B",
+               (void *)(((npairs - 1) % 2 == 0) ? chainA : chainB));
+        {
+            int maxcg = 0;
+            for (int b = 0; b < npairs; b++) {
+                const layer_desc_t *d = &g_edge_descs[2 * b];
+                const int cg = d->Cin * (((d->W + 7) & ~7) / 8);
+                if (cg > maxcg) maxcg = cg;
+            }
+            printf("[EDGE] max G*C over DW layers = %d (MAX_CG_PRODUCT must be >= this)\n",
+                   maxcg);
+        }
         g_edge_ready = 1;
     }
 
@@ -6148,6 +6422,16 @@ int edge_run_six_pairs(const uint8_t *gm_in_frame)
                                    &g_edge_p[2 * p + 1], &g_edge_w[2 * p + 1],
                                    SURR_IN_FLAGS(chained)) != 0) return -1;
     }
+
+    /* Publish the buffer this frame just wrote, then flip so the NEXT frame's
+     * analysis writes the other one. Only on success: a failed frame must not
+     * hand the search a half-written latent.
+     *
+     * The final pair's output alternates chainA/chainB with p, so which chain
+     * holds the latent follows the PAIR COUNT, not a fixed choice. Derived
+     * from npairs here so a schedule change cannot silently mis-point it. */
+    g_edge_latent = ((npairs - 1) % 2 == 0) ? chainA : chainB;
+    g_edge_parity ^= 1;
     return 0;
 }
 

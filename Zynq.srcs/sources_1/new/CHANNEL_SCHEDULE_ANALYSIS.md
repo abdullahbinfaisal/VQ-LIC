@@ -12,10 +12,73 @@ The document supports a **hardware-efficiency sensitivity analysis** plus **one
 RD comparison**. It still does not support a Pareto-optimality claim, and the RD
 experiment is **confounded** until the §4.6.1 ablations are run.
 
+> **SUPERSEDED 2026-09-02 — retained verbatim for provenance.** The paragraph
+> immediately below was written when Route A had been built and timing-closed but
+> had never been run on the board. That was true at the time. It is no longer
+> true, and it must not be cited. See "Route A silicon validation" beneath it.
+
 **Authoritative cost model: FULL drain** (`cyc/grp = B·cin + Q_last + 6B + 1`),
 which is the law matching the 22.03 ms board measurement. Route A (half drain) is
 **built and timing-closed but not board-measured**; results under it are labelled
 throughout and must not be quoted as silicon-validated.
+
+### Route A silicon validation (2026-09-02) — the note above is now stale
+
+Route A has since been board-measured. The realized bitstream implements the
+**half-drain** shadow transfer (`R_sh = 2` output channels/cycle, so the final
+batch drains in `⌈Q_last/2⌉` cycles), and silicon agrees with it, not with the
+full-drain law. Measured cycles/group on **PW-bound blocks only** (the blocks
+where the PW law actually sets the time; DW-bound blocks cannot arbitrate it):
+
+| block | measured cyc/grp | half drain (Route A) | err | full drain (old) | err |
+|---|---|---|---|---|---|
+| `16-48-64` b1 (cin=3, cout=16)   |  18.05 |  18 | **+0.3%** |  26 | −30.6% |
+| 6-block b4 (cin=32, cout=32)     |  55.97 |  54 | **+3.7%** |  71 | −21.2% |
+| 6-block b5 (cin=32, cout=64)     |  93.97 |  92 | **+2.1%** | 109 | −13.8% |
+| 6-block b6 (cin=64, cout=64)     | 158.44 | 156 | **+1.6%** | 173 | −8.4% |
+
+Full drain over-predicts by 8–31%. The 22.03 ms board measurement that motivated
+the full-drain note **predates both the Route A build and the MM2S burst-size fix**
+(`c_mm2s_burst_size` 8 → 256), so it cannot arbitrate the current hardware and is
+not evidence against Route A. It is left in the history below as measured.
+
+**Consequence for draft 3.** The draft-3 error recorded in §0 was diagnosed as
+"used the Route A half-drain term against full-drain silicon". The *arithmetic*
+error stands — draft 3 mixed a half-drain law with a calibration constant derived
+from a full-drain measurement. The *attribution* was half wrong: the law draft 3
+used was the correct one for the hardware as now built; the calibration constant
+was the stale half. Neither the 1.2527 nor the 1.0615 calibration should be used,
+because the validated model is uncalibrated — no empirical correction factor is
+applied at all.
+
+**DW row count.** Two DW expressions circulate. The superseded form
+`T_DW = H·(c_in(G+1)+4)` gives **13.4136 ms** for `16-48-64`; the final RTL-derived
+form `T_DW = (H+1)·(c_in(G+1)+4)` gives **13.4463 ms**. The `(H+1)` form is
+correct — the windower runs one extra vertical-flush row pass beyond the `H` real
+rows (`r_cnt` advances to `H_r` inclusive) — and it is also the better predictor
+on the two DW-bound blocks of `16-48-64` (+0.21% / +0.30%, versus +0.49% / +0.85%).
+**Quote 13.4463 ms, not 13.4136 ms.**
+
+### Hardware feasibility constraint (2026-09-02)
+
+`dw_banked_window_8x` allocates `line0`/`line1` at flat depth
+`MAX_CG_PRODUCT = 2048` (RTL default; not overridden in `hw.bd`). `slot_idx`
+resets at every row boundary and increments once per real-group beat, so a row
+consumes exactly `G_j · c_in,j` slots. Overflow **wraps and aliases silently —
+wrong data, no error**. The search formulation must therefore carry
+
+>   `G_j · c_in,j ≤ 2048`  for every block j
+
+which, with the realized 3×stride-2 front end (`G` = 160, 80, 40, then 20),
+reduces to a per-position cap on the channel schedule itself:
+
+>   `c_out,1 ≤ 25`,  `c_out,2 ≤ 51`,  `c_out,j ≤ 102` for `j ≥ 3`
+
+`16-64-64-64` violates this at block 3 (`c_out,2 = 64 > 51`, i.e.
+`40 × 64 = 2560 > 2048`) and is **not hardware-feasible on the realized
+accelerator**. It must not be treated as an ordinary feasible NAS point. It is
+the only violating topology among every candidate recorded in this repository
+(see `results/hw_feasibility_audit.csv`).
 
 ---
 
