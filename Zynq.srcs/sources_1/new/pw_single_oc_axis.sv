@@ -1,5 +1,7 @@
 `timescale 1ns/1ps
 module pw_single_oc_axis #(
+  // USE_PW_VQ: pass-through to pw_pixel_major_core. 0 = unchanged IP.
+  parameter int USE_PW_VQ          = 0,
   parameter int DATA_WIDTH        = 8,
   parameter int ACC_WIDTH         = 32,
   parameter int CIN_MAX           = 240,
@@ -35,6 +37,10 @@ module pw_single_oc_axis #(
   input  logic [7:0]                   zp_in,
   input  logic [7:0]                   zp_out,
   input  logic                         relu_en,
+
+  // ---- VQ mode pass-through (USE_PW_VQ only; tie low otherwise) ----
+  input  logic                         vq_mode,
+  input  logic [11:0]                  vq_cin_load,
 
   // Weight BRAM read interface (from AXI wrapper BRAMs)
   output logic [$clog2((COUT_MAX/N_OC)*CIN_MAX)-1:0] w_rd_addr,
@@ -297,12 +303,14 @@ module pw_single_oc_axis #(
                                : (OUT_FIFO_DEPTH / 2);
 
   pw_pixel_major_core #(
+    .USE_PW_VQ(USE_PW_VQ),
     .DATA_WIDTH(DATA_WIDTH), .ACC_WIDTH(ACC_WIDTH), .CIN_MAX(CIN_MAX),
     .COUT_MAX(COUT_MAX), .N_LANES(N_LANES), .N_OC(N_OC)
   ) u_core (
     .clk(clk), .rst_n(rst_n), .start_in(start_in), .done_out(core_done),
     .tile_pixels(tile_pixels), .cin_run(cin_run), .cout_run(cout_run),
     .zp_in(zp_in), .zp_out(zp_out), .relu_en(relu_en),
+    .vq_mode(vq_mode), .vq_cin_load(vq_cin_load),
     .w_rd_addr(w_rd_addr), .w_rd_en(w_rd_en), .w_rd_data(w_rd_data),
     .param_rd_addr(param_rd_addr), .param_rd_en(param_rd_en),
     .param_bias_data(param_bias_data), .param_mult_data(param_mult_data),

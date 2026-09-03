@@ -11,6 +11,9 @@ module pw_single_oc_axis_axi #(
   parameter int S_AXIS_DATA_WIDTH  = 32,
   parameter int N_LANES            = 16,
   parameter int N_OC               = 20,
+  // USE_PW_VQ: compile in PW-hosted vector quantisation. 0 = this IP is
+  // exactly what it was before the feature existed. See vq_pw.h.
+  parameter int USE_PW_VQ          = 0,
   parameter int M_AXIS_DATA_WIDTH  = N_LANES * DATA_WIDTH,
 
   parameter integer C_S_AXI_DATA_WIDTH = 32,
@@ -80,6 +83,7 @@ module pw_single_oc_axis_axi #(
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_COUT_RUN    = 12'h028; // RW: total output channels
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_W_BRAM_OFF  = 12'h02C; // RW: base offset in weight BRAM
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_PARAM_ADDR  = 12'h030; // RW: address for bias/mult/shift BRAM writes
+  localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_VQ_CTRL     = 12'h034; // RW: [0]=vq_mode, [23:12]=vq_cin_load  (USE_PW_VQ only)
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_W_BASE      = 12'h100; // W: weight BRAM data at offset w_bram_off + idx
 
   // ============================================================
@@ -116,6 +120,7 @@ module pw_single_oc_axis_axi #(
   logic [31:0] reg_oc_sel;       // weight bank select (0..N_OC-1)
   logic [31:0] reg_w_bram_off;   // base offset into selected weight BRAM bank
   logic [31:0] reg_param_addr;   // global OC address for bias/mult/shift writes
+  logic [31:0] reg_vq_ctrl;      // [0]=vq_mode, [23:12]=vq_cin_load (USE_PW_VQ)
 
   logic        busy;
   logic        done_sticky;
@@ -363,6 +368,8 @@ module pw_single_oc_axis_axi #(
           reg_w_bram_off <= s_axi_wdata;
         else if (wr_addr == ADDR_PARAM_ADDR)
           reg_param_addr <= s_axi_wdata;
+        else if (wr_addr == ADDR_VQ_CTRL)
+          reg_vq_ctrl <= s_axi_wdata;
       end
     end
   end
@@ -457,6 +464,8 @@ module pw_single_oc_axis_axi #(
       s_axi_rdata = reg_w_bram_off;
     end else if (rd_addr == ADDR_PARAM_ADDR) begin
       s_axi_rdata = reg_param_addr;
+    end else if (rd_addr == ADDR_VQ_CTRL) begin
+      s_axi_rdata = reg_vq_ctrl;
     end else if (rd_addr == ADDR_STATUS2) begin
       s_axi_rdata[0] = in_overflow_sticky;
       s_axi_rdata[1] = in_underflow_sticky;
@@ -490,13 +499,18 @@ module pw_single_oc_axis_axi #(
     .COUT_MAX(COUT_MAX), .TILE_PIXELS_MAX(TILE_PIXELS_MAX),
     .IN_FIFO_DEPTH(IN_FIFO_DEPTH), .OUT_FIFO_DEPTH(OUT_FIFO_DEPTH),
     .S_AXIS_DATA_WIDTH(S_AXIS_DATA_WIDTH),
-    .N_LANES(N_LANES), .N_OC(N_OC), .M_AXIS_DATA_WIDTH(M_AXIS_DATA_WIDTH)
+    .N_LANES(N_LANES), .N_OC(N_OC), .M_AXIS_DATA_WIDTH(M_AXIS_DATA_WIDTH),
+    .USE_PW_VQ(USE_PW_VQ)
   ) u_pw (
     .clk(s_axi_aclk), .rst_n(s_axi_aresetn),
     .start_in(start_pulse), .done_out(pw_done_out),
     .tile_pixels(reg_tile_pixels), .cin_run(reg_cin_run[11:0]),
     .cout_run(reg_cout_run[11:0]),
     .zp_in(reg_zp_relu[7:0]), .zp_out(reg_zp_relu[15:8]), .relu_en(reg_zp_relu[16]),
+    // VQ mode. Hard-tied off unless USE_PW_VQ is set, so a stray register
+    // write cannot perturb convolution in a build that did not ask for VQ.
+    .vq_mode    ((USE_PW_VQ != 0) ? reg_vq_ctrl[0]     : 1'b0),
+    .vq_cin_load((USE_PW_VQ != 0) ? reg_vq_ctrl[23:12] : 12'd0),
 
     // Weight BRAM read (from core)
     .w_rd_addr(core_w_rd_addr), .w_rd_en(core_w_rd_en),

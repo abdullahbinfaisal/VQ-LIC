@@ -6,7 +6,11 @@ module pw_pixel_major_core #(
   parameter int CIN_MAX         = 240,
   parameter int COUT_MAX        = 240,
   parameter int N_LANES         = 8,
-  parameter int N_OC            = 5
+  parameter int N_OC            = 5,
+  // USE_PW_VQ: compile in the PW-hosted vector-quantisation mode. 0 = the
+  // engine is exactly what it was before this feature existed (see the
+  // bit-identity note at the vq_mode_r declaration below).
+  parameter int USE_PW_VQ        = 0
 )(
   input  logic                              clk,
   input  logic                              rst_n,
@@ -21,6 +25,14 @@ module pw_pixel_major_core #(
   input  logic [7:0]                        zp_in,
   input  logic [7:0]                        zp_out,
   input  logic                              relu_en,
+
+  // ---- VQ mode (USE_PW_VQ only; tie low otherwise) ----
+  // vq_mode      : 1 = nearest-codeword search, 0 = ordinary convolution
+  // vq_cin_load  : channels STREAMED per group (64 = the full latent vector).
+  //                cin_run keeps its ordinary meaning of MAC length and weight
+  //                stride, which in VQ mode is 16 = 2 sub-codebooks x DSUB.
+  input  logic                              vq_mode,
+  input  logic [11:0]                       vq_cin_load,
 
   // Weight BRAM read interface (all N_OC banks, 1-cycle latency)
   output logic [$clog2((COUT_MAX/N_OC)*CIN_MAX)-1:0] w_rd_addr,
@@ -59,6 +71,32 @@ module pw_pixel_major_core #(
 
   // Registered at start - removes division from critical path
   logic [31:0] tile_groups_r;
+  // ============================================================
+  // VQ MODE  (see Final_code_2/src/vq_pw.h for the full mapping)
+  //
+  // The PW MAC already computes SUM_ic (uint8 act - uint8 zp_in) * int8 w.
+  // With the codebook stored PRE-CENTRED as v = cq - 128 that is exactly the
+  // dot product the nearest-codeword search needs, so the MAC, the DSP
+  // packing, the accumulators, the shadow copy and the drain FSM are ALL
+  // untouched. Only two things differ in VQ mode:
+  //
+  //   1. cin_load = 64  -- the stream still delivers the whole latent vector
+  //      for the group (one contiguous DDR read), while cin_run = 16 remains
+  //      the per-batch MAC length.
+  //   2. the pb_ram READ window starts at w_addr_base instead of 0.
+  //      w_addr_base already resets to 0 at every group boundary and advances
+  //      by cin_run per OC batch, so in VQ mode it ALREADY equals
+  //      16 * oc_batch_idx -- the exact window base each batch needs. No new
+  //      counter, no multiplier, no extra state.
+  //
+  // BIT-IDENTITY WITH ORDINARY CONVOLUTION: USE_PW_VQ is an elaboration-time
+  // constant. At USE_PW_VQ = 0 both ternaries below fold to their else-arms,
+  // which are character-for-character the expressions that were in the RTL
+  // before this feature, and vq_mode_r/vq_cin_load_r lose all readers and are
+  // stripped. Conv mode cannot change; there is no path by which it could.
+  logic                vq_mode_r;
+  logic [11:0]         vq_cin_load_r;
+
   logic [11:0] cout_batches_r;
   // PARTIAL-BATCH DRAIN (2026-08-07). Previously the drain always issued N_OC
   // beats, so a layer whose cout is not a multiple of N_OC paid for padding
@@ -352,6 +390,10 @@ module pw_pixel_major_core #(
   //   Stage 3: subtract + multiply ? prod_reg
   //   Stage 4: accumulate from prod_reg
   // ------------------------------------------------------------
+  // Channels STREAMED per group. Ordinary convolution loads exactly the
+  // channels it MACs; VQ mode loads all 64 and MACs a 16-wide window of them.
+  wire [11:0] cin_load = ((USE_PW_VQ != 0) && vq_mode_r) ? vq_cin_load_r : cin_run;
+
   logic signed [DATA_WIDTH-1:0] w_rd_data_r   [0:N_OC-1]; // Fixes 1-cycle weight alignment bug
   logic signed [DATA_WIDTH-1:0] w_rd_data_rr  [0:N_OC-1]; // stage-2.5 registered weights for DSP path
   logic signed [24:0]           a_packed_r    [0:(N_LANES/2)-1]; // stage-2.5 registered packed activations
@@ -435,6 +477,7 @@ module pw_pixel_major_core #(
 
   wire ppu_valid_out = ppu_valid_out_vec[0];
 
+
   // Pack PPU output into pixel_out bus
   generate
     for (genvar g = 0; g < N_LANES; g++) begin : G_PX_OUT
@@ -451,6 +494,12 @@ module pw_pixel_major_core #(
   logic [$clog2(CIN_MAX)-1:0]        ic_idx;
   logic [11:0]                        oc_batch_idx;
   logic [W_AW-1:0]                    w_addr_base;
+
+  // pb_ram READ index. In VQ mode the batch's window base is w_addr_base.
+  wire [PB_AW-1:0] pb_rd_index = ((USE_PW_VQ != 0) && vq_mode_r)
+                               ? (w_addr_base[PB_AW-1:0] + ic_idx[PB_AW-1:0])
+                               : ic_idx[PB_AW-1:0];
+
   logic                               rd_issued;
   logic                               first_ic;
   // mul_valid is declared above with prod_reg
@@ -584,6 +633,8 @@ module pw_pixel_major_core #(
             cout_run_r     <= cout_run;
             zp_in_r        <= zp_in;
             zp_out_r       <= zp_out;
+            vq_mode_r      <= (USE_PW_VQ != 0) ? vq_mode : 1'b0;
+            vq_cin_load_r  <= vq_cin_load;
             relu_en_r      <= relu_en;
             /* start each run on a known bank so a previous run's parity
              * cannot carry over (2026-07-30 double buffer) */
@@ -622,7 +673,7 @@ module pw_pixel_major_core #(
             pb_a_wr_addr <= ic_idx[PB_AW-1:0];
             pb_a_wr_data <= pixel_in;
 
-            if (($unsigned(ic_idx) + 1) == cin_run) begin
+            if (($unsigned(ic_idx) + 1) == cin_load) begin
               // First group loaded - setup compute
               ic_idx       <= '0;
               oc_batch_idx <= 12'd0;
@@ -699,10 +750,10 @@ module pw_pixel_major_core #(
             // Read from active compute buffer
             if (!compute_buf) begin
               pb_a_rd_en   <= 1'b1;
-              pb_a_rd_addr <= ic_idx[PB_AW-1:0];
+              pb_a_rd_addr <= pb_rd_index;
             end else begin
               pb_b_rd_en   <= 1'b1;
-              pb_b_rd_addr <= ic_idx[PB_AW-1:0];
+              pb_b_rd_addr <= pb_rd_index;
             end
             w_rd_en    <= 1'b1;
             w_rd_addr  <= w_addr_base + ic_idx;
@@ -875,7 +926,7 @@ module pw_pixel_major_core #(
               pb_b_wr_data <= pixel_in;
             end
 
-            if (($unsigned(load_ic_idx) + 1) == cin_run) begin
+            if (($unsigned(load_ic_idx) + 1) == cin_load) begin
               next_grp_ready <= 1'b1;
               load_st        <= L_READY;
             end else begin
@@ -1030,6 +1081,25 @@ module pw_pixel_major_core #(
       end
     end
   end
+
+`ifndef SYNTHESIS
+  // Step 10 safety properties. The MAC must never read a pb_ram entry the load
+  // did not write, which is exactly "the batch windows tile the loaded region".
+  always_ff @(posedge clk) begin
+    if (rst_n) begin
+      a_vq_off_when_not_compiled: assert (!((USE_PW_VQ == 0) && vq_mode))
+        else $error("vq_mode asserted but USE_PW_VQ = 0");
+      if (vq_mode_r && (st != S_IDLE)) begin
+        a_vq_window_inside_load: assert ($unsigned(w_addr_base) + $unsigned(cin_run)
+                                         <= $unsigned(cin_load))
+          else $error("VQ window %0d+%0d overruns the %0d channels loaded",
+                      w_addr_base, cin_run, cin_load);
+        a_vq_load_fits_pb: assert ($unsigned(cin_load) <= CIN_MAX)
+          else $error("vq_cin_load %0d exceeds CIN_MAX %0d", cin_load, CIN_MAX);
+      end
+    end
+  end
+`endif
 
 endmodule
 
