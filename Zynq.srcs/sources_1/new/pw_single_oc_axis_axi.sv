@@ -64,7 +64,27 @@ module pw_single_oc_axis_axi #(
   output logic [M_AXIS_DATA_WIDTH-1:0]      m_axis_tdata,
   output logic                              m_axis_tvalid,
   input  logic                              m_axis_tready,
-  output logic                              m_axis_tlast
+  output logic                              m_axis_tlast,
+
+  // ---- VQ-mode stream pair (USE_PW_VQ only; tie off / leave open otherwise)
+  // In VQ mode the engine's input is the LATENT read from DDR rather than the
+  // DW engine's output, and its output is the packed index stream rather than
+  // feature maps. Those are different DMA channels, so the engine needs a
+  // second stream pair and a mux -- the alternative, an AXIS switch in the
+  // block design, would add an IP, an address segment and a control path for
+  // what is three lines of logic.
+  //
+  // Which pair is live follows reg_vq_ctrl[0], the SAME bit that puts the core
+  // in VQ mode, so the stream selection and the datapath mode cannot disagree.
+  input  logic [S_AXIS_DATA_WIDTH-1:0]      s_axis_vq_tdata,
+  input  logic                              s_axis_vq_tvalid,
+  output logic                              s_axis_vq_tready,
+  input  logic                              s_axis_vq_tlast,
+
+  output logic [M_AXIS_DATA_WIDTH-1:0]      m_axis_vq_tdata,
+  output logic                              m_axis_vq_tvalid,
+  input  logic                              m_axis_vq_tready,
+  output logic                              m_axis_vq_tlast
 );
 
   // ============================================================
@@ -122,6 +142,49 @@ module pw_single_oc_axis_axi #(
   logic [31:0] reg_w_bram_off;   // base offset into selected weight BRAM bank
   logic [31:0] reg_param_addr;   // global OC address for bias/mult/shift writes
   logic [31:0] reg_vq_ctrl;      // [0]=vq_mode, [23:12]=vq_cin_load (USE_PW_VQ)
+
+  // ------------------------------------------------------------------
+  // STREAM SELECT. At USE_PW_VQ = 0 vq_stream is a constant 0, every
+  // ternary below folds to its else-arm and this IP is port-for-port and
+  // gate-for-gate what it was before the VQ pair existed -- the same
+  // elaboration-time folding the core relies on.
+  //
+  // The unselected slave is held NOT ready and the unselected master NOT
+  // valid, so an idle producer on the other pair simply stalls; nothing is
+  // dropped and no beat can cross between the two paths.
+  // ------------------------------------------------------------------
+  wire vq_stream = (USE_PW_VQ != 0) && reg_vq_ctrl[0];
+
+  wire [S_AXIS_DATA_WIDTH-1:0] core_s_tdata  = vq_stream ? s_axis_vq_tdata  : s_axis_tdata;
+  wire                         core_s_tvalid = vq_stream ? s_axis_vq_tvalid : s_axis_tvalid;
+  wire                         core_s_tlast  = vq_stream ? s_axis_vq_tlast  : s_axis_tlast;
+  wire                         core_s_tready;
+  assign s_axis_tready    = vq_stream ? 1'b0 : core_s_tready;
+  assign s_axis_vq_tready = vq_stream ? core_s_tready : 1'b0;
+
+  wire [M_AXIS_DATA_WIDTH-1:0] core_m_tdata;
+  wire                         core_m_tvalid, core_m_tlast;
+  wire                         core_m_tready = vq_stream ? m_axis_vq_tready : m_axis_tready;
+  assign m_axis_tdata     = core_m_tdata;
+  assign m_axis_tlast     = core_m_tlast;
+  assign m_axis_tvalid    = vq_stream ? 1'b0 : core_m_tvalid;
+  assign m_axis_vq_tdata  = core_m_tdata;
+  assign m_axis_vq_tlast  = core_m_tlast;
+  assign m_axis_vq_tvalid = vq_stream ? core_m_tvalid : 1'b0;
+
+`ifndef SYNTHESIS
+  // vq_mode is programmed before start_in and must not move under a live
+  // stream: flipping it mid-transfer would strand a beat in whichever FIFO
+  // was mid-handshake. Software sets it once per run; this catches a driver
+  // that does not.
+  logic vq_stream_d;
+  always_ff @(posedge s_axi_aclk) begin
+    vq_stream_d <= vq_stream;
+    if (s_axi_aresetn && (vq_stream != vq_stream_d))
+      a_vq_stream_stable: assert (!core_s_tvalid && !core_m_tvalid)
+        else $error("vq_mode changed while a stream was active");
+  end
+`endif
   logic        vq_norm_we;       // 1-cycle pulse on a write to ADDR_VQ_NORM
   logic [6:0]  vq_norm_addr;
   logic signed [19:0] vq_norm_data;
@@ -538,10 +601,10 @@ module pw_single_oc_axis_axi #(
     .param_bias_data(param_bias_rd), .param_mult_data(param_mult_rd),
     .param_shift_data(param_shift_rd),
 
-    .s_axis_tdata(s_axis_tdata), .s_axis_tvalid(s_axis_tvalid),
-    .s_axis_tready(s_axis_tready), .s_axis_tlast(s_axis_tlast),
-    .m_axis_tdata(m_axis_tdata), .m_axis_tvalid(m_axis_tvalid),
-    .m_axis_tready(m_axis_tready), .m_axis_tlast(m_axis_tlast),
+    .s_axis_tdata(core_s_tdata), .s_axis_tvalid(core_s_tvalid),
+    .s_axis_tready(core_s_tready), .s_axis_tlast(core_s_tlast),
+    .m_axis_tdata(core_m_tdata), .m_axis_tvalid(core_m_tvalid),
+    .m_axis_tready(core_m_tready), .m_axis_tlast(core_m_tlast),
     .in_overflow_out(in_overflow), .in_underflow_out(in_underflow),
     .out_overflow_out(out_overflow), .out_underflow_out(out_underflow)
   );
