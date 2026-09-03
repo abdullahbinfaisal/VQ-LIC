@@ -612,3 +612,55 @@ and is contained in the recommended schedule.
 > = 243 > 240**, so it would **not fit**; `12-32-64-64-64-64` sums to 239 and
 > would. This is a consequence of the proposed change, not a property of the built
 > system, and must never be cited as corroborating a schedule choice.
+
+---
+
+## 2026-09-03 — the frozen model still describes the OLD bitstream
+
+The service model frozen on 2026-09-02 (Route A / half-drain, R_sh = 2, T_DW
+on the (H+1) vertical-flush-row formulation) was calibrated and silicon-validated
+against the bitstream as it stood on that date. On 2026-09-03 the first data
+check this datapath has ever had (`tb_pw_axis_conv.sv`) found five defects in the
+PW compute path, and fixing them changed the schedule slightly. Both facts are
+recorded here; neither supersedes the other.
+
+**The OOS silicon measurements remain valid as measurements.** They record how
+long the accelerator takes to move a given number of beats. That is independent
+of whether the beats are numerically correct, and the five defects did not change
+any beat count — every shape emitted exactly the expected number of beats before
+the fixes as well as after. Nothing in the frozen-model validation needs redoing
+on account of the arithmetic.
+
+**What did change is the predicted period, by about one cycle per group.**
+Measured on identical vectors, pre-fix RTL vs post-fix RTL, no backpressure:
+
+| c_in | c_out | groups | batches/grp | pre-fix | post-fix | delta |
+|---|---|---|---|---|---|---|
+| 16 | 32 | 64 | 1 | 26115 ns | 26135 ns | +2 cyc total |
+| 8  | 32 | 32 | 1 | 11925 ns | 11945 ns | +2 cyc total |
+| 16 | 30 | 48 | 1 | 19385 ns | 19405 ns | +2 cyc total |
+| 16 | 48 | 40 | 2 | 23955 ns | 24365 ns | +41 cyc, ≈ +1/group |
+| 32 | 64 | 48 | 2 | 45955 ns | 46455 ns | +50 cyc, ≈ +1/group |
+| 64 | 64 | 24 | 2 | 39315 ns | 39575 ns | +26 cyc, ≈ +1/group |
+
+Two of the fixes move the schedule in opposite directions and very nearly cancel:
+the MAC pipeline gained the stage it was missing relative to the BRAM read latency
+(+1 cycle per batch), while the shadow copy now begins on the trigger cycle rather
+than one cycle later (−1 cycle per batch). Single-batch shapes cancel exactly; the
+residual on multi-batch shapes is about one cycle per group, roughly 1.5% of a
+group period.
+
+**Consequence for the manuscript.** Any number reported from the frozen model
+describes the bitstream the OOS runs were measured on, and should be attributed to
+it. If the design is rebuilt with the arithmetic fixes, the model will under-predict
+multi-batch layers by ≈1 cycle per group; that is a constant offset in a term the
+model already carries (the `+6` in the PW group-period expression becomes `+7`,
+against a copy that starts one cycle earlier), and it can be re-derived analytically
+rather than re-fitted. Do not re-fit constants to measurements — the freeze holds.
+
+**The correctness finding is separate and larger.** Before 2026-09-03 the PW engine
+did not compute correct convolutions for any shape, and did not compute them for
+multi-batch shapes even after four of the five fixes. Every rate/distortion or
+accuracy number that depends on PW output is therefore invalid for all builds prior
+to commit cb16322, on top of the already-recorded fact that no trained weights exist.
+Throughput, utilisation and timing-closure results are unaffected.
