@@ -14,7 +14,16 @@
 //   vq_cin_load = 64   channels STREAMED per group (one contiguous DDR read)
 //   cout_run    = 128  4 batches x 32 OC = 8 sub-codebooks x 16 codewords
 //
-// Run with +VECDIR=<dir> and +NGROUPS=<n>.
+// STATUS 2026-09-03: PASSES, 0 mismatches on all 256 beats, for all three
+// scenarios -- 0 random, 1 tie storm, 2 INT8 extremes. It failed until the
+// five PW datapath defects in commit cb16322 were fixed; nothing in the VQ
+// branch itself changed. The tie-storm and corner scenarios are what make
+// this more than a lucky pass: they pin the lowest-index tie rule and the
+// 20-bit score width at their limits.
+//
+// Vectors are read from the CURRENT RUN DIRECTORY by fixed name (xsim.bat
+// mangles plusargs); regenerate with
+//   gen_vq_vectors <ngroups> <scenario> <dir>
 // ============================================================================
 module tb_pw_vq;
 
