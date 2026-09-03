@@ -71,6 +71,11 @@ set SH_MARKERS [list "assign in_rd_en      = core_consume_in && core_valid_in;" 
 # power-up-to-zero behaviour the design already relied on explicit). ppu.sv is the
 # WORST file in the tree for staleness: the PW IP declares it once and the DW IP
 # declares it TWICE, so there are four source paths and several generated copies.
+# 2026-09-03: the AXI SHELL was never guarded, and it now carries the VQ
+# stream pair (s_axis_vq / m_axis_vq) plus the mux that selects it. A stale
+# copy would build a BD whose axi_dma_2 is wired to ports that do not exist.
+set AXI_MARKERS [list "s_axis_vq_tdata" "m_axis_vq_tvalid" \
+                      "wire vq_stream = (USE_PW_VQ != 0) && reg_vq_ctrl\[0\];"]
 set PPU_MARKERS [list "acc_biased_s0 = '0;" "pre_clamp_s3 = '0;"]
 
 proc die {msg} {
@@ -98,6 +103,7 @@ check_markers $ROOT/Zynq.srcs/src/pw_pixel_major_core.sv $PW_MARKERS "PW core"
 # PW shell: declared ONCE in Zynq.srcs/component.xml (unlike the DW sources), so
 # sources_1/new is the single authority for it.
 check_markers $ROOT/Zynq.srcs/sources_1/new/pw_single_oc_axis.sv $SH_MARKERS "PW shell"
+check_markers $ROOT/Zynq.srcs/sources_1/new/pw_single_oc_axis_axi.sv $AXI_MARKERS "PW AXI shell"
 # ppu.sv: shared by both IPs. Check the live tree (PW's declared path AND the DW's
 # second declared path) and the DW IP's own copy.
 check_markers $ROOT/Zynq.srcs/sources_1/new/ppu.sv $PPU_MARKERS "PPU (live tree)"
@@ -183,6 +189,7 @@ proc findall {dir name acc} {
 foreach {fname markers what} [list \
         pw_pixel_major_core.sv $PW_MARKERS "PW core" \
         pw_single_oc_axis.sv   $SH_MARKERS "PW shell" \
+        pw_single_oc_axis_axi.sv $AXI_MARKERS "PW AXI shell" \
         ppu.sv                 $PPU_MARKERS "PPU" \
         dw_fused_core.sv       $DW_MARKERS "DW core"] {
     set copies [list]
