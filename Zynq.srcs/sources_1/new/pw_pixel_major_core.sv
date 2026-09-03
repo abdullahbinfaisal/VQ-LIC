@@ -253,7 +253,14 @@ module pw_pixel_major_core #(
   // Accumulators: N_OC � N_LANES
   // shadow_acc replaced by BRAM to eliminate 10,240 FFs
   // ------------------------------------------------------------
-  logic signed [ACC_WIDTH-1:0] acc [0:N_OC-1][0:N_LANES-1];
+  // DECLARATION INITIALISER (2026-09-03) -- same rationale as ppu.sv's, see the
+  // long note there. acc has no reset (deliberately, to stay out of the async
+  // reset fanout cone), so SIMULATION started it X and that X reached every
+  // output, which is why this core has never had a data check. Xilinx honours
+  // SV declaration initialisers as the flop INIT attribute, i.e. the power-up
+  // state the silicon already had. Synthesisable, changes NOTHING on hardware,
+  // and lets tb_pw_vq.sv actually check data.
+  logic signed [ACC_WIDTH-1:0] acc [0:N_OC-1][0:N_LANES-1] = '{default:'0};
 
   // Shadow BRAM: depth=N_OC, width=N_LANES*ACC_WIDTH
   //
