@@ -33,6 +33,12 @@ module pw_pixel_major_core #(
   //                stride, which in VQ mode is 16 = 2 sub-codebooks x DSUB.
   input  logic                              vq_mode,
   input  logic [11:0]                       vq_cin_load,
+  // Codeword-norm ROM write port. ||v_k||^2 for absolute OC vq_norm_addr.
+  // A dedicated ROM, NOT the param-BRAM bias path: see the note at the VQ
+  // branch below for why the bias path is unsafe for the last OC of a batch.
+  input  logic                              vq_norm_we,
+  input  logic [6:0]                        vq_norm_addr,
+  input  logic signed [19:0]                vq_norm_data,
 
   // Weight BRAM read interface (all N_OC banks, 1-cycle latency)
   output logic [$clog2((COUT_MAX/N_OC)*CIN_MAX)-1:0] w_rd_addr,
@@ -478,13 +484,149 @@ module pw_pixel_major_core #(
   wire ppu_valid_out = ppu_valid_out_vec[0];
 
 
-  // Pack PPU output into pixel_out bus
+  // ============================================================
+  // VQ BRANCH  (USE_PW_VQ only)
+  //
+  // Snoops the PPU issue bus READ-ONLY. Nothing here can back-pressure or
+  // otherwise perturb the MAC, the accumulators or the drain FSM. In VQ mode
+  // the PPU still runs and its results are simply discarded by the output mux;
+  // in conv mode this whole block loses its readers and is stripped.
+  //
+  //   score_k = ||v_k||^2 - 2*acc_k        20 bits signed (derived in vq_pw.c)
+  //
+  // WHY A DEDICATED NORM ROM AND NOT THE PARAM-BRAM BIAS PATH
+  //   The obvious reuse is to carry ||v_k||^2 on ppu_bias_q, which is already
+  //   read per OC at exactly the right cycle. tb_pw_bias_align.sv shows that
+  //   is NOT safe: the drain's bias latch is gated by
+  //   (ppu_issue_idx + 1) < ppu_drain_len, so the LAST OC of every batch is
+  //   presented with the SECOND-TO-LAST OC's bias. Convolution has never
+  //   noticed because this project programs bias == 0 for every channel
+  //   (surr_fill_dummy_params), but VQ would silently mis-score k = 15 of
+  //   every sub-codebook. Rather than modify the validated drain FSM, the VQ
+  //   branch carries its own 128-entry norm ROM. 128 x 20 bits is distributed
+  //   RAM; the drain FSM is untouched.
+  //
+  // OC/BATCH SHADOWS
+  //   ppu_valid_in and ppu_acc_in are REGISTERED at issue, and ppu_issue_idx
+  //   increments on the same edge, so at the valid cycle the accumulator
+  //   belongs to OC (ppu_issue_idx - 1). A free-running one-cycle shadow gives
+  //   that index with no subtractor and no FSM change. ppu_oc_batch is
+  //   shadowed for the same reason: the last issue releases the drain to
+  //   P_IDLE, so S_BATCH_DONE can overwrite ppu_oc_batch on the very cycle the
+  //   last OC is presented.
+  //
+  // TIES: strict less-than keeps the LOWEST codeword index, matching
+  // vqpw_search_sub() and the retired vq_engine.sv comparator.
+  // ============================================================
+  localparam int VQ_K       = 16;
+  localparam int VQ_KW      = 4;
+  localparam int VQ_SCORE_W = 20;
+  localparam int VQ_NORM_D  = 128;
+  localparam int VQ_BEATS   = N_LANES / 2;   // two 32-bit positions per beat
+
+  logic [N_LANES*DATA_WIDTH-1:0] vq_pixel_out;
+  logic                          vq_valid_out;
+  wire  [N_LANES*DATA_WIDTH-1:0] ppu_pixel_bus;
+
   generate
-    for (genvar g = 0; g < N_LANES; g++) begin : G_PX_OUT
-      assign pixel_out[g*DATA_WIDTH +: DATA_WIDTH] = ppu_pixel_out[g];
+    for (genvar g = 0; g < N_LANES; g++) begin : G_PX_PACK
+      assign ppu_pixel_bus[g*DATA_WIDTH +: DATA_WIDTH] = ppu_pixel_out[g];
     end
   endgenerate
-  assign valid_out = ppu_valid_out;
+
+  generate
+  if (USE_PW_VQ != 0) begin : G_VQ
+    logic [$clog2(N_OC>1?N_OC+1:2)-1:0] vq_oc_r;
+    logic [11:0]                        vq_batch_r;
+    always_ff @(posedge clk) begin
+      vq_oc_r    <= ppu_issue_idx;
+      vq_batch_r <= ppu_oc_batch;
+    end
+
+    (* ram_style = "distributed" *) logic signed [VQ_SCORE_W-1:0] vq_norm [0:VQ_NORM_D-1];
+    always_ff @(posedge clk) if (vq_norm_we) vq_norm[vq_norm_addr] <= vq_norm_data;
+    wire [6:0] vq_norm_ra = {vq_batch_r[1:0], vq_oc_r[4:0]};
+    wire signed [VQ_SCORE_W-1:0] vq_norm_q = vq_norm[vq_norm_ra];
+
+    wire [VQ_KW-1:0] vq_k     = vq_oc_r[VQ_KW-1:0];
+    wire             vq_half  = vq_oc_r[VQ_KW];
+    wire             vq_first = (vq_k == {VQ_KW{1'b0}});
+    wire             vq_lastk = (vq_k == {VQ_KW{1'b1}});
+    wire [2:0]       vq_m     = {vq_batch_r[1:0], vq_half};
+    wire             vq_go    = vq_mode_r && ppu_valid_in;
+
+    logic signed [VQ_SCORE_W-1:0] vq_best  [0:N_LANES-1];
+    logic [VQ_KW-1:0]             vq_bestk [0:N_LANES-1];
+    logic [31:0]                  vq_word  [0:N_LANES-1];
+    wire signed [VQ_SCORE_W-1:0]  vq_score [0:N_LANES-1];
+    wire [N_LANES-1:0]            vq_take;
+    wire [VQ_KW-1:0]              vq_curk  [0:N_LANES-1];
+
+    for (genvar g = 0; g < N_LANES; g++) begin : G_VQ_LANE
+      wire signed [31:0] acc32 = 32'(ppu_acc_in[g]);
+      wire signed [31:0] sc32  = 32'(vq_norm_q) - (acc32 <<< 1);
+      assign vq_score[g] = sc32[VQ_SCORE_W-1:0];
+      assign vq_take[g]  = vq_first || (vq_score[g] < vq_best[g]);
+      assign vq_curk[g]  = vq_take[g] ? vq_k : vq_bestk[g];
+`ifndef SYNTHESIS
+      // The 20-bit truncation must be exact -- that is the derivation in
+      // vq_pw.c holding on real data, checked every single compare.
+      always_ff @(posedge clk)
+        if (rst_n && vq_go)
+          a_vq_score_fits: assert (sc32 === 32'(vq_score[g]))
+            else $error("VQ score %0d does not fit %0d bits", sc32, VQ_SCORE_W);
+`endif
+    end
+
+    logic       vq_pending, vq_emit_busy;
+    logic [$clog2(VQ_BEATS)-1:0] vq_beat;
+
+    always_ff @(posedge clk) begin
+      if (!rst_n) begin
+        vq_pending <= 1'b0; vq_emit_busy <= 1'b0; vq_beat <= '0;
+        for (int i = 0; i < N_LANES; i++) begin
+          vq_best[i] <= '0; vq_bestk[i] <= '0; vq_word[i] <= 32'd0;
+        end
+      end else begin
+        if (vq_go) begin
+          for (int i = 0; i < N_LANES; i++) begin
+            if (vq_take[i]) vq_best[i] <= vq_score[i];
+            vq_bestk[i] <= vq_curk[i];
+            if (vq_lastk) vq_word[i][{vq_m, 2'b00} +: VQ_KW] <= vq_curk[i];
+          end
+          // last codeword of the last sub-codebook of the last batch: the
+          // whole 32-bit word for every lane is complete on this edge.
+          if (vq_lastk && vq_half &&
+              ($unsigned(vq_batch_r) + 1 == $unsigned(cout_batches_r)))
+            vq_pending <= 1'b1;
+        end
+
+        if (vq_pending && !vq_emit_busy) begin
+          vq_emit_busy <= 1'b1;
+          vq_beat      <= '0;
+          vq_pending   <= 1'b0;
+        end else if (vq_emit_busy && !out_stall) begin
+          if ($unsigned(vq_beat) + 1 == VQ_BEATS) vq_emit_busy <= 1'b0;
+          vq_beat <= vq_beat + 1'b1;
+        end
+      end
+    end
+
+    // Position 2i occupies the LOW 32 bits so the S2MM writes it to the lower
+    // address: little-endian, matching vqpw_encode_frame()'s idx_out[pos*4].
+    assign vq_pixel_out = {vq_word[{vq_beat, 1'b1}], vq_word[{vq_beat, 1'b0}]};
+    assign vq_valid_out = vq_emit_busy && !out_stall;
+  end else begin : G_NO_VQ
+    assign vq_pixel_out = '0;
+    assign vq_valid_out = 1'b0;
+  end
+  endgenerate
+
+  // ---- output ownership mux ----
+  // Exactly one of the two sources drives the output FIFO, selected by the
+  // per-run latched mode. In conv builds the ternaries fold to ppu_*.
+  assign pixel_out = ((USE_PW_VQ != 0) && vq_mode_r) ? vq_pixel_out : ppu_pixel_bus;
+  assign valid_out = ((USE_PW_VQ != 0) && vq_mode_r) ? vq_valid_out : ppu_valid_out;
 
   // ------------------------------------------------------------
   // Counters

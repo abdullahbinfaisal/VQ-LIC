@@ -84,6 +84,7 @@ module pw_single_oc_axis_axi #(
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_W_BRAM_OFF  = 12'h02C; // RW: base offset in weight BRAM
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_PARAM_ADDR  = 12'h030; // RW: address for bias/mult/shift BRAM writes
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_VQ_CTRL     = 12'h034; // RW: [0]=vq_mode, [23:12]=vq_cin_load  (USE_PW_VQ only)
+  localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_VQ_NORM     = 12'h038; // W: [6:0]=OC, [31:12]=||v_k||^2 (USE_PW_VQ only)
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_W_BASE      = 12'h100; // W: weight BRAM data at offset w_bram_off + idx
 
   // ============================================================
@@ -121,6 +122,9 @@ module pw_single_oc_axis_axi #(
   logic [31:0] reg_w_bram_off;   // base offset into selected weight BRAM bank
   logic [31:0] reg_param_addr;   // global OC address for bias/mult/shift writes
   logic [31:0] reg_vq_ctrl;      // [0]=vq_mode, [23:12]=vq_cin_load (USE_PW_VQ)
+  logic        vq_norm_we;       // 1-cycle pulse on a write to ADDR_VQ_NORM
+  logic [6:0]  vq_norm_addr;
+  logic signed [19:0] vq_norm_data;
 
   logic        busy;
   logic        done_sticky;
@@ -374,6 +378,17 @@ module pw_single_oc_axis_axi #(
     end
   end
 
+  // Codeword-norm ROM write. One AXI-Lite write per entry, 128 entries total.
+  always_ff @(posedge s_axi_aclk) begin
+    if (!s_axi_aresetn) begin
+      vq_norm_we <= 1'b0;
+    end else begin
+      vq_norm_we   <= slv_reg_wren && (wr_addr == ADDR_VQ_NORM) && (USE_PW_VQ != 0);
+      vq_norm_addr <= s_axi_wdata[6:0];
+      vq_norm_data <= s_axi_wdata[31:12];
+    end
+  end
+
   // Weight BRAM write: triggered when AXI-Lite writes to weight space
   always_comb begin
     w_wr_en   = '0;
@@ -511,6 +526,8 @@ module pw_single_oc_axis_axi #(
     // write cannot perturb convolution in a build that did not ask for VQ.
     .vq_mode    ((USE_PW_VQ != 0) ? reg_vq_ctrl[0]     : 1'b0),
     .vq_cin_load((USE_PW_VQ != 0) ? reg_vq_ctrl[23:12] : 12'd0),
+    .vq_norm_we(vq_norm_we), .vq_norm_addr(vq_norm_addr),
+    .vq_norm_data(vq_norm_data),
 
     // Weight BRAM read (from core)
     .w_rd_addr(core_w_rd_addr), .w_rd_en(core_w_rd_en),

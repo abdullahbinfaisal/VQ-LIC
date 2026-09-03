@@ -41,6 +41,9 @@ module pw_single_oc_axis #(
   // ---- VQ mode pass-through (USE_PW_VQ only; tie low otherwise) ----
   input  logic                         vq_mode,
   input  logic [11:0]                  vq_cin_load,
+  input  logic                         vq_norm_we,
+  input  logic [6:0]                   vq_norm_addr,
+  input  logic signed [19:0]           vq_norm_data,
 
   // Weight BRAM read interface (from AXI wrapper BRAMs)
   output logic [$clog2((COUT_MAX/N_OC)*CIN_MAX)-1:0] w_rd_addr,
@@ -105,6 +108,8 @@ module pw_single_oc_axis #(
   //   Each stage is now ?6 CARRY4 deep ? timing closure at 100 MHz.
   logic [31:0] tile_groups_r;
   logic [11:0] cout_run_r;
+  wire  [11:0] out_beats_per_grp =
+      ((USE_PW_VQ != 0) && vq_mode) ? 12'(N_LANES/2) : cout_run_r;
   logic        start_in_d1, start_in_d2;
 
   (* use_dsp = "yes" *) logic [27:0] pp_lo_r;   // 16+12 = 28 bits
@@ -131,8 +136,12 @@ module pw_single_oc_axis #(
       end
 
       if (start_in_d1) begin                           // Cycle 2: two narrow DSP multiplies
-        pp_lo_r <= tile_groups_r[15:0]  * cout_run_r;
-        pp_hi_r <= tile_groups_r[31:16] * cout_run_r;
+        // Expected output beats per group. VQ mode emits N_LANES/2 packed
+        // index beats per group instead of one beat per output channel, so
+        // TLAST must be counted against that. Folds to cout_run_r when the
+        // VQ mode is not compiled in.
+        pp_lo_r <= tile_groups_r[15:0]  * out_beats_per_grp;
+        pp_hi_r <= tile_groups_r[31:16] * out_beats_per_grp;
       end
 
       if (start_in_d2)                                 // Cycle 3: cheap add + shift
@@ -311,6 +320,8 @@ module pw_single_oc_axis #(
     .tile_pixels(tile_pixels), .cin_run(cin_run), .cout_run(cout_run),
     .zp_in(zp_in), .zp_out(zp_out), .relu_en(relu_en),
     .vq_mode(vq_mode), .vq_cin_load(vq_cin_load),
+    .vq_norm_we(vq_norm_we), .vq_norm_addr(vq_norm_addr),
+    .vq_norm_data(vq_norm_data),
     .w_rd_addr(w_rd_addr), .w_rd_en(w_rd_en), .w_rd_data(w_rd_data),
     .param_rd_addr(param_rd_addr), .param_rd_en(param_rd_en),
     .param_bias_data(param_bias_data), .param_mult_data(param_mult_data),
