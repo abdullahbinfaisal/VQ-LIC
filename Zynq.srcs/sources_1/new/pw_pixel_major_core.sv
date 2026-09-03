@@ -302,30 +302,103 @@ module pw_pixel_major_core #(
   localparam int SA_AW     = SA_HIDX_W + 1;                     // {bank, halfidx}
   localparam int SA_DW     = N_LANES * ACC_WIDTH;
 
-  logic [SA_AW-1:0]  sha_wr_addr;
-  logic [SA_DW-1:0]  sha_wr_data_e, sha_wr_data_o;
-  logic              sha_wr_en_e,   sha_wr_en_o;
-  logic [SA_AW-1:0]  sha_rd_addr;
-  logic              sha_rd_en;
+  // shadow_copy_idx now counts HALF-PAIRS: cycle i copies OC 2i and OC 2i+1
+  logic [SA_HIDX_W-1:0] shadow_copy_idx;
+  logic              sha_wr_bank, sha_rd_bank;
+  logic              sha_copy_bank_r;   // bank THIS copy targets, latched at trig
+  logic              shadow_copying;
+  logic              shadow_copy_trig;  // 1-cycle pulse from main FSM -> shadow block
+
+  // ==================================================================
+  // SHADOW WRITE PORT -- rewritten 2026-09-03. Two defects lived here,
+  // both found by tb_pw_axis_conv.sv, the first data check this datapath
+  // has ever had.
+  //
+  // DEFECT W1 (data/address skew). sha_wr_addr was REGISTERED from
+  //   shadow_copy_idx while sha_wr_data_e/o were COMBINATIONAL from the
+  //   same counter, so by the cycle the address reached the BRAM the
+  //   counter had already advanced: the copy stored accumulator pair i+1
+  //   at half-index i, and pair 0 wrapped onto the LAST index. Observed
+  //   directly -- acc[0][0] = 6 was written at half-index 15.
+  //
+  // DEFECT W2 (bank). The copy addressed sha_wr_bank, but S_BATCH_DONE
+  //   flips that register in the very cycle it hands the just-filled bank
+  //   to the drain, and the flip always landed before the copy's first
+  //   write. The copy therefore wrote the bank the drain was NOT reading:
+  //   batch 0 drained an untouched bank (all zeros, every output byte
+  //   equal to zp_out) and every later batch drained its predecessor.
+  //
+  // Fix for both: drive address, data and BOTH enables combinationally
+  // from ONE index in ONE cycle, and target the bank latched at the
+  // trigger -- the PRE-flip sha_wr_bank, which is exactly the value
+  // sha_rd_bank takes in the same cycle. Beginning on the trigger cycle
+  // also places each pair in the BRAM one cycle before the drain can ask
+  // for it, which is what makes the copy/drain chase safe WITHOUT adding
+  // a cycle to the batch schedule.
+  // ==================================================================
+  wire                 copy_now      = shadow_copy_trig | shadow_copying;
+  wire [SA_HIDX_W-1:0] copy_idx_now  = shadow_copy_trig ? '0 : shadow_copy_idx;
+  wire                 copy_bank_now = shadow_copy_trig ? sha_wr_bank : sha_copy_bank_r;
+
+  wire [SA_AW-1:0]  sha_wr_addr = {copy_bank_now, copy_idx_now};
+  wire [SA_DW-1:0]  sha_wr_data_e, sha_wr_data_o;
+  wire              sha_wr_en_e = copy_now;
+  // The odd write is suppressed on a ragged final pair, i.e. when Q_last is
+  // odd and OC 2i+1 does not exist.
+  wire              sha_wr_en_o = copy_now &&
+                        (({copy_idx_now, 1'b1}) < $unsigned(shadow_copy_len));
+
+  // Read port. Address and enable are COMBINATIONAL and assigned further
+  // down, where ppu_issue_idx is in scope; see DEFECT R1 there.
+  wire [SA_AW-1:0]  sha_rd_addr;
+  wire              sha_rd_en;
   logic [SA_DW-1:0]  sha_rd_data_e, sha_rd_data_o;
   logic              sha_rd_parity;      // registered: which half issue j wants
   logic [SA_DW-1:0]  sha_rd_data;        // muxed, drives ppu_acc_in as before
 
   assign sha_rd_data = sha_rd_parity ? sha_rd_data_o : sha_rd_data_e;
 
-  // shadow_copy_idx now counts HALF-PAIRS: cycle i copies OC 2i and OC 2i+1
-  logic [SA_HIDX_W-1:0] shadow_copy_idx;
-  logic              sha_wr_bank, sha_rd_bank;
-  logic              shadow_copying;
-  logic              shadow_copy_trig;  // 1-cycle pulse from main FSM -> shadow block
+  // ==================================================================
+  // DEFECT W3 (the copy raced the next batch's accumulator) -- fixed
+  // 2026-09-03.
+  //
+  // The copy walks acc two output channels per cycle, so it needs
+  // ceil(Q/2) cycles -- 16 for Q = 32. But S_BATCH_DONE launches the NEXT
+  // batch's compute immediately, and that batch's first accumulate lands
+  // on acc about 7 cycles later with first_ic set, overwriting EVERY
+  // channel at once. Everything the copy had not yet read was therefore
+  // taken from the successor's partial sums, not from the batch being
+  // drained. Measured with cout=48: output channels 0..13 (pairs 0..6,
+  // copied before the clobber) were exact and 14..31 were the next
+  // batch's in-flight state. Single-batch shapes were immune only
+  // because S_WAIT_PPU holds the group boundary on !shadow_copying, which
+  // is why cout <= N_OC passed and every real multi-batch layer did not.
+  //
+  // The snapshot makes the copy atomic: acc is captured whole in ONE
+  // cycle at the trigger, and the copy dribbles THAT into the BRAM. The
+  // trigger cycle itself still writes pair 0 straight from acc, because
+  // sha_snap only becomes valid the cycle after -- acc is still the
+  // drained batch's final value at that point, so the two agree.
+  //
+  // Costs N_OC*N_LANES*ACC_WIDTH flip-flops and no cycles.
+  // ==================================================================
+  logic signed [ACC_WIDTH-1:0] sha_snap [0:N_OC-1][0:N_LANES-1] = '{default:'0};
+  always_ff @(posedge clk) begin
+    if (shadow_copy_trig)
+      for (int oci = 0; oci < N_OC; oci++)
+        for (int li = 0; li < N_LANES; li++)
+          sha_snap[oci][li] <= acc[oci][li];
+  end
 
   genvar _g;
   generate
     for (_g = 0; _g < N_LANES; _g++) begin : G_SHA_PACK
       assign sha_wr_data_e[_g*ACC_WIDTH +: ACC_WIDTH] =
-               acc[{shadow_copy_idx, 1'b0}][_g];   // OC 2i
+               shadow_copy_trig ? acc[{copy_idx_now, 1'b0}][_g]
+                                : sha_snap[{copy_idx_now, 1'b0}][_g];   // OC 2i
       assign sha_wr_data_o[_g*ACC_WIDTH +: ACC_WIDTH] =
-               acc[{shadow_copy_idx, 1'b1}][_g];   // OC 2i+1
+               shadow_copy_trig ? acc[{copy_idx_now, 1'b1}][_g]
+                                : sha_snap[{copy_idx_now, 1'b1}][_g];   // OC 2i+1
     end
   endgenerate
 
@@ -413,7 +486,28 @@ module pw_pixel_major_core #(
   logic signed [32:0] p_packed_reg [0:N_OC-1][0:(N_LANES/2)-1]; // Dual-MAC packed product register
   logic                         mul_valid;  // p_packed_reg contains valid data
   logic [DATA_WIDTH-1:0]        pb_pixel_r [0:N_LANES-1] = '{default:'0};  // registered BRAM output (raw)
-  logic                         rd_issued_d1;  // delayed rd_issued (BRAM data registered)
+  // ==================================================================
+  // DEFECT M1 (pipeline one stage short of the BRAM latency) -- fixed
+  // 2026-09-03.
+  //
+  // rd_issued is high during the cycle a pixel-buffer / weight read is
+  // ISSUED; with READ_LATENCY_B = 1 that read's data only appears the
+  // NEXT cycle. The stage-2 capture was gated on rd_issued itself, so it
+  // ran one cycle early: the first capture of every batch took whatever
+  // the buses held BEFORE the first read completed, and the capture
+  // window closed one cycle before the LAST channel's data arrived. Net
+  // effect per batch: one stale product accumulated (with first_ic set,
+  // so it was not even masked) and channel cin-1 never multiplied at all.
+  // Measured: with cin=16 the accumulator reached -5 where the reference
+  // was 1, the difference being exactly a[15]*w[15] = 6, and the leading
+  // product came from the previous batch's operands.
+  //
+  // rd_issued_q is that missing stage. The capture chain now tracks the
+  // data, not the address. This adds ONE cycle of MAC pipeline latency
+  // per batch, which lengthens S_COMPUTE's drain by one cycle.
+  // ==================================================================
+  logic                         rd_issued_q = 1'b0;   // read's DATA is on the bus
+  logic                         rd_issued_d1;  // delayed rd_issued_q (pb_pixel_r valid)
   logic                         rd_issued_d2;  // delayed rd_issued_d1 (a_packed_r valid)
 
   // Unpack pixel buffer read data into per-lane values (combinational, used for registration)
@@ -668,6 +762,25 @@ module pw_pixel_major_core #(
 
   // Load sub-FSM
   logic [$clog2(CIN_MAX)-1:0]        load_ic_idx;
+
+  // ==================================================================
+  // INPUT HANDSHAKE -- fixed 2026-09-03.
+  //
+  // DEFECT L1 (beat latched one cycle before it is popped). Both load
+  // sites used to latch pixel_in on `valid_in` ALONE and only then assert
+  // consume_in. consume_in is a REGISTERED output and the wrapper drives
+  // the FWFT input FIFO's rd_en from it, so the pop only took effect the
+  // cycle AFTER the latch: dout still presented the same word, the core
+  // latched it a second time at the next address, and every channel from
+  // there on landed one address high. The last channel of every group was
+  // then never stored at all, because the load terminates on a beat count.
+  // Measured directly: pb_ram[i] held activation i-1 for all i >= 1.
+  //
+  // A beat is TRANSFERRED only on a cycle where the core is both offered a
+  // word and already asserting consume -- that is the cycle the wrapper
+  // pops it. Latch on that, and only that.
+  // ==================================================================
+  wire in_xfer = valid_in && consume_in;
   logic                               next_grp_ready;
 
   // PPU sub-FSM
@@ -687,6 +800,35 @@ module pw_pixel_major_core #(
   // $clog2(N_OC+1) guarantees the terminal value is representable.
   logic [$clog2(N_OC>1?N_OC+1:2)-1:0]  ppu_issue_idx;
   logic [31:0]                        ppu_out_cnt;
+
+  // ==================================================================
+  // SHADOW READ PORT -- rewritten 2026-09-03.
+  //
+  // DEFECT R1 (address one cycle late). The pair consumed at drain cycle j
+  // must be on doutb AT cycle j, so its read has to be ISSUED at cycle
+  // j-1. sha_rd_addr was a REGISTER assigned during cycle j-1, so it only
+  // reached the BRAM address bus at cycle j and its data arrived at j+1 --
+  // one cycle too late. sha_rd_parity, assigned in the same statement, was
+  // already correctly aligned to the consumption cycle, so the two drifted
+  // apart: issue j received pair (j-1)>>1 selected by parity j&1. Observed
+  // as odd issues landing on the right half of the wrong pair.
+  //
+  // Driving the address combinationally from the CURRENT issue index puts
+  // it on the bus in the same cycle the FSM decides it, one cycle ahead of
+  // the data, which is what a 1-cycle-latency BRAM needs.
+  //
+  // Stalls: out_stall drops sha_rd_en, so doutb HOLDS the pending pair for
+  // the whole stall and the resume cycle consumes exactly what it would
+  // have consumed unstalled. Holding the enable instead would re-read the
+  // already-advanced address and lose that pair.
+  // ==================================================================
+  wire [11:0] sha_rd_oc_next = (ppu_st == P_PARAM_WAIT)
+                             ? 12'd0                              // prefetch OC 0
+                             : (12'($unsigned(ppu_issue_idx)) + 12'd1);
+  assign sha_rd_en   = (ppu_st == P_PARAM_WAIT)
+                    || ((ppu_st == P_DRAIN) && !out_stall
+                        && (($unsigned(ppu_issue_idx) + 1) < $unsigned(ppu_drain_len)));
+  assign sha_rd_addr = {sha_rd_bank, SA_HIDX_W'(sha_rd_oc_next >> 1)};
 
   // OPTION C (2026-08-07): the drain context is released when the last beat has
   // been ISSUED, not when it has RETIRED, so a batch's outputs can still be
@@ -719,6 +861,7 @@ module pw_pixel_major_core #(
       w_rd_addr     <= '0;
       w_rd_en       <= 1'b0;
       rd_issued     <= 1'b0;
+      rd_issued_q   <= 1'b0;
       rd_issued_d1  <= 1'b0;
       rd_issued_d2  <= 1'b0;
       mul_valid     <= 1'b0;
@@ -745,7 +888,7 @@ module pw_pixel_major_core #(
       // causing a Recovery violation identical to the one already fixed above.
       // shadow_copying/shadow_copy_idx/sha_wr_en: synchronous reset (separate block)
       shadow_copy_trig <= 1'b0;
-      sha_rd_en       <= 1'b0;
+      sha_rd_parity <= 1'b0;
       sha_wr_bank <= 1'b0; sha_rd_bank <= 1'b0;
 
 
@@ -764,7 +907,6 @@ module pw_pixel_major_core #(
       pb_b_wr_en   <= 1'b0;
       pb_a_rd_en   <= 1'b0;
       pb_b_rd_en   <= 1'b0;
-      sha_rd_en        <= 1'b0;
       shadow_copy_trig <= 1'b0;  // default deassert; set in S_COMPUTE when batch done
 
       // OPTION C: PPU pipeline occupancy. Maintained here, outside the FSM,
@@ -829,8 +971,12 @@ module pw_pixel_major_core #(
         //   (no compute to overlap with yet)
         // --------------------------------------------------------
         S_LOAD_FIRST: begin
-          if (valid_in) begin
-            consume_in   <= 1'b1;
+          // Request the next beat one cycle ahead, and drop the request on the
+          // beat that completes the group so the FIFO is never popped for a
+          // word this state will not store. See DEFECT L1 above.
+          consume_in <= valid_in &&
+                        !(in_xfer && (($unsigned(ic_idx) + 1) == cin_load));
+          if (in_xfer) begin
             pb_a_wr_en   <= 1'b1;
             pb_a_wr_addr <= ic_idx[PB_AW-1:0];
             pb_a_wr_data <= pixel_in;
@@ -904,8 +1050,11 @@ module pw_pixel_major_core #(
           // and -2.7 ns slack. Now only registered signals enter the DSP48.
           rd_issued_d2 <= rd_issued_d1;
 
-          // Pipeline stage 2: register BRAM output (data arrived from read)
-          rd_issued_d1 <= rd_issued;
+          // Pipeline stage 2: register BRAM output (data arrived from read).
+          // rd_issued_q marks the cycle the DATA is valid; everything
+          // downstream hangs off it. See DEFECT M1 above.
+          rd_issued_q  <= rd_issued;
+          rd_issued_d1 <= rd_issued_q;
 
           // Pipeline stage 1: issue BRAM reads
           if ($unsigned(ic_idx) < cin_run) begin
@@ -923,7 +1072,8 @@ module pw_pixel_major_core #(
             ic_idx     <= ic_idx + 1'b1;
           end else begin
             rd_issued <= 1'b0;
-            if (!rd_issued && !rd_issued_d1 && !rd_issued_d2 && !mul_valid) begin
+            if (!rd_issued && !rd_issued_q && !rd_issued_d1 && !rd_issued_d2
+                && !mul_valid) begin
               // DOUBLE-BUFFER CHANGE 2026-07-30. This used to require
               // `ppu_st == P_IDLE`, i.e. batch N+1 could not finish its compute
               // until batch N's PPU drain had fully RETIRED (N_OC issues plus
@@ -1073,8 +1223,10 @@ module pw_pixel_major_core #(
       case (load_st)
         L_IDLE:  begin end  // nothing to do
         L_LOADING: begin
-          if (valid_in) begin
-            consume_in <= 1'b1;
+          // Same one-cycle-ahead request as S_LOAD_FIRST; see DEFECT L1.
+          consume_in <= valid_in &&
+                        !(in_xfer && (($unsigned(load_ic_idx) + 1) == cin_load));
+          if (in_xfer) begin
             // Write to inactive buffer (opposite of compute_buf)
             if (compute_buf) begin
               // Compute reads B ? load writes A
@@ -1120,8 +1272,8 @@ module pw_pixel_major_core #(
             param_rd_addr <= ppu_oc_batch * N_OC + 1;
           end
           // Pre-read shadow BRAM OC 0 (1-cycle BRAM latency ? data ready at P_DRAIN cycle 0)
-          sha_rd_en     <= 1'b1;
-          sha_rd_addr   <= {sha_rd_bank, {SA_HIDX_W{1'b0}}};
+          // The OC 0 pre-read is issued COMBINATIONALLY this cycle (see
+          // SHADOW READ PORT above); only the parity select is registered.
           sha_rd_parity <= 1'b0;                     // issue 0 -> even half
           ppu_st <= P_DRAIN;
         end
@@ -1149,14 +1301,11 @@ module pw_pixel_major_core #(
               if (($unsigned(ppu_issue_idx) + 1) == $unsigned(ppu_drain_len))
                 ppu_st <= P_IDLE;
 
-              // Pre-read NEXT OC from shadow BRAM (data arrives next cycle)
+              // OC j lives at half-index j>>1 in half (j&1). Both halves share
+              // one address bus, driven combinationally above so the read for
+              // OC j+1 is issued THIS cycle; only the parity that selects the
+              // half is registered, so it lands with the data it selects.
               if (($unsigned(ppu_issue_idx) + 1) < $unsigned(ppu_drain_len)) begin
-                // OC j lives at half-index j>>1 in half (j&1). Both halves share
-                // this address bus; sha_rd_parity selects which one the muxed
-                // sha_rd_data presents, registered so it lands with the data.
-                sha_rd_en     <= 1'b1;
-                sha_rd_addr   <= {sha_rd_bank,
-                                  SA_HIDX_W'(($unsigned(ppu_issue_idx) + 1) >> 1)};
                 sha_rd_parity <= ($unsigned(ppu_issue_idx) + 1) & 1'b1;
               end
 
@@ -1188,7 +1337,9 @@ module pw_pixel_major_core #(
 
   // Synchronous-only datapath registers to map optimally to the DSP48 input pipeline
   always_ff @(posedge clk) begin
-    if (rd_issued) begin
+    // Gated on rd_issued_q, not rd_issued: the data for a read issued in
+    // cycle t lands on the bus in cycle t+1. See DEFECT M1 above.
+    if (rd_issued_q) begin
       for (int li = 0; li < N_LANES; li++) begin
         pb_pixel_r[li] <= pb_pixel[li];
       end
@@ -1217,23 +1368,18 @@ module pw_pixel_major_core #(
     if (!rst_n) begin
       shadow_copying  <= 1'b0;
       shadow_copy_idx <= '0;
-      sha_wr_en_e     <= 1'b0;
-      sha_wr_en_o     <= 1'b0;
+      sha_copy_bank_r <= 1'b0;
     end else begin
-      sha_wr_en_e <= 1'b0;  // default deassert
-      sha_wr_en_o <= 1'b0;
+      // Two OCs per cycle: 2i into the even half, 2i+1 into the odd half.
+      // The write PORT itself (address, data, both enables) is combinational
+      // and lives with the declarations above; this block only sequences the
+      // index. Pair 0 is written on the TRIGGER cycle via copy_idx_now, so
+      // the registered index starts at 1.
       if (shadow_copy_trig) begin
-        // Latch trigger; start copy from idx 0
-        shadow_copying  <= 1'b1;
-        shadow_copy_idx <= '0;
+        sha_copy_bank_r <= sha_wr_bank;        // PRE-flip: the bank the drain reads
+        shadow_copying  <= ($unsigned(copy_pairs) > 12'd1);
+        shadow_copy_idx <= ($unsigned(copy_pairs) > 12'd1) ? SA_HIDX_W'(1) : '0;
       end else if (shadow_copying) begin
-        // Two OCs per cycle: 2i into the even half, 2i+1 into the odd half.
-        // The odd write is suppressed on a ragged final pair, i.e. when
-        // Q_last is odd and OC 2i+1 does not exist.
-        sha_wr_en_e <= 1'b1;
-        sha_wr_en_o <= (({shadow_copy_idx, 1'b1}) < $unsigned(shadow_copy_len));
-        sha_wr_addr <= {sha_wr_bank, shadow_copy_idx};
-        // sha_wr_data_e/o driven combinationally from acc[2i] / acc[2i+1]
         if ($unsigned(shadow_copy_idx) >= (copy_pairs - 1)) begin
           shadow_copying  <= 1'b0;
           shadow_copy_idx <= '0;

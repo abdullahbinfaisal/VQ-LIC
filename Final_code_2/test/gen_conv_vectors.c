@@ -36,8 +36,12 @@
 #include <stdint.h>
 
 #define LANES 8
+#ifndef CIN
 #define CIN   16
+#endif
+#ifndef COUT
 #define COUT  32
+#endif
 #define ZP    128
 
 static uint32_t st = 0x13579BDFu;

@@ -245,9 +245,18 @@ module pw_single_oc_axis #(
   // unconditional ALONE does nothing (tried: bit-identical), and the occupancy
   // guard ALONE oscillates at half rate, because a gated consume does not pop
   // and so the threshold and in_occ disagree. Both are required together.
-  assign in_rd_en      = core_consume_in;
-  assign core_valid_in = !in_empty &&
-                         ($unsigned(in_occ) > (core_consume_in ? 32'd1 : 32'd0));
+  // HANDSHAKE SIMPLIFIED 2026-09-03. Everything above this line describes
+  // attempts to stop the core consuming a word it never stored. The cause was
+  // in the CORE, not here: it latched dout on valid_in alone, one cycle before
+  // its own registered consume_in popped that word (pw_pixel_major_core.sv,
+  // DEFECT L1). With the core latching only on a real transfer, the ordinary
+  // FWFT handshake is correct and the in_occ guard is no longer needed --
+  // worse, it would now deadlock the final beat, because it withholds valid
+  // exactly when consume is high and one word remains.
+  //   in_rd_en pops precisely the word the core latches this cycle.
+  // in_occ is retained above for the assertion and for waveform debug only.
+  assign in_rd_en      = core_consume_in && core_valid_in;
+  assign core_valid_in = !in_empty;
 
   xpm_fifo_sync #(
     .DOUT_RESET_VALUE("0"), .ECC_MODE("no_ecc"), .FIFO_MEMORY_TYPE("block"),

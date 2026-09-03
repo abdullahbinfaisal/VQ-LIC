@@ -33,9 +33,21 @@ module tb_pw_axis_conv;
   localparam int W_AW       = $clog2((COUT_MAX/N_OC)*CIN_MAX);
   localparam int PARAM_AW   = $clog2(COUT_MAX);
 
-  localparam int NG   = 64;    // groups
-  localparam int CIN  = 16;
-  localparam int COUT = 32;
+  // Shape is overridable from the command line (xvlog -d) so one bench can
+  // sweep several shapes, including cout values that are NOT a multiple of
+  // N_OC -- those exercise the ragged final pair in the shadow copy.
+`ifndef TB_NG
+  `define TB_NG 64
+`endif
+`ifndef TB_CIN
+  `define TB_CIN 16
+`endif
+`ifndef TB_COUT
+  `define TB_COUT 32
+`endif
+  localparam int NG   = `TB_NG;   // groups
+  localparam int CIN  = `TB_CIN;
+  localparam int COUT = `TB_COUT;
 
   logic clk = 0, rst_n = 0;
   always #5 clk = ~clk;
@@ -71,11 +83,18 @@ module tb_pw_axis_conv;
   logic [7:0]  w_mem   [0:COUT*CIN-1];
   logic [63:0] exp_mem [0:NG*COUT-1];
 
-  // ---- weight BRAM model: 1-cycle registered read, bank per OC ----
+  // ---- weight BRAM model: 1-cycle registered read, one bank per OC SLOT ----
+  // The real memory (pw_single_oc_axis_axi.sv) instantiates N_OC banks; bank b
+  // holds every output channel congruent to b mod N_OC, at address
+  // batch*cin + ic. Output channel oc therefore lives in bank oc%N_OC at
+  // address (oc/N_OC)*cin + ic. An earlier version of this model indexed
+  // w_mem[oc*CIN + addr], which only holds ONE batch per bank and so fed
+  // garbage to every batch above the first -- a bench defect, not an RTL one.
+  logic [7:0] w_bank [0:N_OC-1][0:(COUT_MAX/N_OC)*CIN_MAX-1];
   always_ff @(posedge clk) begin
     if (w_rd_en)
       for (int oc = 0; oc < N_OC; oc++)
-        w_rd_data[oc] <= $signed(w_mem[oc*CIN + int'(w_rd_addr)]);
+        w_rd_data[oc] <= $signed(w_bank[oc][int'(w_rd_addr)]);
   end
 
   // ---- param BRAM model: the identity requantiser ----
@@ -88,7 +107,10 @@ module tb_pw_axis_conv;
   end
 
   pw_single_oc_axis #(
-    .USE_PW_VQ(1),                 // compiled in, but vq_mode is LOW here:
+`ifndef TB_VQBUILD
+  `define TB_VQBUILD 1
+`endif
+    .USE_PW_VQ(`TB_VQBUILD),       // compiled in, but vq_mode is LOW here:
                                    // this also proves the VQ build does not
                                    // disturb ordinary convolution.
     .DATA_WIDTH(DATA_WIDTH), .ACC_WIDTH(ACC_WIDTH),
@@ -157,8 +179,17 @@ module tb_pw_axis_conv;
     end
   end
 
-  // ---- AXIS output sink, always ready ----
-  assign m_axis_tready = 1'b1;
+  // ---- AXIS output sink ----
+  // TB_BP > 0 applies pseudo-random backpressure, which is what drives
+  // out_prog_full and therefore the core's out_stall. The shadow read port is
+  // combinational in out_stall, so the drain's stall/resume behaviour has to
+  // be exercised, not assumed.
+`ifndef TB_BP
+  `define TB_BP 0
+`endif
+  logic [15:0] bp_lfsr = 16'hACE1;
+  always_ff @(posedge clk) bp_lfsr <= {bp_lfsr[14:0], bp_lfsr[15]^bp_lfsr[13]^bp_lfsr[12]^bp_lfsr[10]};
+  assign m_axis_tready = (`TB_BP == 0) ? 1'b1 : (bp_lfsr[6:0] >= `TB_BP);
 
   int nout = 0, nbad = 0, nlast = 0, nshift = 0;
   always_ff @(posedge clk) begin
@@ -183,9 +214,77 @@ module tb_pw_axis_conv;
     end
   end
 
+  // ---- SHADOW-PATH PROBE (2026-09-03) -------------------------------------
+  // Dumps the shadow write (copy) and shadow read (drain) sides cycle by cycle
+  // for the first two batches, to settle where the accumulators are lost.
+  int dbgw = 0;
+  always_ff @(posedge clk) begin
+    if (rst_n && dut.u_core.sha_wr_en_e && dbgw < 40) begin
+      $display("  W[%0t] wr_addr=%0h (bank=%0b half=%0h) wr_bank=%0b rd_bank=%0b dat_e0=%0d dat_o0=%0d",
+               $time, dut.u_core.sha_wr_addr,
+               dut.u_core.sha_wr_addr[4],
+               dut.u_core.sha_wr_addr[3:0],
+               dut.u_core.sha_wr_bank, dut.u_core.sha_rd_bank,
+               $signed(dut.u_core.sha_wr_data_e[23:0]),
+               $signed(dut.u_core.sha_wr_data_o[23:0]));
+      dbgw++;
+    end
+  end
+
+  int dbgr = 0;
+  always_ff @(posedge clk) begin
+    if (rst_n && dut.u_core.ppu_st != 2'd0 && dbgr < 44) begin
+      $display("  R[%0t] st=%0d issue=%0d rd_en=%0b rd_addr=%0h par=%0b  e0=%0d o0=%0d mux=%0d -> ppu_acc0=%0d v=%0b",
+               $time, dut.u_core.ppu_st, dut.u_core.ppu_issue_idx,
+               dut.u_core.sha_rd_en, dut.u_core.sha_rd_addr, dut.u_core.sha_rd_parity,
+               $signed(dut.u_core.sha_rd_data_e[23:0]),
+               $signed(dut.u_core.sha_rd_data_o[23:0]),
+               $signed(dut.u_core.sha_rd_data[23:0]),
+               dut.u_core.ppu_acc_in[0], dut.u_core.ppu_valid_in);
+      dbgr++;
+    end
+  end
+
+  // ---- MAC-FEED PROBE: every operand pair actually accumulated -------------
+  // Decodes lane 0's activation out of the dual-MAC packed word and pairs it
+  // with OC 0's registered weight, at the exact cycle acc is updated.
+  int dbgm = 0;
+  always_ff @(posedge clk) begin
+    if (rst_n && dut.u_core.st == 3'd2 && dut.u_core.mul_valid && dbgm < 20) begin
+      $display("  M[%0d] act0=%0d w_oc0=%0d prod_lo=%0d first_ic=%0b acc00(before)=%0d ic_idx=%0d",
+               dbgm,
+               $signed(dut.u_core.a_packed_r[0][8:0]),
+               dut.u_core.w_rd_data_rr[0],
+               $signed(dut.u_core.p_packed_reg[0][0][15:0]),
+               dut.u_core.first_ic, dut.u_core.acc[0][0], dut.u_core.ic_idx);
+      dbgm++;
+    end
+  end
+
+  // ---- FULL-CYCLE S_COMPUTE TRACE: both operand streams side by side -------
+  int dbgc = 0;
+  always_ff @(posedge clk) begin
+    if (rst_n && dut.u_core.st == 3'd2 && dbgc < 26) begin
+      $display("  C[%0d] ic=%0d rdi=%0b d1=%0b d2=%0b mv=%0b | wa=%0d wdat=%0d wr=%0d wrr=%0d | pba=%0d pbdat=%0d pbr=%0d apk=%0d | fic=%0b acc=%0d",
+               dbgc, dut.u_core.ic_idx, dut.u_core.rd_issued,
+               dut.u_core.rd_issued_d1, dut.u_core.rd_issued_d2, dut.u_core.mul_valid,
+               dut.u_core.w_rd_addr, dut.u_core.w_rd_data[0],
+               dut.u_core.w_rd_data_r[0], dut.u_core.w_rd_data_rr[0],
+               dut.u_core.pb_a_rd_addr, $signed({1'b0,dut.u_core.pb_pixel[0]}) - 128,
+               $signed({1'b0,dut.u_core.pb_pixel_r[0]}) - 128,
+               $signed(dut.u_core.a_packed_r[0][8:0]),
+               dut.u_core.first_ic, dut.u_core.acc[0][0]);
+      dbgc++;
+    end
+  end
+
   initial begin
     $readmemh("conv_latent.hex",  lat_mem);
     $readmemh("conv_weights.hex", w_mem);
+    // fill the per-slot banks only AFTER the file has been read
+    for (int oc = 0; oc < COUT; oc++)
+      for (int c = 0; c < CIN; c++)
+        w_bank[oc % N_OC][(oc / N_OC)*CIN + c] = w_mem[oc*CIN + c];
     $readmemh("conv_expect.hex",  exp_mem);
 
     $display("\n=== PW convolution at the AXIS level (real FIFOs, real backpressure) ===");
