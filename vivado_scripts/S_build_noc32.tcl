@@ -46,7 +46,7 @@ set PW_MARKERS [list "N_OC+1" "ppu_drain_len" "sha_wr_bank" "ppu_in_flight" \
                      {$signed(first_ic ? '0 : acc[oci][p*2])} \
                      {+ $signed({1'b0, p_packed_reg[oci][p][15]})} \
                      "rd_issued_q" "sha_snap" "copy_idx_now" "sha_copy_bank_r" \
-                     "in_xfer"]
+                     "in_xfer" "DEFECT P1"]
 # 2026-09-03: the five new core markers are the arithmetic defects fixed in
 # commit cb16322 (W1 copy data/address skew, W2 copy bank, W3 copy racing the
 # next batch, R1 shadow read address, L1 input handshake, M1 missing MAC stage).

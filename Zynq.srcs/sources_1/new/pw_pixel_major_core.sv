@@ -1309,15 +1309,40 @@ module pw_pixel_major_core #(
                 sha_rd_parity <= ($unsigned(ppu_issue_idx) + 1) & 1'b1;
               end
 
-              // Param pipeline: latch arriving, pre-read next
-              if (($unsigned(ppu_issue_idx) + 1) < $unsigned(ppu_drain_len)) begin
-                ppu_bias_q  <= param_bias_data;
-                ppu_mult_q  <= param_mult_data[23:0];
-                ppu_shift_q <= param_shift_data;
-                if (($unsigned(ppu_issue_idx) + 2) < $unsigned(ppu_drain_len)) begin
-                  param_rd_en   <= 1'b1;
-                  param_rd_addr <= ppu_oc_batch * N_OC + ppu_issue_idx + 2;
-                end
+              // ==================================================
+              // PARAM PIPELINE -- DEFECT P1 fixed 2026-09-03.
+              //
+              // param_bias_data at drain cycle j holds OC j's parameters
+              // (the read for OC j was issued two cycles earlier), and the
+              // PPU consumes them the cycle AFTER issue j. So the latch has
+              // to happen on EVERY issue, j = 0 .. drain_len-1.
+              //
+              // It used to sit INSIDE the (issue+1 < drain_len) bound that
+              // belongs to the PRE-READ. On the last issue of every batch
+              // that test is false, so the latch was skipped and the final
+              // output channel was requantised with the parameters of OC
+              // drain_len-2 -- its bias, its multiplier and its shift.
+              // Measured by tb_pw_bias_align.sv before the fix:
+              //   "observations = 32, skewed = 1
+              //    -- bias 30 presented with OC 31's accumulator"
+              // At drain_len = 1 nothing was ever latched at all and the
+              // single channel used the stale P_PARAM_WAIT value.
+              //
+              // The identity-requantiser convolution check could not see
+              // this: it sets bias = 0, mult = 1<<16 and shift = 16 for
+              // every channel, so a swapped parameter set is invisible.
+              // gen_conv_vectors.c now emits a per-channel bias for exactly
+              // this reason.
+              //
+              // Only the PRE-READ needs a bound -- it must not address past
+              // the last output channel of the batch.
+              // ==================================================
+              ppu_bias_q  <= param_bias_data;
+              ppu_mult_q  <= param_mult_data[23:0];
+              ppu_shift_q <= param_shift_data;
+              if (($unsigned(ppu_issue_idx) + 2) < $unsigned(ppu_drain_len)) begin
+                param_rd_en   <= 1'b1;
+                param_rd_addr <= ppu_oc_batch * N_OC + ppu_issue_idx + 2;
               end
             end
 

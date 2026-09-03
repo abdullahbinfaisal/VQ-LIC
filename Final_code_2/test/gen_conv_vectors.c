@@ -49,6 +49,12 @@ static uint32_t xs(void){ uint32_t x=st; x^=x<<13; x^=x>>17; x^=x<<5; return st=
 
 static uint8_t  lat[4096][CIN][LANES];   /* [group][channel][lane] */
 static int8_t   w  [COUT][CIN];
+/* PER-OUTPUT-CHANNEL BIAS. The identity requantiser used to set bias = 0 for
+ * every channel, which made the whole per-OC parameter path invisible to this
+ * test -- and that is exactly where DEFECT P1 lived (the last channel of each
+ * batch was requantised with the previous channel's parameters). A distinct
+ * bias per channel makes any parameter/channel swap a data mismatch. */
+static int32_t  bias[COUT];
 
 static FILE *xopen(const char *d, const char *n)
 {
@@ -71,6 +77,11 @@ int main(int argc, char **argv)
     for (int oc = 0; oc < COUT; oc++)
         for (int c = 0; c < CIN; c++)
             w[oc][c] = (int8_t)((int)(xs() % 5u) - 2);
+    /* distinct, small, and never two adjacent channels alike: oc*5 mod 23
+     * shifted to [-11,11], so an off-by-one in the parameter path always
+     * shows up as a wrong output byte. */
+    for (int oc = 0; oc < COUT; oc++)
+        bias[oc] = ((oc * 5) % 23) - 11;
 
     FILE *f = xopen(dir, "conv_latent.hex");
     for (int g = 0; g < ng; g++)
@@ -78,6 +89,11 @@ int main(int argc, char **argv)
             for (int l = LANES - 1; l >= 0; l--) fprintf(f, "%02x", lat[g][c][l]);
             fputc('\n', f);
         }
+    fclose(f);
+
+    f = xopen(dir, "conv_bias.hex");
+    for (int oc = 0; oc < COUT; oc++)
+        fprintf(f, "%08x\n", (unsigned)(uint32_t)bias[oc]);
     fclose(f);
 
     f = xopen(dir, "conv_weights.hex");
@@ -94,9 +110,9 @@ int main(int argc, char **argv)
                 int32_t acc = 0;
                 for (int c = 0; c < CIN; c++)
                     acc += ((int32_t)lat[g][c][l] - ZP) * (int32_t)w[oc][c];
-                if (acc < amin) amin = acc;
-                if (acc > amax) amax = acc;
-                int32_t o = acc + ZP;
+                if (acc + bias[oc] < amin) amin = acc + bias[oc];
+                if (acc + bias[oc] > amax) amax = acc + bias[oc];
+                int32_t o = acc + bias[oc] + ZP;
                 if (o < 0) o = 0; else if (o > 255) o = 255;
                 fprintf(f, "%02x", (unsigned)o);
             }
@@ -105,7 +121,7 @@ int main(int argc, char **argv)
     fclose(f);
 
     printf("conv vectors: %d groups, cin=%d cout=%d -> %s\n", ng, CIN, COUT, dir);
-    printf("acc range [%ld, %ld]  (must stay inside [-128,127] so the clamp is inert)\n",
+    printf("acc+bias range [%ld, %ld]  (must stay inside [-128,127] so the clamp is inert)\n",
            amin, amax);
     if (amin < -128 || amax > 127) {
         fprintf(stderr, "ERROR: acc escaped the no-clamp window; reference would be ambiguous\n");

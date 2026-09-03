@@ -97,10 +97,16 @@ module tb_pw_axis_conv;
         w_rd_data[oc] <= $signed(w_bank[oc][int'(w_rd_addr)]);
   end
 
-  // ---- param BRAM model: the identity requantiser ----
+  // ---- param BRAM model: identity multiplier, REAL per-channel bias ----
+  // mult = 1<<16 and shift = 16 keep the requantiser exact (out = acc+bias+128
+  // with no rounding), but the bias is now a distinct value per output channel
+  // and is addressed by param_rd_addr exactly as the real BRAM is. A constant
+  // bias made the per-OC parameter path unobservable, which is how DEFECT P1
+  // survived the first data check.
+  logic signed [31:0] bias_mem [0:COUT_MAX-1];
   always_ff @(posedge clk) begin
     if (param_rd_en) begin
-      param_bias_data  <= 32'sd0;
+      param_bias_data  <= bias_mem[int'(param_rd_addr)];
       param_mult_data  <= 32'h0001_0000;
       param_shift_data <= 8'd16;
     end
@@ -281,6 +287,8 @@ module tb_pw_axis_conv;
   initial begin
     $readmemh("conv_latent.hex",  lat_mem);
     $readmemh("conv_weights.hex", w_mem);
+    for (int i = 0; i < COUT_MAX; i++) bias_mem[i] = 32'sd0;
+    $readmemh("conv_bias.hex", bias_mem);
     // fill the per-slot banks only AFTER the file has been read
     for (int oc = 0; oc < COUT; oc++)
       for (int c = 0; c < CIN; c++)
