@@ -407,12 +407,12 @@ module pw_pixel_major_core #(
   // channels it MACs; VQ mode loads all 64 and MACs a 16-wide window of them.
   wire [11:0] cin_load = ((USE_PW_VQ != 0) && vq_mode_r) ? vq_cin_load_r : cin_run;
 
-  logic signed [DATA_WIDTH-1:0] w_rd_data_r   [0:N_OC-1]; // Fixes 1-cycle weight alignment bug
-  logic signed [DATA_WIDTH-1:0] w_rd_data_rr  [0:N_OC-1]; // stage-2.5 registered weights for DSP path
-  logic signed [24:0]           a_packed_r    [0:(N_LANES/2)-1]; // stage-2.5 registered packed activations
+  logic signed [DATA_WIDTH-1:0] w_rd_data_r   [0:N_OC-1] = '{default:'0}; // Fixes 1-cycle weight alignment bug
+  logic signed [DATA_WIDTH-1:0] w_rd_data_rr  [0:N_OC-1] = '{default:'0}; // stage-2.5 registered weights for DSP path
+  logic signed [24:0]           a_packed_r    [0:(N_LANES/2)-1] = '{default:'0}; // stage-2.5 registered packed activations
   logic signed [32:0] p_packed_reg [0:N_OC-1][0:(N_LANES/2)-1]; // Dual-MAC packed product register
   logic                         mul_valid;  // p_packed_reg contains valid data
-  logic [DATA_WIDTH-1:0]        pb_pixel_r [0:N_LANES-1];  // registered BRAM output (raw)
+  logic [DATA_WIDTH-1:0]        pb_pixel_r [0:N_LANES-1] = '{default:'0};  // registered BRAM output (raw)
   logic                         rd_issued_d1;  // delayed rd_issued (BRAM data registered)
   logic                         rd_issued_d2;  // delayed rd_issued_d1 (a_packed_r valid)
 
@@ -451,7 +451,13 @@ module pw_pixel_major_core #(
   generate
     for (genvar oc = 0; oc < N_OC; oc++) begin : G_DSP_OC
       for (genvar p = 0; p < N_LANES/2; p++) begin : G_DSP_P
-        (* use_dsp = "yes" *) logic signed [32:0] p_reg;
+        // DECLARATION INITIALISER (2026-09-03), same rationale as ppu.sv's:
+        // no reset keeps this out of the async-reset cone, but simulation then
+        // starts it X and that X reaches acc on the very first accumulate.
+        // Xilinx honours SV initialisers as the flop INIT attribute -- the
+        // power-up state silicon already had -- so this is synthesisable and
+        // changes nothing on hardware.
+        (* use_dsp = "yes" *) logic signed [32:0] p_reg = '0;
         always_ff @(posedge clk) begin
           if (rd_issued_d2) begin
             p_reg <= p_packed_comb[oc][p];
@@ -466,7 +472,7 @@ module pw_pixel_major_core #(
   // N_LANES PPUs (reused across OCs sequentially)
   // ------------------------------------------------------------
   logic                              ppu_valid_in;
-  logic signed [ACC_WIDTH-1:0]       ppu_acc_in    [0:N_LANES-1];
+  logic signed [ACC_WIDTH-1:0]       ppu_acc_in    [0:N_LANES-1] = '{default:'0};
   logic [DATA_WIDTH-1:0]             ppu_pixel_out [0:N_LANES-1];
   logic [N_LANES-1:0]                ppu_valid_out_vec;
 
@@ -482,7 +488,14 @@ module pw_pixel_major_core #(
         .relu_en(relu_en_r),
         .mult_conv(ppu_mult_q), .shift_conv(ppu_shift_q), .bias_in(ppu_bias_q),
         .zp_out(zp_out_r),
-        .valid_in(ppu_valid_in), .conv_acc_in(ppu_acc_in[g]),
+        .valid_in(ppu_valid_in),
+        // EXPLICIT SIGN-EXTENSION (2026-09-03). ppu.sv declares conv_acc_in as
+        // 32 bits; ppu_acc_in is ACC_WIDTH (24) wide. The implicit connection
+        // left conv_acc_in[31:24] FLOATING, which simulates as X and poisoned
+        // acc_biased_s0 and therefore every PPU output -- the reason this core
+        // could never be data-checked. Synthesis ties the unconnected bits low,
+        // so on hardware this changes nothing; it makes simulation match.
+        .conv_acc_in(32'(ppu_acc_in[g])),
         .pixel_out(ppu_pixel_out[g]), .valid_out(ppu_valid_out_vec[g])
       );
     end

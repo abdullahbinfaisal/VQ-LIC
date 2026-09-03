@@ -52,13 +52,17 @@ module tb_pw_vq;
 
   logic [W_AW-1:0]              w_rd_addr;
   logic                         w_rd_en;
-  logic signed [DATA_WIDTH-1:0] w_rd_data [0:N_OC-1];
+  // Model the real weight BRAM's POWER-UP STATE. xpm memories read 0 from
+  // uninitialised locations; an uninitialised TB array reads X, and that X
+  // reaches w_rd_data_rr -> p_reg -> acc on the very first MAC and poisons
+  // every result. This was the actual cause of the earlier bench failures.
+  logic signed [DATA_WIDTH-1:0] w_rd_data [0:N_OC-1] = '{default:'0};
 
   logic [PARAM_AW-1:0] param_rd_addr;
   logic                param_rd_en;
-  logic signed [31:0]  param_bias_data;
-  logic [31:0]         param_mult_data;
-  logic [7:0]          param_shift_data;
+  logic signed [31:0]  param_bias_data = '0;
+  logic [31:0]         param_mult_data = '0;
+  logic [7:0]          param_shift_data = '0;
 
   logic                          valid_in;
   logic [N_LANES*DATA_WIDTH-1:0] pixel_in;
