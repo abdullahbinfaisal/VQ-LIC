@@ -39,8 +39,19 @@
  *   (cin_load = 64, one contiguous DDR read) but each batch's MAC walks only
  *   cin_mac = 16 pb_ram entries starting at vq_base = 16*b.
  *
- *   ||v_k||^2 is delivered by the EXISTING per-OC param-BRAM bias read, which
- *   already lands at the right cycle during the PPU drain. No new storage.
+ *   ||v_k||^2 is delivered by a DEDICATED 128 x 20-bit distributed-RAM ROM in
+ *   the VQ branch, written over AXI-lite at ADDR_VQ_NORM (0x038) and addressed
+ *   {batch[1:0], oc[4:0]} in absolute OC order.
+ *
+ *   THIS PARAGRAPH USED TO SAY the norm rides the existing per-OC param-BRAM
+ *   bias read, with no new storage. That was the plan and it is NOT what was
+ *   built. The bias path had an off-by-one -- the last output channel of every
+ *   batch received the previous channel's bias, mult and shift (DEFECT P1 in
+ *   pw_pixel_major_core.sv) -- so the norm was given its own ROM rather than
+ *   made to depend on it. P1 has since been fixed and tb_pw_bias_align.sv now
+ *   reports skewed = 0, but the ROM stays: it is verified, it costs ~40
+ *   LUTRAM, and it keeps VQ independent of the requantiser parameter path
+ *   entirely. Do not "restore" the bias-path version.
  *
  * LAYOUTS
  *   latent   : group-major/channel-minor, as the accelerator writes it.
