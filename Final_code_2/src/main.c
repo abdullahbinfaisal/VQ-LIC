@@ -591,7 +591,12 @@ static int g_cascade_accum = 0;
  * on one bitstream and one binary, and runs no VQ and no range coding.
  * Takes precedence over RUN_EDGE_VALIDATION; set to 0 to restore the normal
  * edge-encoder run, which is otherwise untouched. */
-#define RUN_OOS_VALIDATION 1
+/* 0 as of 2026-09-04: this and RUN_EDGE_VALIDATION are mutually exclusive
+ * (see the #if/#elif in main), and at 1 the OOS sweep runs INSTEAD of the
+ * edge validation -- so none of the PW-hosted VQ path would execute. Set
+ * back to 1 to run the out-of-sample service-model sweep, which now links
+ * because oos_validation.c is in the build list. */
+#define RUN_OOS_VALIDATION 0
 
 
 typedef unsigned long long u64_cycles;

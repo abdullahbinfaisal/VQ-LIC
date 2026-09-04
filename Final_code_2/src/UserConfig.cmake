@@ -40,6 +40,10 @@ set(USER_COMPILE_SOURCES
 "range_coder.c"
 "edge_pipeline.c"
 "edge_harness.c"
+"oos_validation.c" # referenced by main.c under RUN_OOS_VALIDATION but never
+                   # listed here, so the link failed on
+                   # edge_oos_validation_run. Listed now so BOTH run modes
+                   # link; which one executes is RUN_OOS_VALIDATION.
 )
 
 # -----------------------------------------

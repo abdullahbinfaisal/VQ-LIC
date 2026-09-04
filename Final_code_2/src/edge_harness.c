@@ -224,10 +224,17 @@ static int8_t          g_pw_cb[VQPW_M * VQPW_K * VQPW_DSUB];
 
 /* Index ping-pong. The VQ's S2MM writes one buffer while the PS consumes the
  * other, so a consumer of frame n-1's indices can run while frame n's search
- * is still in flight. g_pl_idx is the second half of the pair. */
+ * is still in flight. g_pl_idx is the second half of the pair.
+ *
+ * Only edge_one_pipelined() uses these, so they are compiled with it --
+ * otherwise this is 57.6 KB of BSS reserved for a path that is switched
+ * off, on a board where the harness already holds >1 MB of static index
+ * storage. */
+#if EDGE_PIPELINED
 static uint8_t         g_pw_idx_b[VQ_IDX_BYTES];
 static uint8_t        *g_idx_cur  = 0;   /* the search is writing this      */
 static uint8_t        *g_idx_prev = 0;   /* complete, safe for the PS       */
+#endif
 
 static void edge_pw_synth_codebook(void)
 {
