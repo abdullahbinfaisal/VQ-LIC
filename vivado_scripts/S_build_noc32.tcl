@@ -208,6 +208,31 @@ if {[get_property PROGRESS [get_runs impl_1]] ne "100%"} {
     die "impl_1 did not finish: [get_property STATUS [get_runs impl_1]]"
 }
 
+# ---- guard: the GENERIC that synthesis actually bound -------------------
+# 2026-09-04. CONFIG.USE_PW_VQ read back as 1 from the BD while synthesis
+# bound the generic to 0 and compiled the entire VQ branch out: the IP's
+# modelParameter was missing spirit:resolve="generated", so the HDL
+# parameter never followed the user parameter. The build looked completely
+# healthy -- it just had no VQ in it. Read the value synthesis really used.
+set slog $ROOT/Zynq.runs/synth_1/runme.log
+if {[file exists $slog]} {
+    set fh [open $slog r]; set stext [read $fh]; close $fh
+    if {[regexp {USE_PW_VQ bound to: ([0-9a-zA-Z']+)} $stext -> bound]} {
+        puts "SYNTH BOUND USE_PW_VQ = $bound"
+        set ones [regexp -all {1} $bound]
+        set want [get_property CONFIG.USE_PW_VQ [get_bd_cells -quiet pw_single_oc_axis_axi_0]]
+        if {$want eq "1" && $ones == 0} {
+            die "BD asks for USE_PW_VQ=1 but synthesis bound 0 -- the VQ branch was compiled OUT.\n#   Check spirit:resolve=generated on the USE_PW_VQ modelParameter in Zynq.srcs/component.xml."
+        }
+        if {$want eq "0" && $ones != 0} {
+            die "BD asks for USE_PW_VQ=0 but synthesis bound a non-zero value"
+        }
+        puts "OK: synthesised generic matches the BD request (USE_PW_VQ=$want)"
+    } else {
+        puts "WARN: could not find USE_PW_VQ in the synthesis log to verify"
+    }
+}
+
 # ---- netlist verification ----
 set log [slurp $ROOT/Zynq.runs/synth_1/runme.log]
 if {[string first "Synth 8-2490" $log] >= 0} { die "duplicate module definition -- a stale copy may have won" }
