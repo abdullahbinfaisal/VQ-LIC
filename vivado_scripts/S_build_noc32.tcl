@@ -169,6 +169,11 @@ set now [get_property CONFIG.N_OC $pwcell]
 if {$now ne $SET_N_OC} { die "N_OC did not take: asked $SET_N_OC, read back $now" }
 puts "OK: N_OC $was -> $now on pw_single_oc_axis_axi_0"
 
+# Remember what the BD asks for while the design is still open; the guard
+# after the run cannot query it, because the BD is closed by then.
+set WANT_VQ [get_property CONFIG.USE_PW_VQ $pwcell]
+puts "OK: BD requests USE_PW_VQ = $WANT_VQ"
+
 # reset_target invalidates parameter propagation; without -force the BD reports
 # "already validated", skips it, and smartconnect fails on si_properties.
 if {[catch {validate_bd_design -force} e]} { die "validate_bd_design failed: $e" }
@@ -220,7 +225,7 @@ if {[file exists $slog]} {
     if {[regexp {USE_PW_VQ bound to: ([0-9a-zA-Z']+)} $stext -> bound]} {
         puts "SYNTH BOUND USE_PW_VQ = $bound"
         set ones [regexp -all {1} $bound]
-        set want [get_property CONFIG.USE_PW_VQ [get_bd_cells -quiet pw_single_oc_axis_axi_0]]
+        set want $WANT_VQ
         if {$want eq "1" && $ones == 0} {
             die "BD asks for USE_PW_VQ=1 but synthesis bound 0 -- the VQ branch was compiled OUT.\n#   Check spirit:resolve=generated on the USE_PW_VQ modelParameter in Zynq.srcs/component.xml."
         }
