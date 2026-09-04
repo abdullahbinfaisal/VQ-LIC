@@ -148,6 +148,50 @@ void st_print_pipeline(void)
     }
 }
 
+/* Find the ST_VQ_RUN interval of a frame. Returns 0 if there is none. */
+static int vq_span(uint32_t frame, unsigned long long *a, unsigned long long *b)
+{
+    for (int i = 0; i < s_n; i++) {
+        if (s_ev[i].frame != frame || s_ev[i].stage != ST_VQ_RUN ||
+            s_ev[i].phase != ST_BEGIN) continue;
+        for (int j = i + 1; j < s_n; j++)
+            if (s_ev[j].stage == ST_VQ_RUN && s_ev[j].frame == frame &&
+                s_ev[j].phase == ST_END) { *a = s_ev[i].t; *b = s_ev[j].t; return 1; }
+    }
+    return 0;
+}
+
+void st_print_hiding(void)
+{
+    printf("#STHIDE,frame,vq_ms,hidden_ms,exposed_ms\n");
+    const int nf = nframes();
+    for (int k = 0; k < nf; k++) {
+        const uint32_t f = frame_at(k);
+        unsigned long long va, vb;
+        if (!vq_span(f, &va, &vb)) continue;
+
+        /* Sum the parts of OTHER stages that fall inside the VQ interval.
+         * Stages are not nested with each other in this harness, so summing
+         * their clipped intersections does not double count. */
+        double hidden = 0.0;
+        for (int i = 0; i < s_n; i++) {
+            if (s_ev[i].phase != ST_BEGIN) continue;
+            if (s_ev[i].stage == ST_VQ_RUN || s_ev[i].stage == ST_FRAME) continue;
+            unsigned long long a = s_ev[i].t, b = 0;
+            for (int j = i + 1; j < s_n; j++)
+                if (s_ev[j].stage == s_ev[i].stage && s_ev[j].idx == s_ev[i].idx &&
+                    s_ev[j].frame == s_ev[i].frame && s_ev[j].phase == ST_END) { b = s_ev[j].t; break; }
+            if (!b) continue;
+            const unsigned long long lo = (a > va) ? a : va;
+            const unsigned long long hi = (b < vb) ? b : vb;
+            if (hi > lo) hidden += ep_cycles_to_ms(hi - lo);
+        }
+        const double vq = ep_cycles_to_ms(vb - va);
+        if (hidden > vq) hidden = vq;
+        printf("#STHIDE,%u,%.4f,%.4f,%.4f\n", (unsigned)f, vq, hidden, vq - hidden);
+    }
+}
+
 int st_check_exclusive(void)
 {
     int bad = 0;

@@ -105,7 +105,35 @@ int main(void)
     chk(st_check_exclusive() == 1,
         "impossible trace IS caught (DW_PW straddling VQ_RUN on one engine)");
 
-    /* ---- 4. disabled tracing costs nothing and records nothing ----------- */
+    /* ---- 4. the hiding metric on the REAL pipelined shape ---------------- */
+    /* edge_one_pipelined's structure: analysis, then VQ with the next frame's
+     * input preparation running inside it. VQ 2,450 us, PACK 1,800 us nested
+     * entirely within it -> hidden 1.8 ms, exposed 0.65 ms. */
+    st_reset();
+    st_set_frame(0);
+    at(0);     ST_BEGIN_S(ST_FRAME);
+    at(0);     ST_BEGIN_I(ST_DW_PW, 0);
+    at(13446); ST_END_I(ST_DW_PW, 0);
+    at(13446); ST_BEGIN_S(ST_VQ_PROG);
+    at(13746); ST_END_S(ST_VQ_PROG);
+    at(13746); ST_BEGIN_S(ST_VQ_RUN);
+    at(13800); ST_BEGIN_S(ST_PACK);          /* CPU work under the search */
+    at(15600); ST_END_S(ST_PACK);            /* 1,800 us, fully inside    */
+    at(16196); ST_END_S(ST_VQ_RUN);          /* 2,450 us total            */
+    at(16196); ST_END_S(ST_FRAME);
+    printf("  -- pipelined shape --\n");
+    st_print_hiding();
+    chk(st_check_exclusive() == 0, "pipelined shape is engine-legal");
+
+    /* a fully serial frame must report the whole VQ as exposed */
+    st_reset();
+    st_set_frame(0);
+    at(0);    ST_BEGIN_S(ST_VQ_RUN);
+    at(2450); ST_END_S(ST_VQ_RUN);
+    printf("  -- serial shape --\n");
+    st_print_hiding();
+
+    /* ---- 5. disabled tracing costs nothing and records nothing ----------- */
     st_reset();
     st_enable(0);
     st_set_frame(0);

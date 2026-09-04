@@ -155,6 +155,15 @@ extern const char *edge_pm_group_name(int i);
  * A and B are INTERLEAVED, not run sequentially. A sequential idle-then-active
  * attempt on 2026-07-30 returned physically impossible NEGATIVE deltas because
  * thermal drift over the run exceeded the signal. */
+/* EDGE_PIPELINED -- run the measured loop through edge_one_pipelined(), which
+ * overlaps the VQ with the next frame's CPU-side input preparation. Default 0
+ * so the serial numbers already in the record remain the default output; set
+ * to 1 to measure the pipelined topology. Both emit the same stage trace, so
+ * #STPIPE makes the difference visible rather than asserted. */
+#ifndef EDGE_PIPELINED
+#define EDGE_PIPELINED 0
+#endif
+
 #ifndef EDGE_POWER
 #define EDGE_POWER 1      /* 1 = run the power measurement after all timing */
 #endif
@@ -190,6 +199,13 @@ static int             g_pl_ok = 0;      /* set only after the block identifies 
  * PRE-CENTRED int8, i.e. v = cq - 128 already applied, which is the form
  * vqpw_init() expects and the only form the signed weight port can carry. */
 static int8_t          g_pw_cb[VQPW_M * VQPW_K * VQPW_DSUB];
+
+/* Index ping-pong. The VQ's S2MM writes one buffer while the PS consumes the
+ * other, so a consumer of frame n-1's indices can run while frame n's search
+ * is still in flight. g_pl_idx is the second half of the pair. */
+static uint8_t         g_pw_idx_b[VQ_IDX_BYTES];
+static uint8_t        *g_idx_cur  = 0;   /* the search is writing this      */
+static uint8_t        *g_idx_prev = 0;   /* complete, safe for the PS       */
 
 static void edge_pw_synth_codebook(void)
 {
@@ -277,30 +293,49 @@ static int edge_prepare(int n, ep_src_layout_t layout,
  * reported duty makes that visible rather than hiding it.
  */
 #if EDGE_POWER
-/* One PIPELINED frame, the deployed topology: the PL VQ for the PREVIOUS
- * frame's latent overlaps THIS frame's analysis. They use disjoint hardware --
- * analysis on HP0/HP1, VQ on HP2 -- and disjoint latent buffers, which is what
- * the chain double-buffering exists for: edge_run_six_pairs writes the buffer
- * the VQ is not reading.
+/* One PIPELINED frame.
  *
- * run_vq=0 gives the same loop with the VQ never started, so A and B differ in
- * exactly one thing. */
+ * ---------------------------------------------------------------------------
+ * THE OVERLAP THIS FUNCTION USED TO PERFORM IS NO LONGER LEGAL.
+ * ---------------------------------------------------------------------------
+ * It started the VQ on the PREVIOUS frame's latent and then ran THIS frame's
+ * analysis concurrently, on the stated grounds that the two used disjoint
+ * hardware: analysis on HP0/HP1, VQ on HP2. That was true of the DEDICATED VQ
+ * block. It is false since 62cbfbc -- VQ now runs on the PW engine, the same
+ * engine the analysis cascade drives. Starting both would reprogram the engine
+ * out from under a search in flight.
+ *
+ * The DMA ports are still disjoint, and the latent is still genuinely
+ * double-buffered by g_edge_parity, so the memory-side reasoning survives. It
+ * is the ENGINE that is now shared, and no amount of buffering fixes that.
+ *
+ * The legal ordering is analysis THEN VQ. What can overlap the VQ is PS-side
+ * work that touches neither the PW engine nor the buffers in flight; see
+ * edge_one_pipelined() for the measured version. This function keeps the
+ * A/B contract (run_vq toggles exactly one thing) for the power sweep.
+ */
 static const uint8_t *g_pipe_lat = 0;
 
 static int edge_pipe_frame(int run_vq)
 {
-    int started = 0;
-    if (run_vq && g_pl_ok && g_pipe_lat) {
-        vq_pl_cache_prep(g_pipe_lat, g_pl_idx, 0);
-        if (vq_pl_start(g_pipe_lat, g_pl_idx) == 0) started = 1;
-    }
     if (edge_run_six_pairs(edge_chw_ptr()) != 0) return -1;
-    if (started) {
-        int r; unsigned long guard = 0;
-        while ((r = vq_pl_poll_done()) == 0 && ++guard < 200000000u) { }
-        if (r > 0) vq_pl_finish(g_pl_idx);
+    g_pipe_lat = edge_latent_ptr();
+
+#if EDGE_USE_PW_VQ
+    if (run_vq && g_pl_ok && g_pipe_lat) {
+        /* The analysis just overwrote the weight BRAM the codebook lives in. */
+        if (vq_pw_pl_load_codebook(g_pw_cb, 128) == 0) {
+            vq_pw_pl_cache_prep(g_pipe_lat, g_pl_idx, 0);
+            if (vq_pw_pl_start(g_pipe_lat, g_pl_idx) == 0) {
+                int r; unsigned long guard = 0;
+                while ((r = vq_pw_pl_poll_done()) == 0 && ++guard < 200000000u) { }
+                if (r > 0) vq_pw_pl_finish(g_pl_idx);
+            }
+        }
     }
-    g_pipe_lat = edge_latent_ptr();      /* becomes the NEXT frame's VQ input */
+#else
+    (void)run_vq;
+#endif
     return 0;
 }
 
@@ -413,6 +448,115 @@ static void edge_power_measure(const vq_pq_ctx_t *vq)
 // ---------------------------------------------------------------------------
 // One measured frame.  The single contiguous bracket is t_e0..t_e1.
 // ---------------------------------------------------------------------------
+/* ---------------------------------------------------------------------------
+ * One SOFTWARE-PIPELINED frame -- the deployed topology once VQ shares the PW
+ * engine.
+ *
+ * WHAT CAN AND CANNOT OVERLAP, and why this ordering is the one that is legal:
+ *
+ *   analysis(f)  and  VQ(f)      CANNOT overlap. One PW engine. This is the
+ *                                hard bound: II >= T_analysis + T_VQ_exposed.
+ *   analysis(f+1) and VQ(f)      CANNOT overlap, same reason. Buffering does
+ *                                not help; the contended resource is the
+ *                                engine, not the memory.
+ *   VQ(f) and PS-side work       CAN overlap, provided that work touches
+ *                                neither the PW engine nor a buffer in flight.
+ *
+ * So the VQ is started as soon as the analysis frees the engine, and the next
+ * frame's input is prepared on the CPU while the search runs in PL. That input
+ * preparation writes edge_chw_ptr(), which frame f's analysis has already
+ * finished reading and frame f's VQ never touches -- so it is safe without any
+ * further buffering.
+ *
+ * The latent needs no extra work either: g_edge_parity already alternates the
+ * chain buffers per frame, so frame f+1's cascade writes the buffer frame f's
+ * VQ is not reading. The INDEX buffers are ping-ponged here (g_idx_cur /
+ * g_idx_prev) so a consumer of frame f-1's indices can run while frame f's
+ * search is in flight.
+ *
+ * The overlap is MEASURED, not asserted: ST_PACK is marked inside the
+ * ST_VQ_RUN interval, so #STPIPE reports what actually happened. If the CPU
+ * work is shorter than the search the residue shows up as exposed VQ time,
+ * and if the ordering is ever broken st_check_exclusive() catches it.
+ *
+ * NOT WIRED TO THE RANGE CODER, deliberately. rc has RC_NMODEL = VQ_M = 4 and
+ * RC_NSYM = VQ_K = 256 -- the OLD codebook geometry. The PW search emits 8
+ * sub-codebooks of 16, packed 4 bits each. Both happen to be 4 bytes per
+ * position, so feeding the new indices to the old coder would RUN and produce
+ * a plausible bitstream from a model that does not describe the data. Range
+ * coding of the new format needs rc rebuilt for M=8/K=16 first.
+ * ------------------------------------------------------------------------ */
+#if EDGE_USE_PW_VQ && EDGE_PIPELINED
+static int edge_one_pipelined(int frame_id, int next_seed, ep_frame_stat_t *st)
+{
+    memset(st, 0, sizeof(*st));
+    st->frame_id = frame_id;
+    st->pl_mismatch = -1;
+    st->pl_flushed  = 0;
+
+    if (!g_idx_cur) { g_idx_cur = g_pl_idx; g_idx_prev = g_pw_idx_b; }
+
+    edge_reset_accums();
+    st_set_frame((uint32_t)frame_id);
+    ST_BEGIN_S(ST_FRAME);
+
+    /* ---- analysis: the PW engine is busy for this whole interval -------- */
+    const unsigned long long t0 = NOW();
+    if (edge_run_six_pairs(edge_chw_ptr()) != 0) return -1;
+    const unsigned long long t_an = NOW();
+
+    if (g_pl_ok) {
+        /* ---- codebook reload: cannot overlap anything, it writes the same
+         * weight BRAM the cascade just used ------------------------------- */
+        ST_BEGIN_S(ST_VQ_PROG);
+        const int cb_ok = vq_pw_pl_load_codebook(g_pw_cb, 128);
+        ST_END_S(ST_VQ_PROG);
+
+        if (cb_ok == 0) {
+            ST_BEGIN_S(ST_VQ_RUN);
+            vq_pw_pl_cache_prep(edge_latent_ptr(), g_idx_cur, 0);
+            const int ok = (vq_pw_pl_start(edge_latent_ptr(), g_idx_cur) == 0);
+
+            /* ---- OVERLAP: prepare frame f+1's input while the search runs.
+             * Neither the PW engine nor any buffer in flight is touched. --- */
+            ST_BEGIN_S(ST_PACK);
+            ep_synth_frame_planar(edge_chw_ptr(), next_seed);
+            Xil_DCacheFlushRange((UINTPTR)edge_chw_ptr(), EP_RAW_BYTES);
+            ST_END_S(ST_PACK);
+
+            if (ok) {
+                int r; unsigned long long guard = 0;
+                while ((r = vq_pw_pl_poll_done()) == 0 && ++guard < 200000000u) { }
+                if (r > 0) vq_pw_pl_finish(g_idx_cur);
+            }
+            ST_END_S(ST_VQ_RUN);
+
+            st->t_vq_pw_prog  = vq_pw_pl_last_prog_ms();
+            st->t_vq_pl_block = vq_pw_pl_last_run_ms();
+            st->t_vq_pl       = st->t_vq_pw_prog + st->t_vq_pl_block;
+
+            /* ping-pong for the next frame */
+            uint8_t *tmp = g_idx_prev; g_idx_prev = g_idx_cur; g_idx_cur = tmp;
+        }
+    }
+
+    ST_END_S(ST_FRAME);
+
+    const unsigned long long t1 = NOW();
+    st->t_pl          = MS(t0, t_an);
+    st->t_vq          = st->t_vq_pl;
+    st->t_edge_direct = MS(t0, t1);
+    st->t_edge_sum    = st->t_pl + st->t_vq;
+
+    double pack, prog, cache, pl, total;
+    edge_read_accums(&pack, &prog, &cache, &pl, &total);
+    st->t_pack = pack; st->t_prog = prog; st->t_cache = cache;
+    st->t_host = total;
+    st->fixed_bpp = ((double)VQPW_IDX_BYTES * 8.0) / ((double)EP_W * (double)EP_H);
+    return 0;
+}
+#endif /* EDGE_USE_PW_VQ && EDGE_PIPELINED */
+
 static int edge_one(int frame_id, const vq_pq_ctx_t *vq, const rc_models_t *M,
                     int do_roundtrip, ep_frame_stat_t *st)
 {
@@ -730,7 +874,15 @@ int edge_validation_run(void)
         int fid = EDGE_FIRST_TIMED + i;
         if (fid > 100) break;
         if (edge_prepare2(fid, layout, use_synth, &ms_load, &ms_deint) != 0) return -1;
+#if EDGE_PIPELINED && EDGE_USE_PW_VQ
+        /* Deployed topology: VQ on the shared engine, next frame's input
+         * prepared on the CPU underneath it. The serial edge_one() path is
+         * left intact so the previously reported numbers stay reproducible
+         * from the same source -- switch with EDGE_PIPELINED. */
+        if (edge_one_pipelined(fid, fid + 1, &g_stat[n]) != 0) return -1;
+#else
         if (edge_one(fid, &vq, &M, 1, &g_stat[n]) != 0) return -1;
+#endif
         g_stat[n].t_load  = ms_load;    // outside T_EDGE, reported only
         g_stat[n].t_deint = ms_deint;   // outside T_EDGE, reported only
 
@@ -757,6 +909,7 @@ int edge_validation_run(void)
     /* ---- stage trace: the pipeline figure's raw data ---------------------- */
     st_print_frame_summary();
     st_print_pipeline();
+    st_print_hiding();      /* how much of the VQ the CPU work actually hid */
     st_check_exclusive();
     if (st_overflowed())
         printf("[EDGE] WARNING: stage trace overflowed, raise ST_MAX_EVENTS\n");

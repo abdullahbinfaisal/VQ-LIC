@@ -88,4 +88,12 @@ void st_print_pipeline(void);
  * Returns the number of violations and prints each. */
 int  st_check_exclusive(void);
 
+/* How much of the VQ was actually HIDDEN by concurrent CPU work, per frame:
+ *   #STHIDE,frame,vq_ms,hidden_ms,exposed_ms
+ * hidden is the part of the ST_VQ_RUN interval covered by some other stage
+ * running inside it; exposed is the remainder, and it is the only part that
+ * lengthens the initiation interval. This is the number a pipelining claim
+ * rests on -- "VQ is 2.45 ms" says nothing on its own once it overlaps. */
+void st_print_hiding(void);
+
 #endif /* STAGE_TRACE_H */
