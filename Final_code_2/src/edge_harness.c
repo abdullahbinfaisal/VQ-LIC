@@ -536,12 +536,16 @@ static int edge_one_pipelined(int frame_id, int next_seed,
                 st->range_bpp   = st->range_bits / ((double)EP_W * (double)EP_H);
             }
 
-            /* (b) prepare frame f+1's input. Writes edge_chw_ptr(), which this
-             * frame's analysis has finished reading and its VQ never sees. */
-            ST_BEGIN_S(ST_PACK);
-            ep_synth_frame_planar(edge_chw_ptr(), next_seed);
-            Xil_DCacheFlushRange((UINTPTR)edge_chw_ptr(), EP_RAW_BYTES);
-            ST_END_S(ST_PACK);
+            /* There is deliberately NO input-preparation overlap here.
+             * An earlier version generated frame f+1's input under the search,
+             * but edge_prepare2() in the measured loop already prepares every
+             * frame BEFORE calling this function -- so that was duplicated
+             * work, and crediting it as hidden would have inflated the
+             * overlap. Input preparation is also outside the timed bracket
+             * (t_load / t_deint are reported but excluded), so hiding it buys
+             * nothing measurable. Range coding above is the real overlap.
+             */
+            (void)next_seed;
 
             if (ok) {
                 int r; unsigned long long guard = 0;
@@ -667,6 +671,29 @@ static int edge_one(int frame_id, const vq_pq_ctx_t *vq, const rc_models_t *M,
              * should agree; with differing geometries it is a liveness check,
              * not an equivalence one. */
             st->pl_mismatch = -1;
+
+            /* Entropy-code the indices the PW search just produced. Without
+             * this a default run reports no T_RANGE at all: edge_one's own
+             * range coding is compiled out under RC_GEOMETRY_PW because it
+             * would feed the coder the NEON path's old-format bytes. These
+             * indices are the right geometry, so they can be coded and timed.
+             *
+             * Outside the t_e0..t_e1 bracket by construction -- that bracket
+             * is the legacy serial measurement and must keep its meaning --
+             * but inside the stage trace, so #STSUM carries it. */
+#if RC_GEOMETRY_PW
+            ST_BEGIN_S(ST_RANGE);
+            const unsigned long long r0 = NOW();
+            const size_t rn = rc_encode_frame(M, g_pl_idx, g_bs, sizeof g_bs);
+            const unsigned long long r1 = NOW();
+            ST_END_S(ST_RANGE);
+            st->t_range     = MS(r0, r1);
+            st->range_bytes = rn;
+            st->range_bits  = (double)rn * 8.0;
+            st->range_bpp   = st->range_bits / ((double)EP_W * (double)EP_H);
+            if (rn == 0)
+                printf("[EDGE] f%d PW range overflow\n", frame_id);
+#endif
         }
     }
 #endif

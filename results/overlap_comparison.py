@@ -112,3 +112,33 @@ for extra in (-3.0, -1.5, 0.0, 1.5, 3.0):
     ii_e = a + SHR_NEW + RELOAD
     print("  analysis %6.3f ms -> A %6.2f fps, E %6.2f fps, sharing costs %4.1f%%"
           % (a, fps(ii_a), fps(ii_e), 100.0 * (1.0 - ii_a / ii_e)))
+
+# ---------------------------------------------------------------------------
+# End-to-end estimate for the CURRENT design, including entropy coding.
+# This is the number to quote for "what frame rate will the board give".
+# ---------------------------------------------------------------------------
+RANGE_MS = 1.9307 * 1.88     # measured on the OLD geometry, scaled by the
+                             # host benchmark ratio. The measurement was taken
+                             # on a DEGENERATE stream, so this is a LOWER bound.
+VQ_TOT = SHR_NEW + RELOAD
+
+print("\nEnd-to-end, current design (analysis + reload + search + entropy)")
+ser = ANALYSIS + VQ_TOT + RANGE_MS
+print("  serial                                : %6.3f ms -> %6.2f fps" % (ser, fps(ser)))
+
+# Only range coding overlaps: it is CPU work on frame f-1's indices, needing
+# neither the PW engine nor any buffer in flight. Input preparation does NOT
+# count -- edge_prepare2() already does it outside the frame.
+pipe = ANALYSIS + RELOAD + max(SHR_NEW, RANGE_MS)
+print("  pipelined (entropy under the search)  : %6.3f ms -> %6.2f fps" % (pipe, fps(pipe)))
+print("  the search is %s by entropy coding (%.3f vs %.3f ms)"
+      % ("fully hidden" if RANGE_MS >= SHR_NEW else "only partly hidden",
+         SHR_NEW, RANGE_MS))
+print("  overlap is worth %6.2f -> %6.2f fps (%.2fx)" % (fps(ser), fps(pipe), ser / pipe))
+
+print("\n  For reference, the old dedicated engine at the same analysis and")
+print("  entropy cost: II = max(%.3f, %.3f) + %.3f = %.3f ms -> %.2f fps"
+      % (ANALYSIS, DED_OLD, RANGE_MS, max(ANALYSIS, DED_OLD) + RANGE_MS,
+         fps(max(ANALYSIS, DED_OLD) + RANGE_MS)))
+print("  (its VQ overlapped the analysis; its entropy stage did not overlap")
+print("   anything, because the CPU was the thing driving both.)")
