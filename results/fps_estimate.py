@@ -16,6 +16,22 @@ provenance of each input is stated so the weak ones are visible.
                           the host benchmark ratio -- and that measurement was
                           on a DEGENERATE stream, so it is a LOWER bound
   T_pack       MEASURED   5.1047 ms, host input preparation
+
+SUPERSEDED 2026-09-04 -- see results/overlap_comparison.py.
+
+This file treats T_pack as CPU work available to hide under the VQ search. It
+is not. The measured 5.1047 ms happens INSIDE edge_run_six_pairs, before the
+search exists, and the measured decomposition shows host work is SERIAL with
+the PL (pack + prog + cache + pl sums to t_host with a 1 us residual). So the
+analysis phase is PL + host, ~19.77 ms rather than the 13.4463 ms used below,
+and the numbers here are optimistic by roughly 6 ms per frame.
+
+What edge_one_pipelined actually moved under the search is
+ep_synth_frame_planar -- synthetic INPUT generation -- whose cost has never
+been measured on the board.
+
+Corrected estimate: ~44 fps, not ~50. overlap_comparison.py carries it, along
+with the comparison against the dedicated engine that this file does not make.
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
