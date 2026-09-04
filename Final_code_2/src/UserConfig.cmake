@@ -30,6 +30,13 @@ set(USER_INCLUDE_DIRECTORIES
 set(USER_COMPILE_SOURCES
 "main.c"
 "vq_pq.c"
+"vq_pl.c"          # dedicated-engine driver: DEAD, the block was removed
+                   # in 62cbfbc. Kept only so the pre-62cbfbc A/B can
+                   # still be built; EDGE_USE_PL_VQ defaults to 0.
+"vq_pw.c"          # PW-hosted VQ golden model (also links in the tests)
+"vq_pw_pl.c"       # PW-hosted VQ driver -- the live path
+"stage_trace.c"    # absolute-timestamped stage boundaries
+"pwr_log.c"        # PMBus sampling for energy per frame
 "range_coder.c"
 "edge_pipeline.c"
 "edge_harness.c"

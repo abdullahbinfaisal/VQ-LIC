@@ -9,6 +9,7 @@
 #include "xil_cache.h"
 #include "xil_mmu.h"      /* Xil_SetTlbAttributes / NORM_NONCACHE */
 #include "xiicps.h"       /* PS I2C0 -> PCA9548 -> UCD9248 PMBus (power) */
+#include "stage_trace.h" /* absolute stage timestamps for the pipeline figure */
 #include "sleep.h"
 #include "xparameters.h"
 #include "xaxidma.h"
@@ -6417,10 +6418,17 @@ int edge_run_six_pairs(const uint8_t *gm_in_frame)
         uint8_t *out_buf = (p % 2 == 0) ? chainA : chainB;
         uint8_t *in_buf  = (p == 0) ? gm_in : ((p % 2 == 1) ? chainA : chainB);
         g_acc_pair = p;
-        if (hw_dw_pw_cascade_l0_l1(&dw, &pw, raw_in, in_buf, out_buf,
+        /* One mark per fused DW->PW pair. DW and PW overlap INSIDE the pair --
+         * they are one cascade with II=1 per beat -- so this is the finest
+         * granularity software can observe, and it is what the pipeline figure
+         * needs: the engine is busy for exactly this interval. */
+        ST_BEGIN_I(ST_DW_PW, p);
+        const int _rc = hw_dw_pw_cascade_l0_l1(&dw, &pw, raw_in, in_buf, out_buf,
                                    &g_edge_p[2 * p],     &g_edge_w[2 * p],
                                    &g_edge_p[2 * p + 1], &g_edge_w[2 * p + 1],
-                                   SURR_IN_FLAGS(chained)) != 0) return -1;
+                                   SURR_IN_FLAGS(chained));
+        ST_END_I(ST_DW_PW, p);
+        if (_rc != 0) return -1;
     }
 
     /* Publish the buffer this frame just wrote, then flip so the NEXT frame's

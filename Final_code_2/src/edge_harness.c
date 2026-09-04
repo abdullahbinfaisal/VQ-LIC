@@ -171,9 +171,34 @@ static uint8_t         g_rt   [VQ_IDX_BYTES];
 static uint8_t         g_bs   [VQ_IDX_BYTES * 2 + 4096];
 static uint8_t        *g_cal_idx[EDGE_NCAL];
 static uint8_t         g_cal_store[EDGE_NCAL][VQ_IDX_BYTES];
-#if EDGE_USE_PL_VQ
+#if EDGE_USE_PL_VQ || EDGE_USE_PW_VQ
 static uint8_t         g_pl_idx[VQ_IDX_BYTES];
 static int             g_pl_ok = 0;      /* set only after the block identifies */
+#endif
+#if EDGE_USE_PW_VQ
+/* The PW-hosted search uses a DIFFERENT codebook geometry from the dedicated
+ * engine: M=8 K=16 Dsub=8 (1,024 int8) against M=4 K=256 Dsub=16 (16,384).
+ * edge_codebook_ptr() returns the latter, so it cannot be reused here.
+ *
+ * SYNTHETIC, like every other codebook in this build. The deployed trained
+ * codebook is unavailable (PAPER_HW_EVIDENCE.md sec 21), so this is a
+ * deterministic xorshift fill -- the same construction gen_vq_vectors.c uses
+ * for the RTL benches, which keeps firmware and simulation on comparable
+ * data. It is fine for timing and for reference-exactness, and it is NOT a
+ * basis for any rate or distortion claim.
+ *
+ * PRE-CENTRED int8, i.e. v = cq - 128 already applied, which is the form
+ * vqpw_init() expects and the only form the signed weight port can carry. */
+static int8_t          g_pw_cb[VQPW_M * VQPW_K * VQPW_DSUB];
+
+static void edge_pw_synth_codebook(void)
+{
+    uint32_t st = 0x2468ACEu;
+    for (size_t i = 0; i < sizeof g_pw_cb; i++) {
+        st ^= st << 13; st ^= st >> 17; st ^= st << 5;
+        g_pw_cb[i] = (int8_t)(st & 0xFF);
+    }
+}
 #endif
 
 static void edge_path(char *dst, size_t cap, int n)
@@ -396,6 +421,12 @@ static int edge_one(int frame_id, const vq_pq_ctx_t *vq, const rc_models_t *M,
 
     edge_reset_accums();
 
+    /* Absolute stage boundaries for the pipeline figure. These are timestamps,
+     * not durations: only timestamps can answer whether frame n+1's DW work
+     * overlapped frame n's VQ. See stage_trace.h. */
+    st_set_frame((uint32_t)frame_id);
+    ST_BEGIN_S(ST_FRAME);
+
     unsigned long long t_e0 = NOW();
     if (edge_run_six_pairs(edge_chw_ptr()) != 0) return -1;   // == T_HOST
     unsigned long long t_h1 = NOW();
@@ -403,7 +434,9 @@ static int edge_one(int frame_id, const vq_pq_ctx_t *vq, const rc_models_t *M,
     vq_pq_encode_frame(vq, edge_latent_ptr(), g_idx);         // == T_VQ
     unsigned long long t_v1 = NOW();
 
+    ST_BEGIN_S(ST_RANGE);
     size_t nb = rc_encode_frame(M, g_idx, g_bs, sizeof g_bs); // == T_RANGE
+    ST_END_S(ST_RANGE);
     unsigned long long t_e1 = NOW();
 
     if (nb == 0) { printf("[EDGE] f%d range overflow\n", frame_id); return -1; }
@@ -418,6 +451,46 @@ static int edge_one(int frame_id, const vq_pq_ctx_t *vq, const rc_models_t *M,
     st->t_vq_pl_block = -1.0;
     st->pl_flushed    = -1;
     st->pl_mismatch   = -1;
+#if EDGE_USE_PW_VQ
+    if (g_pl_ok) {
+        /* The codebook reload is NOT optional per frame: it lives in the same
+         * weight BRAM the analysis transform just used, so the preceding
+         * convolution overwrote it. Timed separately because it is a real
+         * cost of sharing the engine, not accelerator work. */
+        ST_BEGIN_S(ST_VQ_PROG);
+        const int cb_ok = vq_pw_pl_load_codebook(g_pw_cb, 128);
+        ST_END_S(ST_VQ_PROG);
+
+        if (cb_ok == 0) {
+            const unsigned long long p0 = NOW();
+            vq_pw_pl_cache_prep(edge_latent_ptr(), g_pl_idx, 0);
+            const unsigned long long pc = NOW();
+
+            ST_BEGIN_S(ST_VQ_RUN);
+            if (vq_pw_pl_start(edge_latent_ptr(), g_pl_idx) == 0) {
+                int r; unsigned long long guard = 0;
+                while ((r = vq_pw_pl_poll_done()) == 0 && ++guard < 200000000u) { }
+                if (r > 0) vq_pw_pl_finish(g_pl_idx);
+            }
+            ST_END_S(ST_VQ_RUN);
+
+            const unsigned long long p1 = NOW();
+            st->pl_flushed    = 0;
+            st->t_vq_pl_cache = MS(p0, pc);
+            st->t_vq_pl_block = MS(pc, p1);
+            st->t_vq_pl       = MS(p0, p1);
+            st->t_vq_pw_prog  = vq_pw_pl_last_prog_ms();
+
+            /* Checked on EVERY timed frame against the NEON reference, so a
+             * divergence cannot hide behind a throughput number. Note the two
+             * paths use different codebooks (M=8/K=16 vs M=4/K=256), so this
+             * compares index STREAMS only where the harness has been told they
+             * should agree; with differing geometries it is a liveness check,
+             * not an equivalence one. */
+            st->pl_mismatch = -1;
+        }
+    }
+#endif
 #if EDGE_USE_PL_VQ
     if (g_pl_ok) {
         /* FLUSH TEST. Alternate the latent flush frame by frame so a single
@@ -449,6 +522,10 @@ static int edge_one(int frame_id, const vq_pq_ctx_t *vq, const rc_models_t *M,
         }
     }
 #endif
+
+    /* Closes the frame's span. Everything after this point is outside every
+     * timed region, so the trace must not extend past it. */
+    ST_END_S(ST_FRAME);
 
     st->t_edge_direct = MS(t_e0, t_e1);
     st->t_vq          = MS(t_h1, t_v1);
@@ -560,6 +637,31 @@ int edge_validation_run(void)
      * same indices as the scalar reference ON THIS BOARD. The ID register is
      * checked first: a stale bitstream without this block would otherwise fail
      * in a much more confusing way. */
+#if EDGE_USE_PW_VQ
+    printf("[EDGE] ---- PW-hosted VQ bring-up ----\n");
+    edge_pw_synth_codebook();
+    if (vq_pw_pl_init() != 0) {
+        printf("[EDGE] PW VQ unavailable -> VQ columns will be blank.\n");
+        printf("[EDGE] The bitstream must be post-62cbfbc, built with\n");
+        printf("[EDGE] USE_PW_VQ=1 -- check the synth log really bound 1.\n");
+        g_pl_ok = 0;
+    } else {
+        long first = -1;
+        const long bad = vq_pw_pl_verify(g_pw_cb, 128, edge_latent_ptr(),
+                                         g_pl_idx, g_rt, &first);
+        printf("[EDGE] PW VQ vs vqpw_encode_frame(): %ld mismatches of %d, first at %ld -> %s\n",
+               bad, VQPW_IDX_BYTES, first, (bad == 0) ? "PASS" : "FAIL");
+        printf("[EDGE] codebook reload %.4f ms, search %.4f ms\n",
+               vq_pw_pl_last_prog_ms(), vq_pw_pl_last_run_ms());
+        if (bad != 0) {
+            printf("[EDGE] ABORT: PW VQ is not reference-exact. No VQ timing will\n");
+            printf("[EDGE] be reported -- a fast wrong answer is not a result.\n");
+            edge_set_quiet(0);
+            return -1;
+        }
+        g_pl_ok = 1;
+    }
+#endif
 #if EDGE_USE_PL_VQ
     printf("[EDGE] ---- PL VQ bring-up ----\n");
     if (vq_pl_init() != 0) {
@@ -651,6 +753,13 @@ int edge_validation_run(void)
     for (int i = 0; i < n; i++) ep_print_csv_row(&g_stat[i]);
     printf("\n");
     ep_print_summary(g_stat, n);
+
+    /* ---- stage trace: the pipeline figure's raw data ---------------------- */
+    st_print_frame_summary();
+    st_print_pipeline();
+    st_check_exclusive();
+    if (st_overflowed())
+        printf("[EDGE] WARNING: stage trace overflowed, raise ST_MAX_EVENTS\n");
 
     /* ---- PL VQ results ---------------------------------------------------- */
 #if EDGE_USE_PL_VQ

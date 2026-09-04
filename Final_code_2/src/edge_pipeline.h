@@ -66,6 +66,19 @@ typedef struct {
     double h_emp[RC_NMODEL];        // empirical entropy per codebook, bits/sym
     long   rc_mismatch;             // round-trip mismatches, -1 if not checked
     long   rc_first_bad;
+
+    /* PL VQ block. Timed OUTSIDE the T_EDGE_DIRECT bracket on purpose, so
+     * B1..B5 stay bit-identical to the NEON-only run and remain comparable
+     * with everything already reported. -1 = not run. */
+    double t_vq_pl;                 // cache prep + block, what was reported before
+    double t_vq_pl_cache;           // host cache maintenance only, NOT accelerator work
+    double t_vq_pl_block;           // the accelerator itself
+    double t_vq_pw_prog;            // PW-hosted VQ: per-frame codebook reload.
+                                    // Not optional -- the weight BRAM is shared
+                                    // with convolution, so the preceding block
+                                    // overwrote it. A real cost of engine reuse.
+    int    pl_flushed;              // was the latent flushed for this frame
+    long   pl_mismatch;             // PL vs NEON indices, per frame
 } ep_frame_stat_t;
 
 // Sniff one file: returns the layout, and *nbytes gets the file size.
