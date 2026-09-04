@@ -50,9 +50,42 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "vq_pq.h"
+#include "vq_pw.h"
 
-#define RC_NSYM      VQ_K          // 256 symbols per alphabet
-#define RC_NMODEL    VQ_M          // 4 independent codebook models
+// ---------------------------------------------------------------------------
+// GEOMETRY. The coder core below is untouched by this choice -- only the
+// alphabet size, the model count and the INDEX ADDRESSING change.
+//
+//   RC_GEOMETRY_PW = 1  PW-hosted VQ: M = 8 sub-codebooks of K = 16, packed
+//                       as 4-bit nibbles, 4 bytes per latent position.
+//   RC_GEOMETRY_PW = 0  legacy dedicated engine: M = 4 of K = 256, one byte
+//                       per symbol. The hardware is gone (62cbfbc); kept so
+//                       the previously published rate numbers stay
+//                       reproducible from this source.
+//
+// THE SYMBOL COUNT DOUBLES. 14,400 positions x 8 models = 115,200 symbols per
+// frame against 57,600 before, on a 16-symbol alphabet instead of 256. The
+// configuration that made the VQ search 8x cheaper makes the entropy stage
+// code twice as many symbols, and T_RANGE must be re-measured rather than
+// carried over. That trade is the point of measuring it.
+// ---------------------------------------------------------------------------
+#ifndef RC_GEOMETRY_PW
+#define RC_GEOMETRY_PW 1
+#endif
+
+#if RC_GEOMETRY_PW
+#  define RC_NSYM      VQPW_K            // 16 codewords per sub-codebook
+#  define RC_NMODEL    VQPW_M            // 8 independent sub-codebook models
+#  define RC_NPOS      VQPW_NPOS
+#  define RC_IDX_BYTES VQPW_IDX_BYTES
+#else
+#  define RC_NSYM      VQ_K              // 256 symbols per alphabet
+#  define RC_NMODEL    VQ_M              // 4 independent codebook models
+#  define RC_NPOS      VQ_NPOS
+#  define RC_IDX_BYTES VQ_IDX_BYTES
+#endif
+
+#define RC_NSYM_PER_FRAME ((size_t)RC_NPOS * RC_NMODEL)
 #define RC_TOT_BITS  16
 #define RC_TOT       (1u << RC_TOT_BITS)   // 65536, power of two -> shift not divide
 
@@ -90,11 +123,39 @@ typedef struct {
     size_t         n;
 } rc_dec_t;
 
+// ---- index addressing -------------------------------------------------------
+// The ONLY thing the geometry changes inside the coder. Packed 4-bit symbols
+// are read and written here so every loop below stays layout-agnostic.
+//
+// Packing (vq_pw.c): one 32-bit little-endian word per position, sub-codebook
+// m in bits [4m+3:4m]. So byte j holds model 2j in its low nibble and model
+// 2j+1 in its high nibble.
+static inline uint8_t rc_get_sym(const uint8_t *idx, int pos, int m)
+{
+#if RC_GEOMETRY_PW
+    const uint8_t b = idx[(size_t)pos * 4 + (size_t)(m >> 1)];
+    return (uint8_t)((m & 1) ? (b >> 4) : (b & 0x0Fu));
+#else
+    return idx[(size_t)pos * RC_NMODEL + (size_t)m];
+#endif
+}
+
+static inline void rc_put_sym(uint8_t *idx, int pos, int m, uint8_t sym)
+{
+#if RC_GEOMETRY_PW
+    uint8_t *b = &idx[(size_t)pos * 4 + (size_t)(m >> 1)];
+    *b = (uint8_t)((m & 1) ? ((*b & 0x0Fu) | (uint8_t)((sym & 0x0Fu) << 4))
+                           : ((*b & 0xF0u) | (uint8_t)(sym & 0x0Fu)));
+#else
+    idx[(size_t)pos * RC_NMODEL + (size_t)m] = sym;
+#endif
+}
+
 // ---- model construction (NOT part of T_RANGE) -------------------------------
 // Accumulates a histogram over `nframes` index arrays, applies add-one
 // smoothing, normalises each model to exactly RC_TOT, and freezes.
-// idx_frames[f] points at VQ_IDX_BYTES bytes laid out as vq_pq_encode_frame
-// writes them (position-major, codebook-minor).
+// idx_frames[f] points at RC_IDX_BYTES bytes in whatever layout the selected
+// geometry uses; rc_get_sym() is the only thing that knows which.
 void rc_model_build(rc_models_t *M, const uint8_t *const *idx_frames, int nframes);
 
 // Uniform fallback (freq = RC_TOT/RC_NSYM for all symbols). Useful as a
@@ -118,7 +179,7 @@ void   rc_dec_init(rc_dec_t *d, const uint8_t *in, size_t cap);
 uint8_t rc_dec_sym (rc_dec_t *d, const rc_model_t *m);
 
 // ---- whole-frame helpers ----------------------------------------------------
-// Encode all VQ_IDX_BYTES indices of one frame. Returns bytes written.
+// Encode all RC_NSYM_PER_FRAME symbols of one frame. Returns bytes written.
 // This is the function timed as T_RANGE.
 size_t rc_encode_frame(const rc_models_t *M, const uint8_t *idx,
                        uint8_t *out, size_t cap);

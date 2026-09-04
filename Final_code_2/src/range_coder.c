@@ -24,9 +24,9 @@ void rc_model_build(rc_models_t *M, const uint8_t *const *idx_frames, int nframe
 
     for (int f = 0; f < nframes; f++) {
         const uint8_t *p = idx_frames[f];
-        for (int pos = 0; pos < VQ_NPOS; pos++)
+        for (int pos = 0; pos < RC_NPOS; pos++)
             for (int m = 0; m < RC_NMODEL; m++)
-                hist[m][p[(size_t)pos * RC_NMODEL + m]]++;
+                hist[m][rc_get_sym(p, pos, m)]++;
     }
 
     for (int m = 0; m < RC_NMODEL; m++) {
@@ -210,10 +210,9 @@ size_t rc_encode_frame(const rc_models_t *M, const uint8_t *idx,
 {
     rc_enc_t e;
     rc_enc_init(&e, out, cap);
-    for (int pos = 0; pos < VQ_NPOS; pos++) {
-        const uint8_t *p = idx + (size_t)pos * RC_NMODEL;
+    for (int pos = 0; pos < RC_NPOS; pos++) {
         for (int m = 0; m < RC_NMODEL; m++)
-            rc_enc_sym(&e, &M->m[m], p[m]);
+            rc_enc_sym(&e, &M->m[m], rc_get_sym(idx, pos, m));
     }
     size_t n = rc_enc_finish(&e);
     return e.overflow ? 0 : n;
@@ -224,10 +223,9 @@ int rc_decode_frame(const rc_models_t *M, const uint8_t *in, size_t n,
 {
     rc_dec_t d;
     rc_dec_init(&d, in, n);
-    for (int pos = 0; pos < VQ_NPOS; pos++) {
-        uint8_t *p = idx_out + (size_t)pos * RC_NMODEL;
+    for (int pos = 0; pos < RC_NPOS; pos++) {
         for (int m = 0; m < RC_NMODEL; m++)
-            p[m] = rc_dec_sym(&d, &M->m[m]);
+            rc_put_sym(idx_out, pos, m, rc_dec_sym(&d, &M->m[m]));
     }
     return 0;
 }
@@ -238,10 +236,10 @@ long rc_selftest_frame(const rc_models_t *M, const uint8_t *idx,
 {
     *first_bad = -1;
     size_t n = rc_encode_frame(M, idx, scratch_bs, bs_cap);
-    if (n == 0) { *first_bad = 0; return VQ_IDX_BYTES; }   // overflow
+    if (n == 0) { *first_bad = 0; return RC_IDX_BYTES; }   // overflow
     rc_decode_frame(M, scratch_bs, n, scratch_idx);
     long bad = 0;
-    for (long i = 0; i < (long)VQ_IDX_BYTES; i++) {
+    for (long i = 0; i < (long)RC_IDX_BYTES; i++) {
         if (scratch_idx[i] != idx[i]) {
             if (*first_bad < 0) *first_bad = i;
             bad++;
@@ -259,12 +257,12 @@ void rc_frame_entropy(const uint8_t *idx, double bits_per_sym[RC_NMODEL])
 {
     static uint32_t h[RC_NMODEL][RC_NSYM];
     memset(h, 0, sizeof(h));
-    for (int pos = 0; pos < VQ_NPOS; pos++)
+    for (int pos = 0; pos < RC_NPOS; pos++)
         for (int m = 0; m < RC_NMODEL; m++)
-            h[m][idx[(size_t)pos * RC_NMODEL + m]]++;
+            h[m][rc_get_sym(idx, pos, m)]++;
     for (int m = 0; m < RC_NMODEL; m++) {
         double H = 0.0;
-        const double N = (double)VQ_NPOS;
+        const double N = (double)RC_NPOS;
         for (int s = 0; s < RC_NSYM; s++) {
             if (!h[m][s]) continue;
             double p = (double)h[m][s] / N;

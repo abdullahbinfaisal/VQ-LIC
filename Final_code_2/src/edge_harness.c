@@ -479,15 +479,18 @@ static void edge_power_measure(const vq_pq_ctx_t *vq)
  * work is shorter than the search the residue shows up as exposed VQ time,
  * and if the ordering is ever broken st_check_exclusive() catches it.
  *
- * NOT WIRED TO THE RANGE CODER, deliberately. rc has RC_NMODEL = VQ_M = 4 and
- * RC_NSYM = VQ_K = 256 -- the OLD codebook geometry. The PW search emits 8
- * sub-codebooks of 16, packed 4 bits each. Both happen to be 4 bytes per
- * position, so feeding the new indices to the old coder would RUN and produce
- * a plausible bitstream from a model that does not describe the data. Range
- * coding of the new format needs rc rebuilt for M=8/K=16 first.
+ * THE RANGE CODER NOW READS THIS GEOMETRY. It was previously excluded here:
+ * rc was fixed at RC_NMODEL = VQ_M = 4 and RC_NSYM = VQ_K = 256, and since
+ * both layouts are 4 bytes per position, feeding it the new indices would have
+ * RUN and produced a plausible bitstream from a model describing nothing.
+ * range_coder.h is now parameterised on RC_GEOMETRY_PW and reads symbols
+ * through rc_get_sym(), so frame f-1's indices can be entropy-coded on the CPU
+ * while frame f's search runs in PL. That is the largest piece of CPU work
+ * available to hide the search behind.
  * ------------------------------------------------------------------------ */
 #if EDGE_USE_PW_VQ && EDGE_PIPELINED
-static int edge_one_pipelined(int frame_id, int next_seed, ep_frame_stat_t *st)
+static int edge_one_pipelined(int frame_id, int next_seed,
+                              const rc_models_t *M, ep_frame_stat_t *st)
 {
     memset(st, 0, sizeof(*st));
     st->frame_id = frame_id;
@@ -517,8 +520,24 @@ static int edge_one_pipelined(int frame_id, int next_seed, ep_frame_stat_t *st)
             vq_pw_pl_cache_prep(edge_latent_ptr(), g_idx_cur, 0);
             const int ok = (vq_pw_pl_start(edge_latent_ptr(), g_idx_cur) == 0);
 
-            /* ---- OVERLAP: prepare frame f+1's input while the search runs.
-             * Neither the PW engine nor any buffer in flight is touched. --- */
+            /* ---- OVERLAP, both items on the CPU while the search runs in PL.
+             * Neither touches the PW engine nor a buffer in flight. --------- */
+
+            /* (a) entropy-code the PREVIOUS frame's indices. g_idx_prev is
+             * complete; g_idx_cur is being written by the S2MM right now.
+             * This is what the range coder rebuild was for -- before it, the
+             * coder could not read this geometry at all. */
+            if (g_idx_prev && frame_id > 0) {
+                ST_BEGIN_S(ST_RANGE);
+                const size_t nb = rc_encode_frame(M, g_idx_prev, g_bs, sizeof g_bs);
+                ST_END_S(ST_RANGE);
+                st->range_bytes = nb;
+                st->range_bits  = (double)nb * 8.0;
+                st->range_bpp   = st->range_bits / ((double)EP_W * (double)EP_H);
+            }
+
+            /* (b) prepare frame f+1's input. Writes edge_chw_ptr(), which this
+             * frame's analysis has finished reading and its VQ never sees. */
             ST_BEGIN_S(ST_PACK);
             ep_synth_frame_planar(edge_chw_ptr(), next_seed);
             Xil_DCacheFlushRange((UINTPTR)edge_chw_ptr(), EP_RAW_BYTES);
@@ -578,12 +597,28 @@ static int edge_one(int frame_id, const vq_pq_ctx_t *vq, const rc_models_t *M,
     vq_pq_encode_frame(vq, edge_latent_ptr(), g_idx);         // == T_VQ
     unsigned long long t_v1 = NOW();
 
+    /* GEOMETRY GUARD. g_idx holds the NEON path's M=4/K=256 indices, one byte
+     * per symbol. With RC_GEOMETRY_PW=1 the coder reads 4-bit nibbles, so it
+     * would histogram and code pairs of sub-codeword indices as if they were
+     * codewords: it RUNS, emits a plausible bitstream, and means nothing. The
+     * two are only compatible when the coder is built for the legacy layout.
+     * The pipelined path is where the PW indices are coded correctly. */
+    size_t nb;
+#if RC_GEOMETRY_PW
+    nb = 0;
+    (void)M;
+#else
     ST_BEGIN_S(ST_RANGE);
-    size_t nb = rc_encode_frame(M, g_idx, g_bs, sizeof g_bs); // == T_RANGE
+    nb = rc_encode_frame(M, g_idx, g_bs, sizeof g_bs);        // == T_RANGE
     ST_END_S(ST_RANGE);
+#endif
     unsigned long long t_e1 = NOW();
 
+#if !RC_GEOMETRY_PW
+    /* nb == 0 means the coder overflowed its buffer. Under RC_GEOMETRY_PW
+     * it is the deliberate skip above, not a failure. */
     if (nb == 0) { printf("[EDGE] f%d range overflow\n", frame_id); return -1; }
+#endif
 
     /* ---- PL VQ, timed SEPARATELY and strictly after t_e1 -------------------
      * Deliberately outside the T_EDGE_DIRECT bracket so B1..B5 stay identical
@@ -747,7 +782,19 @@ int edge_validation_run(void)
         if (edge_prepare2(i + 1, layout, use_synth, &ms_load, &ms_deint) != 0) return -1;
         edge_reset_accums();
         if (edge_run_six_pairs(edge_chw_ptr()) != 0) return -1;
+#if RC_GEOMETRY_PW && EDGE_USE_PW_VQ
+        /* The entropy model must be trained on the SAME index geometry the
+         * coder will see. rc_model_build reads through rc_get_sym, so feeding
+         * it the NEON path's M=4/K=256 bytes while RC_GEOMETRY_PW=1 would
+         * histogram nibble pairs as if they were codewords and produce a model
+         * that describes nothing. Calibrate from the PW search itself. */
+        if (g_pl_ok && vq_pw_pl_load_codebook(g_pw_cb, 128) == 0)
+            vq_pw_pl_encode_frame(edge_latent_ptr(), g_cal_store[i]);
+        else
+            memset(g_cal_store[i], 0, VQ_IDX_BYTES);
+#else
         vq_pq_encode_frame(&vq, edge_latent_ptr(), g_cal_store[i]);
+#endif
         g_cal_idx[i] = g_cal_store[i];
     }
     ep_build_model(&M, (const uint8_t *const *)g_cal_idx, EDGE_NCAL, &t_model_build);
@@ -879,7 +926,7 @@ int edge_validation_run(void)
          * prepared on the CPU underneath it. The serial edge_one() path is
          * left intact so the previously reported numbers stay reproducible
          * from the same source -- switch with EDGE_PIPELINED. */
-        if (edge_one_pipelined(fid, fid + 1, &g_stat[n]) != 0) return -1;
+        if (edge_one_pipelined(fid, fid + 1, &M, &g_stat[n]) != 0) return -1;
 #else
         if (edge_one(fid, &vq, &M, 1, &g_stat[n]) != 0) return -1;
 #endif
