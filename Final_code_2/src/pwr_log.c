@@ -10,6 +10,7 @@
 #include "xiicps.h"
 #include "xil_printf.h"
 #include "xparameters.h"
+#include <stdio.h>
 #include <string.h>
 
 extern unsigned long long ep_timer_now(void);

@@ -68,6 +68,22 @@
 #define EDGE_USE_PL_VQ 0
 #endif
 
+/* EDGE_USE_PW_VQ -- VQ on the SHARED pointwise engine, the live path since
+ * commit 62cbfbc. Mutually exclusive with EDGE_USE_PL_VQ: they drive
+ * different blocks, and only one of those blocks exists in any given
+ * bitstream.
+ *
+ * This define was MISSING until the first Vitis build caught it, while six
+ * #if EDGE_USE_PW_VQ blocks tested it -- so every one of them evaluated to 0
+ * and the entire PW VQ integration was silently compiled out. An undefined
+ * macro in #if is 0, not an error, which is why nothing complained. */
+#ifndef EDGE_USE_PW_VQ
+#define EDGE_USE_PW_VQ 1
+#endif
+#if EDGE_USE_PL_VQ && EDGE_USE_PW_VQ
+#  error "EDGE_USE_PL_VQ and EDGE_USE_PW_VQ are mutually exclusive -- the dedicated VQ block and the PW-hosted VQ cannot both be present."
+#endif
+
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -76,6 +92,12 @@
 #include "edge_pipeline.h"
 #include "vq_pq.h"
 #include "range_coder.h"
+/* Always compiled in: st_mark() is a timer read and four stores, and
+ * st_enable(0) makes it a no-op. */
+#include "stage_trace.h"
+#if EDGE_USE_PW_VQ
+#include "vq_pw_pl.h"
+#endif
 #if EDGE_USE_PL_VQ
 #include "vq_pl.h"
 #endif

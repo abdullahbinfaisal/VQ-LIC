@@ -4495,6 +4495,12 @@ int  surr_sched_current(void){ return g_surr_sched; }
 const char *surr_sched_name(int i)
 { return (i >= 0 && i < SURR_NSCHED) ? g_surr_scheds[i].name : "?"; }
 
+/* Input geometry. Defined HERE rather than further down because
+ * surr_select_schedule() below is the first user; it was previously declared
+ * after its own first use, which never compiled. */
+#define SURR_IN_H        720
+#define SURR_IN_W       1280
+
 /* Returns 0 on success, <0 if the schedule is not hardware-feasible or is
  * internally inconsistent. Does NOT touch accelerator state; the caller must
  * invalidate cached descriptors/blobs (edge_select_schedule does). */
@@ -4548,9 +4554,6 @@ int surr_select_schedule(int idx)
            idx, sc->name, sc->npairs, maxcg);
     return 0;
 }
-#define SURR_IN_H        720
-#define SURR_IN_W       1280
-
 static void surr_build_schedule(layer_desc_t descs[SURR_NUM_LAYERS])
 {
     /* ImageEncoderLite (NeuralImageCodec encoder), 6 depthwise-separable

@@ -64,6 +64,7 @@
  * ==========================================================================*/
 
 #include <stdint.h>
+#include <stddef.h>   /* size_t -- not pulled in by stdint on arm-none-eabi */
 
 #define VQPW_DIM        64
 #define VQPW_M           8
