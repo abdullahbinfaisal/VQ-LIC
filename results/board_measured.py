@@ -126,18 +126,33 @@ II_PWRPIPE = 22.9631   # edge_power_measure()'s loop. NOT the deployed path any
                        # power section.
 
 # ---------------------------------------------------------------------------
-# 6. Power, duty-matched interleaved A/B.  MEASURED IN RUN 2.
+# 6. Power, duty-matched interleaved A/B.  MEASURED IN RUN 3.
 # ---------------------------------------------------------------------------
-PWR_A     = 2.0325   # +- 0.0051 W, pipelined loop with the VQ never started
-PWR_B     = 2.0373   # +- 0.0052 W, same loop with the VQ overlapped
-PWR_DELTA = +0.0048  # +- 0.0073 W
-PWR_BOUND = 0.0145   # 2 SE: the VQ costs LESS THAN this. Not zero -- a bound.
+PWR_A     = 2.0342   # +- 0.0052 W, pipelined loop with the VQ never started
+PWR_B     = 2.0359   # +- 0.0051 W, same loop with the VQ overlapped
+PWR_DELTA = +0.0017  # +- 0.0073 W
+PWR_BOUND = 0.0146   # 2 SE: the VQ costs LESS THAN this. Not zero -- a bound.
+PWR_SAMPLES = 656    # per phase, over 4,896 frames per phase
 PWR_NOTE  = ("regulator OUTPUT power: excludes conversion losses and the "
              "unmonitored 5 V USB rail. NOT 12 V input power.")
 
-# Run 1 gave this delta as -0.0046 W, run 2 as +0.0048 W, both inside 2 SE of
-# zero. The sign flipping between runs is not a puzzle: it is what "not
-# resolved" means, demonstrated.
+# Per-rail means, W.  (name, group, A, B)
+PWR_RAILS = [
+    ("VCCINT",   "PL",   0.2325, 0.2322),
+    ("VCCPINT",  "PS",   0.3591, 0.3595),
+    ("VCCAUX",   "PL",   0.0283, 0.0292),
+    ("VCCPAUX",  "PS",   0.1111, 0.1158),
+    ("VCCADJ",   "MISC", 0.0406, 0.0363),
+    ("VCC1V5PS", "DDR",  0.4737, 0.4747),
+    ("VCC_MIO",  "PS",   0.0111, 0.0110),
+    ("VCCBRAM",  "PL",   0.0088, 0.0075),
+    ("VCC3V3",   "MISC", 0.7480, 0.7450),
+    ("VCC2V5",   "MISC", 0.0210, 0.0247),
+]
+
+# THREE runs, three signs: -0.0046, +0.0048, +0.0017 W, every one inside 2 SE
+# of zero. That is not a puzzle to resolve, it is what "not resolved" looks
+# like, and three independent draws make the point better than any one of them.
 #
 # CAVEAT THAT MATTERS FOR ENERGY. edge_power_measure() drives its own loop, and
 # that loop still packs inside the cascade and never entropy-codes. So the mean
