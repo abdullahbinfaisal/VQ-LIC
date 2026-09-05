@@ -212,6 +212,14 @@ extern const char *edge_pm_group_name(int i);
 #define EDGE_BG_SLICE_SYMS 64
 #endif
 
+/* Rows of input packed per slice. One row is ~7 us at the measured 5.0127
+ * ms for 720 rows -- the same order as the entropy slice, so neither job
+ * can hold the cascade poll loop for long. Rows are the natural unit: they
+ * are independent, so a row boundary needs no saved state beyond an index. */
+#ifndef EDGE_BG_PACK_ROWS
+#define EDGE_BG_PACK_ROWS 1
+#endif
+
 /* Frames in the pipelined pass. Fewer than the serial pass: the quantity
  * being measured is a wall-clock interval per frame with a cv of ~0.01%,
  * so 40 is already far past the point where more frames buy precision. */
@@ -283,20 +291,38 @@ static uint8_t        *g_idx_prev = 0;   /* complete, safe for the PS       */
  * unnecessary one, because rc_stream_coded() gives the same accounting for
  * free by counting symbols instead of cycles. */
 extern void cascade_set_bg_work(void (*fn)(void));
+extern uint8_t *edge_chw_for(int parity);
+extern uint8_t *edge_gm_in_for(int parity);
+extern void     edge_set_in_parity(int p);
+extern void     edge_set_gm_prepacked(int on);
+extern int      edge_pack_arm_frame(const uint8_t *chw, uint8_t *gm);
+extern int      edge_pack_step(int nrows);
+extern int      edge_pack_finish(void);
+extern int      edge_pack_rows_done(void);
+extern int      edge_pack_busy(void);
 
 static rc_stream_t g_bg_rc;
 static int         g_bg_armed = 0;
 
-static void edge_bg_range_slice(void)
+/* Two jobs share the cascade's idle CPU, and the order between them is not
+ * arbitrary. The PACK has a hard deadline: the next frame cannot start its
+ * cascade until gm_in is complete, so a shortfall there stalls the pipeline.
+ * A range-coder shortfall merely becomes exposed time in this frame. Do the
+ * one with the hard deadline first. */
+static void edge_bg_slice(void)
 {
-    if (!g_bg_armed) return;
-    if (rc_stream_step(&g_bg_rc, (unsigned long)EDGE_BG_SLICE_SYMS)) g_bg_armed = 0;
+    if (edge_pack_busy()) { edge_pack_step(EDGE_BG_PACK_ROWS); return; }
+    if (g_bg_armed && rc_stream_step(&g_bg_rc, (unsigned long)EDGE_BG_SLICE_SYMS))
+        g_bg_armed = 0;
 }
 
 /* Per-frame hiding accounting, printed after the pass so no printf lands
  * inside a timed bracket. */
 #define EDGE_BG_MAXF 128
 static unsigned long g_bg_an [EDGE_BG_MAXF];   /* coded during the analysis */
+static int           g_bg_rows[EDGE_BG_MAXF];  /* rows packed in the analysis */
+static double        g_bg_pk_ms[EDGE_BG_MAXF]; /* pack time left EXPOSED    */
+static int           g_bg_rows_all = 0;        /* rows in a whole frame     */
 static unsigned long g_bg_srch[EDGE_BG_MAXF];  /* coded under the VQ search */
 static unsigned long g_bg_exp[EDGE_BG_MAXF];   /* left over, coded exposed  */
 static double        g_bg_exp_ms[EDGE_BG_MAXF];
@@ -621,8 +647,9 @@ static void edge_power_measure(const vq_pq_ctx_t *vq)
  *     the measured loop, so crediting it here would be counting it twice. An
  *     earlier version of this function did exactly that.
  * ========================================================================= */
-static int edge_one_pipelined(int frame_id, int next_seed,
-                              const rc_models_t *M, ep_frame_stat_t *st)
+static int edge_one_pipelined(int frame_id, const rc_models_t *M,
+                              const uint8_t *pack_src, uint8_t *pack_dst,
+                              ep_frame_stat_t *st)
 {
     memset(st, 0, sizeof(*st));
     st->frame_id = frame_id;
@@ -644,8 +671,25 @@ static int edge_one_pipelined(int frame_id, int next_seed,
     if (have_prev) {
         rc_stream_start(&g_bg_rc, M, g_idx_prev, g_bs, sizeof g_bs);
         g_bg_armed = 1;
-        cascade_set_bg_work(edge_bg_range_slice);
     }
+
+    /* ---- arm the NEXT frame's input pack --------------------------------
+     * 5.0127 ms of CPU work that used to sit in front of the cascade because
+     * it writes the buffer the cascade reads. It can only move here because
+     * gm_in is double-buffered: this packs the buffer the NEXT frame will
+     * read, while the DW MM2S streams the one this frame is using. */
+    const int pack_ahead = (pack_src && pack_dst
+                            && edge_pack_arm_frame(pack_src, pack_dst) == 0);
+    if (pack_src && pack_dst && !pack_ahead) {
+        /* Refuse rather than continue. The caller has set gm_prepacked, so
+         * the NEXT frame will stream pack_dst without packing it -- and the
+         * DMA cannot tell stale bytes from fresh ones. Carrying on would
+         * produce a complete, plausible, wrong run. */
+        printf("[EDGE] ABORT: could not arm the input pack (schedule not built?)\n");
+        return -1;
+    }
+
+    if (have_prev || pack_ahead) cascade_set_bg_work(edge_bg_slice);
 
     /* ---- analysis. The engine is busy for this whole interval; the CPU is
      * not, and the hook above is spending it. --------------------------- */
@@ -659,8 +703,23 @@ static int edge_one_pipelined(int frame_id, int next_seed,
     cascade_set_bg_work(0);
     if (an_rc != 0) { g_bg_armed = 0; return -1; }
 
-    const unsigned long syms_an = have_prev ? rc_stream_coded(&g_bg_rc) : 0ul;
-    unsigned long syms_srch = 0ul;
+    const unsigned long syms_an  = have_prev ? rc_stream_coded(&g_bg_rc) : 0ul;
+    const int           rows_an  = pack_ahead ? edge_pack_rows_done() : 0;
+    unsigned long       syms_srch = 0ul;
+
+    /* ---- finish the pack before anything else ---------------------------
+     * HARD DEADLINE, and the reason it is here rather than at the end of the
+     * frame: the next frame's cascade reads pack_dst, and a half-packed
+     * buffer would be consumed without complaint -- the DMA cannot tell.
+     * If the analysis window was big enough this bracket is empty. */
+    double pack_exposed_ms = 0.0;
+    if (pack_ahead) {
+        ST_BEGIN_S(ST_PACK);
+        const unsigned long long k0 = NOW();
+        edge_pack_finish();
+        pack_exposed_ms = MS(k0, NOW());
+        ST_END_S(ST_PACK);
+    }
 
     if (g_pl_ok) {
         /* ---- codebook reload: overlaps nothing, by construction --------- */
@@ -732,6 +791,8 @@ static int edge_one_pipelined(int frame_id, int next_seed,
             const unsigned long tot = (unsigned long)RC_NSYM_PER_FRAME;
             const unsigned long got = syms_an + syms_srch;
             g_bg_an  [g_bg_n] = syms_an;
+            g_bg_rows[g_bg_n] = rows_an;
+            g_bg_pk_ms[g_bg_n] = pack_exposed_ms;
             g_bg_srch[g_bg_n] = syms_srch;
             g_bg_exp [g_bg_n] = (tot > got) ? (tot - got) : 0ul;
             g_bg_exp_ms[g_bg_n] = st->t_range;
@@ -740,7 +801,6 @@ static int edge_one_pipelined(int frame_id, int next_seed,
         }
     }
 
-    (void)next_seed;
     ST_END_S(ST_FRAME);
 
     const unsigned long long t1 = NOW();
@@ -782,6 +842,18 @@ static void edge_bg_report(double ii_ms, int nframes, double t_range_serial)
     printf("#PIPE,coded_in_analysis,%.1f,%.2f%%\n", an / n, 100.0 * an / (n * tot));
     printf("#PIPE,coded_under_search,%.1f,%.2f%%\n", sr / n, 100.0 * sr / (n * tot));
     printf("#PIPE,coded_exposed,%.1f,%.2f%%\n", ex / n, 100.0 * ex / (n * tot));
+    if (g_bg_rows_all > 0) {
+        double rw = 0.0, pk = 0.0, pk_max = 0.0;
+        for (int i = 0; i < g_bg_n; i++) {
+            rw += (double)g_bg_rows[i];
+            pk += g_bg_pk_ms[i];
+            if (g_bg_pk_ms[i] > pk_max) pk_max = g_bg_pk_ms[i];
+        }
+        printf("#PIPE,pack_rows_per_frame,%d\n", g_bg_rows_all);
+        printf("#PIPE,pack_rows_in_analysis,%.1f,%.2f%%\n",
+               rw / n, 100.0 * rw / (n * (double)g_bg_rows_all));
+        printf("#PIPE,pack_exposed_ms_mean,%.4f,max,%.4f\n", pk / n, pk_max);
+    }
     printf("#PIPE,exposed_ms_mean,%.4f,max,%.4f\n", ms / n, ex_max);
     printf("#PIPE,range_bytes_mean,%.1f,bpp,%.5f\n",
            by / n, (by / n) * 8.0 / ((double)EP_W * (double)EP_H));
@@ -1243,7 +1315,7 @@ int edge_validation_run(void)
          * prepared on the CPU underneath it. The serial edge_one() path is
          * left intact so the previously reported numbers stay reproducible
          * from the same source -- switch with EDGE_PIPELINED. */
-        if (edge_one_pipelined(fid, fid + 1, &M, &g_stat[n]) != 0) return -1;
+        if (edge_one_pipelined(fid, &M, 0, 0, &g_stat[n]) != 0) return -1;
 #else
         if (edge_one(fid, &vq, &M, 1, &g_stat[n]) != 0) return -1;
 #endif
@@ -1527,11 +1599,37 @@ int edge_validation_run(void)
 
         static ep_frame_stat_t pstat;
         int np = 0, ok = 1;
+        int par = 0;             /* which input buffer the RUNNING frame uses */
 
-        /* Priming frame: produces the first index set, codes nothing, untimed. */
-        if (edge_prepare2(EDGE_FIRST_TIMED, layout, use_synth, &ms_load, &ms_deint) != 0
-            || edge_one_pipelined(1000 + EDGE_FIRST_TIMED, 0, &M, &pstat) != 0)
+        g_bg_rows_all = EP_H;
+
+        /* PRIMING, two frames deep, and untimed.
+         *
+         * The steady state needs three things true when a frame starts: its own
+         * gm_in is packed, its predecessor's indices exist, and the next frame's
+         * CHW is available to pack from. Reaching that costs one frame of
+         * set-up, and it is why the loop below starts at EDGE_FIRST_TIMED + 1.
+         *
+         * The priming frame itself runs with gm_prepacked off, so the cascade
+         * packs gm_in[0] the old way -- there was no earlier frame to do it. */
+        edge_set_gm_prepacked(0);
+        edge_set_in_parity(0);
+        if (edge_prepare2(EDGE_FIRST_TIMED, layout, use_synth, &ms_load, &ms_deint) != 0)
             ok = 0;
+        if (ok) {
+            edge_set_in_parity(1);
+            if (edge_prepare2(EDGE_FIRST_TIMED + 1, layout, use_synth,
+                              &ms_load, &ms_deint) != 0) ok = 0;
+            edge_set_in_parity(0);
+        }
+        if (ok && edge_one_pipelined(1000 + EDGE_FIRST_TIMED, &M,
+                                     edge_chw_for(1), edge_gm_in_for(1), &pstat) != 0)
+            ok = 0;
+
+        /* From here every frame finds its input already packed. */
+        edge_set_gm_prepacked(1);
+        par = 1;
+        edge_set_in_parity(par);
 
         if (ok) {
             /* TWO intervals, because they answer different questions.
@@ -1549,16 +1647,33 @@ int edge_validation_run(void)
             double acc_frame = 0.0;
             const unsigned long long q0 = NOW();
             for (int i = 1; i <= EDGE_PIPE_FRAMES; i++) {
-                const int fid = EDGE_FIRST_TIMED + i;
-                if (fid > 100) break;
-                if (edge_prepare2(fid, layout, use_synth, &ms_load, &ms_deint) != 0) { ok = 0; break; }
+                const int fid  = EDGE_FIRST_TIMED + i;   /* the frame being RUN  */
+                const int nfid = fid + 1;                /* the one being PREPPED */
+                if (nfid > 100) break;
+
+                /* Prepare frame n+1 into the OTHER input buffer. Untimed: this
+                 * is synthetic frame generation standing in for a camera. */
+                edge_set_in_parity(1 - par);
+                if (edge_prepare2(nfid, layout, use_synth, &ms_load, &ms_deint) != 0) { ok = 0; break; }
+                edge_set_in_parity(par);
+
                 /* +1000 so the stage trace buckets these separately from the
                  * serial pass's frames -- the trace keys on frame id. */
                 const unsigned long long f0 = NOW();
-                if (edge_one_pipelined(1000 + fid, 0, &M, &pstat) != 0) { ok = 0; break; }
+                if (edge_one_pipelined(1000 + fid, &M,
+                                       edge_chw_for(1 - par), edge_gm_in_for(1 - par),
+                                       &pstat) != 0) { ok = 0; break; }
                 acc_frame += MS(f0, NOW());
                 np++;
+
+                par ^= 1;
+                edge_set_in_parity(par);
             }
+            /* Leave the module as the serial path expects to find it: buffer 0,
+             * and packing done inside the cascade. edge_power_measure() runs
+             * after this and drives edge_run_six_pairs directly. */
+            edge_set_gm_prepacked(0);
+            edge_set_in_parity(0);
             const double ii_wall  = (np > 0) ? MS(q0, NOW()) / (double)np : 0.0;
             const double ii_frame = (np > 0) ? acc_frame / (double)np : 0.0;
             edge_set_quiet(0);
@@ -1573,6 +1688,8 @@ int edge_validation_run(void)
         } else {
             edge_set_quiet(0);
         }
+        edge_set_gm_prepacked(0);
+        edge_set_in_parity(0);
         if (!ok) printf("#PIPE,ABORT,the pipelined pass did not complete\n");
 
         printf("#STPASS,pipelined\n");

@@ -1867,9 +1867,10 @@ int compare_tensor_vs_ref(const uint8_t *got, int C, int H, int W,
  * ============================================================ */
 /* Generic fallback for any C and any W. The C==3 fast path below handles
  * the only shape this network actually packs; see the dispatcher. */
-static void pack_input_group_major_generic(const uint8_t *src_unpadded,
+static void pack_input_group_major_generic_rows(const uint8_t *src_unpadded,
                                    uint8_t *dst_group_major,
-                                   int C, int H, int W, uint8_t pad_val)
+                                   int C, int H, int W, uint8_t pad_val,
+                                   int h0, int h1)
 {
     const int W_padded  = (W + 7) & ~7;
     const int G_per_row = W_padded / 8;
@@ -1901,7 +1902,7 @@ static void pack_input_group_major_generic(const uint8_t *src_unpadded,
      * moves are the right primitive. */
     const int G_full = W / 8;   /* groups whose 8 columns are all inside W */
 
-    for (int h = 0; h < H; h++) {
+    for (int h = h0; h < h1; h++) {
         const uint8_t *src_h = src_unpadded + (size_t)h * W;
         uint8_t       *dst_h = dst_group_major + (size_t)h * G_per_row * (size_t)C * 8;
 
@@ -1990,13 +1991,19 @@ static void pack_gm_c3_ptr(const uint8_t *src, uint8_t *dst, int H, int W)
  * write buffer -- halving their count is the lever that matters, not
  * load width. G = W/8 = 160 is even, so no odd-group tail. */
 __attribute__((aligned(64)))
-static void pack_gm_c3_neon(const uint8_t *src, uint8_t *dst, int H, int W)
+/* ROW-RANGED, so the pack can be suspended and resumed. Rows are wholly
+ * independent -- row h reads three source rows and writes one destination
+ * row, and nothing carries between iterations -- so a row boundary is a
+ * clean cut with no state to save beyond the row index. That is what lets
+ * this run inside the cascade's DMA waits alongside the entropy coder. */
+static void pack_gm_c3_neon_rows(const uint8_t *src, uint8_t *dst,
+                                 int H, int W, int h0, int h1)
 {
     const int    G     = W / 8;
     const size_t plane = (size_t)H * (size_t)W;
     const size_t drow  = (size_t)(((W + 7) & ~7) / 8) * 3u * 8u;
 
-    for (int h = 0; h < H; h++) {
+    for (int h = h0; h < h1; h++) {
         const uint8_t *s0 = src + (size_t)h * (size_t)W;
         const uint8_t *s1 = s0 + plane;
         const uint8_t *s2 = s1 + plane;
@@ -2012,6 +2019,7 @@ static void pack_gm_c3_neon(const uint8_t *src, uint8_t *dst, int H, int W)
         }
     }
 }
+
 
 /* Dispatcher. Same in-binary benchmark, 720x1280 C=3, min of 5, TWO builds:
  *
@@ -2043,15 +2051,41 @@ static void pack_gm_c3_neon(const uint8_t *src, uint8_t *dst, int H, int W)
  * gm_in, and that path has no register pressure for the compiler to
  * schedule differently. The scalar version is loop-overhead bound, which
  * is exactly what scheduling perturbs. */
+/* Whole-frame forms. Kept because PACKBENCH times and cross-checks these
+ * three implementations by name; the row-ranged bodies above are the same
+ * code, so the benchmark still measures what it claims to. */
+static void pack_gm_c3_neon(const uint8_t *src, uint8_t *dst, int H, int W)
+{
+    pack_gm_c3_neon_rows(src, dst, H, W, 0, H);
+}
+
+static void pack_input_group_major_generic(const uint8_t *src_unpadded,
+                                           uint8_t *dst_group_major,
+                                           int C, int H, int W, uint8_t pad_val)
+{
+    pack_input_group_major_generic_rows(src_unpadded, dst_group_major,
+                                        C, H, W, pad_val, 0, H);
+}
+
+static void pack_input_group_major_rows(const uint8_t *src_unpadded,
+                                        uint8_t *dst_group_major,
+                                        int C, int H, int W, uint8_t pad_val,
+                                        int h0, int h1)
+{
+    if (C == 3 && (W & 7) == 0) {      /* no ragged tail => pad_val unused */
+        pack_gm_c3_neon_rows(src_unpadded, dst_group_major, H, W, h0, h1);
+        return;
+    }
+    pack_input_group_major_generic_rows(src_unpadded, dst_group_major,
+                                        C, H, W, pad_val, h0, h1);
+}
+
 static void pack_input_group_major(const uint8_t *src_unpadded,
                                    uint8_t *dst_group_major,
                                    int C, int H, int W, uint8_t pad_val)
 {
-    if (C == 3 && (W & 7) == 0) {      /* no ragged tail => pad_val unused */
-        pack_gm_c3_neon(src_unpadded, dst_group_major, H, W);
-        return;
-    }
-    pack_input_group_major_generic(src_unpadded, dst_group_major, C, H, W, pad_val);
+    pack_input_group_major_rows(src_unpadded, dst_group_major,
+                                C, H, W, pad_val, 0, H);
 }
 
 #if SURR_PACK_BENCH
@@ -6198,7 +6232,85 @@ static int           g_edge_ready = 0;
 
 /* 2.76 MB SD staging and de-interleave destination, in spare DDR windows */
 uint8_t *edge_raw_ptr(void) { return (uint8_t *)DDR_BUF_NEXT_ADDR; }
-uint8_t *edge_chw_ptr(void) { return (uint8_t *)DDR_BUF_ADD_ADDR;  }
+
+/* ---------------------------------------------------------------------------
+ * INPUT DOUBLE BUFFERING (2026-09-05).
+ *
+ * Packing the frame into group-major layout is 5.0127 ms of CPU work MEASURED,
+ * and it sat in front of the cascade because it writes the very buffer the
+ * cascade is about to read. To hide it, frame f+1 must be packed while frame f
+ * is running -- which needs two of everything on the input side:
+ *
+ *   chw    the de-interleaved CHW frame. Cached; written by edge_prepare2.
+ *   gm_in  the group-major packed frame. NORM_NONCACHE; read by the DW MM2S.
+ *
+ * Both are selected by g_edge_in_parity, which ONLY the pipelined path
+ * advances. Every other caller leaves it at 0 and sees exactly the buffers it
+ * always saw, so the serial numbers stay reproducible from the same source.
+ *
+ * Room: chw needs 2.76 MB and lives at DDR_BUF_ADD_ADDR with 256 MB clear
+ * before DDR_SKIP0; gm_in needs 2.76 MB inside the 96 MB of DDR_SKIP1. An 8 MB
+ * stride clears both and keeps the 1 MB TLB alignment that the NORM_NONCACHE
+ * mapping requires.
+ * ------------------------------------------------------------------------- */
+#define EDGE_IN_STRIDE 0x00800000u          /* 8 MB */
+
+static int g_edge_in_parity = 0;
+
+uint8_t *edge_chw_for(int parity)
+{
+    return (uint8_t *)(DDR_BUF_ADD_ADDR + (parity ? EDGE_IN_STRIDE : 0u));
+}
+uint8_t *edge_gm_in_for(int parity)
+{
+    return (uint8_t *)(DDR_SKIP1_ADDR + (parity ? EDGE_IN_STRIDE : 0u));
+}
+uint8_t *edge_chw_ptr(void)        { return edge_chw_for(g_edge_in_parity); }
+void     edge_set_in_parity(int p) { g_edge_in_parity = (p != 0); }
+int      edge_get_in_parity(void)  { return g_edge_in_parity; }
+
+/* Set when the caller has packed gm_in itself, so pair 0 must not pack it
+ * again. Off by default: the serial path still packs inside the cascade. */
+static int g_edge_gm_prepacked = 0;
+void edge_set_gm_prepacked(int on) { g_edge_gm_prepacked = (on != 0); }
+
+/* ---- suspendable input pack -------------------------------------------
+ * Driven a few rows at a time from the cascade background hook. Holds only a
+ * row index, because rows are independent. edge_pack_finish() completes
+ * whatever is left, so it is always safe to call and a frame can never start a
+ * cascade over a half-packed buffer. */
+static struct {
+    const uint8_t *src;
+    uint8_t       *dst;
+    int C, H, W, h;
+    uint8_t pad;
+    int armed;
+} g_pack;
+
+void edge_pack_arm(const uint8_t *src, uint8_t *dst,
+                   int C, int H, int W, uint8_t pad)
+{
+    g_pack.src = src; g_pack.dst = dst;
+    g_pack.C = C; g_pack.H = H; g_pack.W = W; g_pack.pad = pad;
+    g_pack.h = 0;  g_pack.armed = 1;
+}
+
+/* Returns 1 when the frame is fully packed. nrows <= 0 means "all of it". */
+int edge_pack_step(int nrows)
+{
+    if (!g_pack.armed) return 1;
+    int h1 = g_pack.h + ((nrows > 0) ? nrows : g_pack.H);
+    if (h1 > g_pack.H) h1 = g_pack.H;
+    pack_input_group_major_rows(g_pack.src, g_pack.dst, g_pack.C,
+                                g_pack.H, g_pack.W, g_pack.pad, g_pack.h, h1);
+    g_pack.h = h1;
+    if (g_pack.h >= g_pack.H) { g_pack.armed = 0; return 1; }
+    return 0;
+}
+
+int edge_pack_finish(void)    { return edge_pack_step(0); }
+int edge_pack_rows_done(void) { return g_pack.armed ? g_pack.h : g_pack.H; }
+int edge_pack_busy(void)      { return g_pack.armed; }
 
 /* ---------------------------------------------------------------------------
  * Block-5 output. With 6 pairs the last write lands in chainB (p=5 is odd).
@@ -6406,7 +6518,7 @@ int edge_run_six_pairs(const uint8_t *gm_in_frame)
 {
     uint8_t *chainA = edge_chainA_for(g_edge_parity);   /* both alternate, so   */
     uint8_t *chainB = edge_chainB_for(g_edge_parity);   /* either may be final  */
-    uint8_t *gm_in  = (uint8_t *)DDR_SKIP1_ADDR;
+    uint8_t *gm_in  = edge_gm_in_for(g_edge_in_parity);
     uint8_t *raw_in = (uint8_t *)gm_in_frame;
     const int npairs = surr_npairs();
 
@@ -6425,10 +6537,17 @@ int edge_run_six_pairs(const uint8_t *gm_in_frame)
          * Skipping this leaves gm_in cached, so dirty lines write back lazily
          * DURING the DMA burst and contend with the PL for DDR -- measured as
          * a ~2.7x inflation of the HW window on the first run. One-time cost. */
-        for (unsigned s = 0; s < 4u; s++)
-            Xil_SetTlbAttributes((INTPTR)((UINTPTR)gm_in + (UINTPTR)s * 0x100000u),
-                                 NORM_NONCACHE);
-        printf("[EDGE] gm_in @ %p mapped NORM_NONCACHE across 4 MB\n", (void *)gm_in);
+        /* BOTH input buffers, not just the current one: the pipelined path
+         * packs into the other while this one is being read, and a cached
+         * mapping there would put dirty lines behind the next frame DMA. */
+        for (int b = 0; b < 2; b++) {
+            uint8_t *gb = edge_gm_in_for(b);
+            for (unsigned s = 0; s < 4u; s++)
+                Xil_SetTlbAttributes((INTPTR)((UINTPTR)gb + (UINTPTR)s * 0x100000u),
+                                     NORM_NONCACHE);
+            printf("[EDGE] gm_in[%d] @ %p mapped NORM_NONCACHE across 4 MB\n",
+                   b, (void *)gb);
+        }
 #endif
         /* Make the schedule and the latent buffer visible. Which chain holds
          * the latent depends on the pair count, and getting it wrong is
@@ -6461,11 +6580,17 @@ int edge_run_six_pairs(const uint8_t *gm_in_frame)
          * they are one cascade with II=1 per beat -- so this is the finest
          * granularity software can observe, and it is what the pipeline figure
          * needs: the engine is busy for exactly this interval. */
+        /* Pair 0 packs gm_in unless the caller already did it out of band.
+         * CASC_IN_PREPACKED also suppresses the flush, which is right here for
+         * the same reason it is right for chained pairs: gm_in is
+         * NORM_NONCACHE, so there were never dirty lines to write back. */
+        unsigned in_flags = SURR_IN_FLAGS(chained);
+        if (p == 0 && g_edge_gm_prepacked) in_flags |= CASC_IN_PREPACKED;
         ST_BEGIN_I(ST_DW_PW, p);
         const int _rc = hw_dw_pw_cascade_l0_l1(&dw, &pw, raw_in, in_buf, out_buf,
                                    &g_edge_p[2 * p],     &g_edge_w[2 * p],
                                    &g_edge_p[2 * p + 1], &g_edge_w[2 * p + 1],
-                                   SURR_IN_FLAGS(chained));
+                                   in_flags);
         ST_END_I(ST_DW_PW, p);
         if (_rc != 0) return -1;
     }
@@ -6479,6 +6604,21 @@ int edge_run_six_pairs(const uint8_t *gm_in_frame)
      * from npairs here so a schedule change cannot silently mis-point it. */
     g_edge_latent = ((npairs - 1) % 2 == 0) ? chainA : chainB;
     g_edge_parity ^= 1;
+    return 0;
+}
+
+/* Arm the suspendable pack for one frame, taking C/H/W and the zero point
+ * from pair 0 of the live schedule. Callers outside this file have no
+ * business knowing that geometry, and a copy of it here would be a second
+ * place for a schedule change to go wrong.
+ *
+ * Returns -1 before the schedule exists (edge_run_six_pairs builds it on
+ * its first call), in which case the caller simply does not pack ahead. */
+int edge_pack_arm_frame(const uint8_t *chw, uint8_t *gm)
+{
+    if (!g_edge_ready || !chw || !gm) return -1;
+    const layer_desc_t *d = &g_edge_descs[0];
+    edge_pack_arm(chw, gm, d->Cin, d->H, d->W, d->zp_in);
     return 0;
 }
 
