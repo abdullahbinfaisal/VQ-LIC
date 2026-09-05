@@ -172,3 +172,35 @@ print("    sharing costs %.1f%% of the frame rate, before entropy coding."
       % (100.0 * (1.0 - _ded / _shr)))
 print("  NOTE the dedicated figure remains MODELLED: that engine was removed")
 print("  from the design, so it can no longer be measured on this board.")
+
+# ---------------------------------------------------------------------------
+# 2026-09-05, run 3: the comparison above has REVERSED, and the reason is the
+# same overlap that used to justify the dedicated engine.
+# ---------------------------------------------------------------------------
+_rest = B.II_PIPE - B.T_VQ_PROG - B.T_VQ_RUN_P   # frame minus what only the
+                                                 # shared design has to pay
+_ded  = max(_rest, DED_OLD)
+
+print("\nWith the CPU work hidden, the dedicated engine LOSES")
+print("  shared engine   MEASURED : %7.4f ms -> %5.2f fps" % (B.II_PIPE, fps(B.II_PIPE)))
+print("  dedicated       MODELLED : max(%.4f, %.4f) = %7.4f ms -> %5.2f fps"
+      % (_rest, DED_OLD, _ded, fps(_ded)))
+print("    Its frame is the analysis side alone, %.4f ms -- no codebook reload" % _rest)
+print("    and no shared search -- run against an %.3f ms VQ on its own" % DED_OLD)
+print("    hardware, which it cannot overlap away.")
+print("  the shared engine is %.1f%% FASTER, and ~7,000 LUT / ~8,100 FF /"
+      % (100.0 * (_ded / B.II_PIPE - 1.0)))
+print("  9 BRAM36 smaller.")
+print("""
+  WHY IT REVERSED. The dedicated engine's %.3f ms VQ hid under an analysis
+  phase that was 19.65 ms because 6.16 ms of it was CPU work sitting in front
+  of the PL. Moving that work into the cascade's DMA waits shrank the phase to
+  %.4f ms, which is no longer wide enough to cover an 18.43 ms search. The
+  overlap that made the dedicated engine look free is the same overlap that
+  took its advantage away.
+
+  So the trade is no longer area-for-throughput. On the measured pipeline the
+  shared engine is smaller AND slightly faster, and the honest caveat is the
+  direction of evidence: the shared figure is measured on silicon, the
+  dedicated one is analytical for hardware that no longer exists in the design.
+""" % (DED_OLD, _rest))
