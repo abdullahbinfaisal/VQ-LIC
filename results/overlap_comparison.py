@@ -133,34 +133,42 @@ for extra in (-3.0, -1.5, 0.0, 1.5, 3.0):
           % (a, fps(ii_a), fps(ii_e), 100.0 * (1.0 - ii_a / ii_e)))
 
 # ---------------------------------------------------------------------------
-# End-to-end estimate for the CURRENT design, including entropy coding.
-# This is the number to quote for "what frame rate will the board give".
+# End-to-end for the CURRENT design.
+#
+# SUPERSEDED 2026-09-05 BY MEASUREMENT. The board ran the PW-hosted VQ
+# bitstream; results/board_measured.py carries every number and the estimates
+# below are kept only to show what the pre-run guesses were worth.
+#
+#   analysis     19.7701 modelled   ->  19.5905 measured   -0.9%
+#   VQ reload     0.4819 measured (was 0.327 assumed:      +47%)
+#   VQ search     2.4480 modelled   ->   2.4503 measured   +0.09%
+#   entropy       3.6297 estimated  ->   5.2750 measured   +45%
+#
+# The two MODELLED terms held. The two ESTIMATED terms did not, and both were
+# optimistic. The serial frame period is 27.99 ms (35.73 fps), not the 26.33 ms
+# this file predicted.
 # ---------------------------------------------------------------------------
-RANGE_MS = 1.9307 * 1.88     # measured on the OLD geometry, scaled by the
-                             # host benchmark ratio. The measurement was taken
-                             # on a DEGENERATE stream, so this is a LOWER bound.
-# End-to-end uses the MEASURED search and the MEASURED reload: both exist
-# now, and using the model where a measurement exists would be a choice to
-# report a weaker number.
-VQ_TOT = SHR_NEW_MEAS + RELOAD
+import board_measured as B
 
-print("\nEnd-to-end, current design (analysis + reload + search + entropy)")
-ser = ANALYSIS + VQ_TOT + RANGE_MS
-print("  serial                                : %6.3f ms -> %6.2f fps" % (ser, fps(ser)))
+print("\nEnd-to-end, current design -- MEASURED 2026-09-05")
+print("  this file predicted            : %6.3f ms -> %6.2f fps"
+      % (ANALYSIS + SHR_NEW + RELOAD + 1.9307 * 1.88,
+         fps(ANALYSIS + SHR_NEW + RELOAD + 1.9307 * 1.88)))
+SER_MEAS = (B.T_HOST + B.T_VQ_PROG + B.T_VQ_RUN + B.T_RANGE)
+print("  the board gave                 : %6.3f ms -> %6.2f fps"
+      % (SER_MEAS, fps(SER_MEAS)))
+print("  run results/board_measured.py for the full decomposition, the")
+print("  overlap bounds and the power A/B.")
 
-# Only range coding overlaps: it is CPU work on frame f-1's indices, needing
-# neither the PW engine nor any buffer in flight. Input preparation does NOT
-# count -- edge_prepare2() already does it outside the frame.
-pipe = ANALYSIS + RELOAD + max(SHR_NEW, RANGE_MS)
-print("  pipelined (entropy under the search)  : %6.3f ms -> %6.2f fps" % (pipe, fps(pipe)))
-print("  the search is %s by entropy coding (%.3f vs %.3f ms)"
-      % ("fully hidden" if RANGE_MS >= SHR_NEW else "only partly hidden",
-         SHR_NEW, RANGE_MS))
-print("  overlap is worth %6.2f -> %6.2f fps (%.2fx)" % (fps(ser), fps(pipe), ser / pipe))
-
-print("\n  For reference, the old dedicated engine at the same analysis and")
-print("  entropy cost: II = max(%.3f, %.3f) + %.3f = %.3f ms -> %.2f fps"
-      % (ANALYSIS, DED_OLD, RANGE_MS, max(ANALYSIS, DED_OLD) + RANGE_MS,
-         fps(max(ANALYSIS, DED_OLD) + RANGE_MS)))
-print("  (its VQ overlapped the analysis; its entropy stage did not overlap")
-print("   anything, because the CPU was the thing driving both.)")
+print("\n  The comparison this file exists to make is unaffected: the dedicated")
+print("  engine's VQ was hidden under the analysis and the shared engine's is")
+print("  not, so sharing still costs a frame-rate fraction. With the measured")
+print("  analysis and the measured search that cost is:")
+_ded = max(B.T_HOST, DED_OLD)              # dedicated: VQ hidden under analysis
+_shr = B.T_HOST + B.T_VQ_PROG + B.T_VQ_RUN # shared: exposed, plus its reload
+print("    dedicated (VQ hidden)        : %6.3f ms -> %6.2f fps" % (_ded, fps(_ded)))
+print("    shared    (VQ exposed)       : %6.3f ms -> %6.2f fps" % (_shr, fps(_shr)))
+print("    sharing costs %.1f%% of the frame rate, before entropy coding."
+      % (100.0 * (1.0 - _ded / _shr)))
+print("  NOTE the dedicated figure remains MODELLED: that engine was removed")
+print("  from the design, so it can no longer be measured on this board.")
