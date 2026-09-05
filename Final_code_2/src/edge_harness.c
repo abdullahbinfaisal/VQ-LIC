@@ -1466,14 +1466,31 @@ int edge_validation_run(void)
         printf("[PAIR] ===== end per-pair report =====\n");
     }
 
-    // sum-vs-direct cross-check
-    double d = 0.0, s = 0.0;
-    for (int i = 0; i < n; i++) { d += g_stat[i].t_edge_direct; s += g_stat[i].t_edge_sum; }
-    d /= n; s /= n;
+    /* sum-vs-direct cross-check.
+     *
+     * T_EDGE_DIRECT is the legacy bracket t_e0..t_e1: analysis plus the NEON
+     * VQ. Under the PW geometry the range coding happens AFTER t_e1, on the
+     * PW search's indices, so t_edge_sum legitimately exceeds it by exactly
+     * T_RANGE. That is a definition, not a discrepancy -- report the residual
+     * with the range term removed as well, or the line reads as a 1.5%%
+     * accounting failure every run. */
+    double d = 0.0, s = 0.0, r = 0.0;
+    for (int i = 0; i < n; i++) {
+        d += g_stat[i].t_edge_direct;
+        s += g_stat[i].t_edge_sum;
+        r += g_stat[i].t_range;
+    }
+    d /= n; s /= n; r /= n;
     printf("XCHK,T_EDGE_DIRECT_mean_ms,%.4f\n", d);
     printf("XCHK,T_EDGE_SUM_mean_ms,%.4f\n", s);
     printf("XCHK,difference_ms,%.4f\n", d - s);
     printf("XCHK,difference_pct,%.3f\n", (s != 0.0) ? 100.0 * (d - s) / s : 0.0);
+#if RC_GEOMETRY_PW && EDGE_USE_PW_VQ
+    printf("XCHK,T_RANGE_outside_direct_ms,%.4f\n", r);
+    printf("XCHK,difference_excl_range_ms,%.4f\n", d - (s - r));
+    printf("XCHK,NOTE,range coding runs after the T_EDGE_DIRECT bracket\n");
+    printf("XCHK,NOTE,so the raw difference above IS T_RANGE, by construction\n");
+#endif
     printf("MODEL,t_model_build_ms,%.4f\n", t_model_build);
 #if EDGE_PIPELINED_AB && EDGE_USE_PW_VQ
     /* ======================================================================
