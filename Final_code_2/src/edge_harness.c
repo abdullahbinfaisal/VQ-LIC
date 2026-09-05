@@ -830,60 +830,25 @@ int edge_validation_run(void)
 
     vq_pq_init(&vq, edge_codebook_ptr(), 0);
 
-    // ---- calibration pass: frames 1..EDGE_NCAL -----------------------------
-    printf("[EDGE] calibration over frames 1..%d (model build timed separately)\n",
-           EDGE_NCAL);
+    /* ---- VQ bring-up runs BEFORE calibration -----------------------------
+     * ORDER IS LOAD-BEARING, not cosmetic. The calibration loop below builds
+     * the entropy model from the PW search's own indices, but only when
+     * g_pl_ok is set -- and g_pl_ok is set by the bring-up. Until 2026-09-05
+     * the bring-up sat AFTER calibration, so the loop silently took its
+     * memset(0) fallback for all 20 frames. The resulting model gave symbol 0
+     * 65521/65536 and every other symbol 1/65536: 0.0040 bits/sym, 16 bits per
+     * real symbol, 216 KB per frame against a 119 KB buffer. Every timed frame
+     * printed "PW range overflow" and T_RANGE was never measured.
+     *
+     * The bring-up verifies against edge_latent_ptr(), so one analysis pass
+     * runs first to put a real latent there rather than power-on contents.
+     * Frame 1 is prepared twice as a result; it is outside every timed
+     * bracket, so the only cost is a few ms of start-up. */
     double ms_load, ms_deint;
-    for (int i = 0; i < EDGE_NCAL; i++) {
-        if (edge_prepare2(i + 1, layout, use_synth, &ms_load, &ms_deint) != 0) return -1;
-        edge_reset_accums();
-        if (edge_run_six_pairs(edge_chw_ptr()) != 0) return -1;
-#if RC_GEOMETRY_PW && EDGE_USE_PW_VQ
-        /* The entropy model must be trained on the SAME index geometry the
-         * coder will see. rc_model_build reads through rc_get_sym, so feeding
-         * it the NEON path's M=4/K=256 bytes while RC_GEOMETRY_PW=1 would
-         * histogram nibble pairs as if they were codewords and produce a model
-         * that describes nothing. Calibrate from the PW search itself. */
-        if (g_pl_ok && vq_pw_pl_load_codebook(g_pw_cb, 128) == 0)
-            vq_pw_pl_encode_frame(edge_latent_ptr(), g_cal_store[i]);
-        else
-            memset(g_cal_store[i], 0, VQ_IDX_BYTES);
-#else
-        vq_pq_encode_frame(&vq, edge_latent_ptr(), g_cal_store[i]);
-#endif
-        g_cal_idx[i] = g_cal_store[i];
-    }
-    ep_build_model(&M, (const uint8_t *const *)g_cal_idx, EDGE_NCAL, &t_model_build);
-    double Hm[RC_NMODEL];
-    rc_model_entropy(&M, Hm);
-    printf("[EDGE] model built in %.4f ms (NOT counted in T_RANGE)\n", t_model_build);
-    printf("[EDGE] model entropy per codebook: %.4f %.4f %.4f %.4f bits/sym\n",
-           Hm[0], Hm[1], Hm[2], Hm[3]);
+    if (edge_prepare2(1, layout, use_synth, &ms_load, &ms_deint) != 0) return -1;
+    edge_reset_accums();
+    if (edge_run_six_pairs(edge_chw_ptr()) != 0) return -1;
 
-    /* ON-TARGET VERIFICATION of the restructured NEON search (2026-08-26).
-     * search_sub now keeps the running minimum in NEON registers. Confirm on the
-     * real device that it still yields indices identical to the scalar reference
-     * before any timing is reported. vq_pq_selftest() lives behind VQ_PQ_BENCH,
-     * so compare against vq_pq_encode_frame_ref() directly. */
-    {
-        long bad = 0, first = -1;
-        vq_pq_encode_frame(&vq, edge_latent_ptr(), g_idx);
-        vq_pq_encode_frame_ref(&vq, edge_latent_ptr(), g_rt);
-        for (long i = 0; i < (long)VQ_IDX_BYTES; i++)
-            if (g_idx[i] != g_rt[i]) { if (first < 0) first = i; bad++; }
-        printf("[EDGE] VQ NEON vs scalar reference: %ld mismatches of %d, first at %ld -> %s\n",
-               bad, VQ_IDX_BYTES, first, (bad == 0) ? "PASS" : "FAIL");
-        if (bad != 0) {
-            printf("[EDGE] ABORT: restructured VQ search is not reference-exact.\n");
-            edge_set_quiet(0);
-            return -1;
-        }
-    }
-    /* ---- PL VQ bring-up and correctness gate ------------------------------
-     * Nothing about the PL path may be reported unless it returns exactly the
-     * same indices as the scalar reference ON THIS BOARD. The ID register is
-     * checked first: a stale bitstream without this block would otherwise fail
-     * in a much more confusing way. */
 #if EDGE_USE_PW_VQ
     printf("[EDGE] ---- PW-hosted VQ bring-up ----\n");
     edge_pw_synth_codebook();
@@ -909,6 +874,84 @@ int edge_validation_run(void)
         g_pl_ok = 1;
     }
 #endif
+
+    // ---- calibration pass: frames 1..EDGE_NCAL -----------------------------
+    printf("[EDGE] calibration over frames 1..%d (model build timed separately)\n",
+           EDGE_NCAL);
+    for (int i = 0; i < EDGE_NCAL; i++) {
+        if (edge_prepare2(i + 1, layout, use_synth, &ms_load, &ms_deint) != 0) return -1;
+        edge_reset_accums();
+        if (edge_run_six_pairs(edge_chw_ptr()) != 0) return -1;
+#if RC_GEOMETRY_PW && EDGE_USE_PW_VQ
+        /* The entropy model must be trained on the SAME index geometry the
+         * coder will see. rc_model_build reads through rc_get_sym, so feeding
+         * it the NEON path's M=4/K=256 bytes while RC_GEOMETRY_PW=1 would
+         * histogram nibble pairs as if they were codewords and produce a model
+         * that describes nothing. Calibrate from the PW search itself. */
+        if (g_pl_ok && vq_pw_pl_load_codebook(g_pw_cb, 128) == 0)
+            vq_pw_pl_encode_frame(edge_latent_ptr(), g_cal_store[i]);
+        else
+            memset(g_cal_store[i], 0, VQ_IDX_BYTES);
+#else
+        vq_pq_encode_frame(&vq, edge_latent_ptr(), g_cal_store[i]);
+#endif
+        g_cal_idx[i] = g_cal_store[i];
+    }
+#if RC_GEOMETRY_PW && EDGE_USE_PW_VQ
+    /* A model built on all-zero indices is not obviously wrong at build time:
+     * it succeeds, reports a plausible-looking entropy, and only fails later
+     * as a per-frame overflow with no stated cause. Check the input instead. */
+    {
+        int nz = 0;
+        for (int i = 0; i < EDGE_NCAL; i++)
+            for (long b = 0; b < (long)VQPW_IDX_BYTES; b++)
+                if (g_cal_store[i][b]) { nz++; break; }
+        if (nz == 0) {
+            printf("[EDGE] ABORT: all %d calibration frames have all-zero indices.\n",
+                   EDGE_NCAL);
+            printf("[EDGE] The entropy model would be degenerate and every frame\n");
+            printf("[EDGE] would overflow the bitstream buffer. Check that the PW\n");
+            printf("[EDGE] VQ bring-up ran and set g_pl_ok before this loop.\n");
+            edge_set_quiet(0);
+            return -1;
+        }
+    }
+#endif
+    ep_build_model(&M, (const uint8_t *const *)g_cal_idx, EDGE_NCAL, &t_model_build);
+    double Hm[RC_NMODEL];
+    rc_model_entropy(&M, Hm);
+    printf("[EDGE] model built in %.4f ms (NOT counted in T_RANGE)\n", t_model_build);
+    /* RC_NMODEL is 8 under RC_GEOMETRY_PW, so the fixed four-value print
+     * hid half the models -- including the fact that they were identical. */
+    printf("[EDGE] model entropy per codebook (%d models of %d symbols):",
+           RC_NMODEL, RC_NSYM);
+    for (int m = 0; m < RC_NMODEL; m++) printf(" %.4f", Hm[m]);
+    printf(" bits/sym\n");
+
+    /* ON-TARGET VERIFICATION of the restructured NEON search (2026-08-26).
+     * search_sub now keeps the running minimum in NEON registers. Confirm on the
+     * real device that it still yields indices identical to the scalar reference
+     * before any timing is reported. vq_pq_selftest() lives behind VQ_PQ_BENCH,
+     * so compare against vq_pq_encode_frame_ref() directly. */
+    {
+        long bad = 0, first = -1;
+        vq_pq_encode_frame(&vq, edge_latent_ptr(), g_idx);
+        vq_pq_encode_frame_ref(&vq, edge_latent_ptr(), g_rt);
+        for (long i = 0; i < (long)VQ_IDX_BYTES; i++)
+            if (g_idx[i] != g_rt[i]) { if (first < 0) first = i; bad++; }
+        printf("[EDGE] VQ NEON vs scalar reference: %ld mismatches of %d, first at %ld -> %s\n",
+               bad, VQ_IDX_BYTES, first, (bad == 0) ? "PASS" : "FAIL");
+        if (bad != 0) {
+            printf("[EDGE] ABORT: restructured VQ search is not reference-exact.\n");
+            edge_set_quiet(0);
+            return -1;
+        }
+    }
+    /* ---- PL VQ bring-up and correctness gate ------------------------------
+     * Nothing about the PL path may be reported unless it returns exactly the
+     * same indices as the scalar reference ON THIS BOARD. The ID register is
+     * checked first: a stale bitstream without this block would otherwise fail
+     * in a much more confusing way. */
 #if EDGE_USE_PL_VQ
     printf("[EDGE] ---- PL VQ bring-up ----\n");
     if (vq_pl_init() != 0) {

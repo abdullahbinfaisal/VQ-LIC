@@ -40,7 +40,18 @@ DED_OLD = (NPOS // QL) * 256 / F_CLK * 1e3      # M=4 K=256 dedicated  18.432 AN
 DED_NEW = (NPOS // QL) *  16 / F_CLK * 1e3      # M=8 K=16  dedicated   1.152 ANALYTICAL
 SHR_OLD = vq_cycles(4, 256)[0] / F_CLK * 1e3    # M=4 K=256 shared     19.584 MODELLED
 SHR_NEW = vq_cycles(8,  16)[0] / F_CLK * 1e3    # M=8 K=16  shared      2.448 MODELLED
-RELOAD  = (32 * 64 + 128 + 6) * 0.15 / 1000.0   # codebook reload      0.327 ESTIMATED
+
+# MEASURED ON THE BOARD 2026-09-05, first run of the PW-hosted VQ bitstream.
+# vq_pw_pl_last_run_ms() reported 2.4503 ms against SHR_NEW's modelled 2.4480:
+# +0.09%. The service model is now validated on hardware for the VQ shape, not
+# just for the convolution shapes it was frozen on.
+SHR_NEW_MEAS = 2.4503
+
+# Codebook reload. Was 0.327 ms ESTIMATED at an assumed 0.15 us per AXI-lite
+# write and flagged as the weakest input in the whole estimate. Measured
+# 0.4819 ms by vq_pw_pl_last_prog_ms(), i.e. 0.221 us per write over the same
+# 2,182 writes -- 47% above the assumption, so the estimate was optimistic.
+RELOAD  = 0.4819                                # codebook reload      MEASURED
 
 fps = lambda ms: 1000.0 / ms
 
@@ -49,6 +60,14 @@ print("  PL   %7.4f ms  MODELLED" % PL_MS)
 print("  pack %7.4f ms  MEASURED" % PACK_MS)
 print("  prog %7.4f ms  MEASURED 2.4363 over 6 pairs, scaled to %d" % (PROG_MS, len(SEL)))
 print("  ---- %7.4f ms  total" % ANALYSIS)
+
+print("\nVQ on the shared engine, model against board (2026-09-05)")
+print("  search  modelled %7.4f ms   measured %7.4f ms   %+.2f%%"
+      % (SHR_NEW, SHR_NEW_MEAS, 100.0 * (SHR_NEW_MEAS - SHR_NEW) / SHR_NEW))
+print("  reload  assumed  %7.4f ms   measured %7.4f ms   %+.2f%%"
+      % (0.327, RELOAD, 100.0 * (RELOAD - 0.327) / 0.327))
+print("  NOTE the rows below still use the MODELLED search, so the dedicated-")
+print("  engine variants (which have no board measurement) stay comparable.")
 
 rows = [
     ("A  dedicated engine, M=4 K=256, OVERLAPPED", DED_OLD, True,
@@ -120,7 +139,10 @@ for extra in (-3.0, -1.5, 0.0, 1.5, 3.0):
 RANGE_MS = 1.9307 * 1.88     # measured on the OLD geometry, scaled by the
                              # host benchmark ratio. The measurement was taken
                              # on a DEGENERATE stream, so this is a LOWER bound.
-VQ_TOT = SHR_NEW + RELOAD
+# End-to-end uses the MEASURED search and the MEASURED reload: both exist
+# now, and using the model where a measurement exists would be a choice to
+# report a weaker number.
+VQ_TOT = SHR_NEW_MEAS + RELOAD
 
 print("\nEnd-to-end, current design (analysis + reload + search + entropy)")
 ser = ANALYSIS + VQ_TOT + RANGE_MS
