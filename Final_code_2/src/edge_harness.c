@@ -128,8 +128,13 @@ extern void edge_read_pair_cycles(unsigned long long *hw, unsigned long long *pa
 extern void edge_read_pair_dims(int *cout, int *hout, int *wout, int *groups, int n);
 
 #define EP_MAXP 8
-/* T_VQ for QUERY_LANES=2. RTL SIMULATION, not silicon: 1,843,339 cycles at
- * 100 MHz. Labelled as such everywhere it is printed. Replace after Stage 4. */
+/* T_VQ for the DEDICATED engine at QUERY_LANES=2. RTL SIMULATION, not
+ * silicon: 1,843,339 cycles at 100 MHz.
+ *
+ * LEGACY ONLY. That block is absent from the PW-hosted bitstream, and the
+ * [PAIR] report no longer prints these under EDGE_USE_PW_VQ -- the shared
+ * engine has measured numbers now. Kept so the EDGE_USE_PL_VQ build still
+ * reproduces what it reported before. */
 #define VQ_SIM_MS       18.433
 #define VQ_CYC_PER_GRP  1024
 
@@ -714,6 +719,11 @@ static int edge_one(int frame_id, const vq_pq_ctx_t *vq, const rc_models_t *M,
             ST_BEGIN_S(ST_RANGE);
             const unsigned long long r0 = NOW();
             const size_t rn = rc_encode_frame(M, g_pl_idx, g_bs, sizeof g_bs);
+            /* Feed the shared nb, or the reporting block below overwrites
+             * every one of these fields with the legacy path's skipped
+             * values -- which is what made the CSV read range_bytes=0 and
+             * t_range=0.0002 ms while #STSUM carried the real 5.27 ms. */
+            nb = rn;
             const unsigned long long r1 = NOW();
             ST_END_S(ST_RANGE);
             st->t_range     = MS(r0, r1);
@@ -764,7 +774,12 @@ static int edge_one(int frame_id, const vq_pq_ctx_t *vq, const rc_models_t *M,
 
     st->t_edge_direct = MS(t_e0, t_e1);
     st->t_vq          = MS(t_h1, t_v1);
+#if RC_GEOMETRY_PW && EDGE_USE_PW_VQ
+    /* Already set from the PW block's own bracket. MS(t_v1, t_e1) measures
+     * the deliberately skipped legacy encode, i.e. nothing. */
+#else
     st->t_range       = MS(t_v1, t_e1);
+#endif
 
     double pack, prog, cache, pl, total;
     edge_read_accums(&pack, &prog, &cache, &pl, &total);
@@ -779,13 +794,28 @@ static int edge_one(int frame_id, const vq_pq_ctx_t *vq, const rc_models_t *M,
     st->t_edge_sum  = st->t_host + st->t_vq + st->t_range;
 
     // everything below is OUTSIDE all timed regions
-    rc_frame_entropy(g_idx, st->h_emp);
+    /* Report on the indices that were actually encoded. Under the PW
+     * geometry that is g_pl_idx (M=8/K=16 nibbles); g_idx holds the NEON
+     * path's M=4/K=256 bytes, and measuring one against the other gave a
+     * guaranteed 57,600 mismatches per frame -- 4,608,000 in the summary,
+     * which reads as a correctness failure and was purely an aliasing bug. */
+#if RC_GEOMETRY_PW && EDGE_USE_PW_VQ
+    const uint8_t *rc_src = g_pl_idx;
+    const long     rc_len = (long)VQPW_IDX_BYTES;
+#else
+    const uint8_t *rc_src = g_idx;
+    const long     rc_len = (long)VQ_IDX_BYTES;
+#endif
+    rc_frame_entropy(rc_src, st->h_emp);
     st->rc_mismatch = -1; st->rc_first_bad = -1;
-    if (do_roundtrip) {
+    /* nb == 0 means nothing was encoded (no PL, or an overflow). Decoding a
+     * zero-length stream and diffing it is not a failing round trip, it is
+     * an absent one: leave rc_mismatch at -1 so the summary says so. */
+    if (do_roundtrip && nb > 0) {
         rc_decode_frame(M, g_bs, nb, g_rt);
         long bad = 0, first = -1;
-        for (long i = 0; i < (long)VQ_IDX_BYTES; i++)
-            if (g_rt[i] != g_idx[i]) { if (first < 0) first = i; bad++; }
+        for (long i = 0; i < rc_len; i++)
+            if (g_rt[i] != rc_src[i]) { if (first < 0) first = i; bad++; }
         st->rc_mismatch = bad; st->rc_first_bad = first;
     }
     return 0;
@@ -997,7 +1027,11 @@ int edge_validation_run(void)
     // ---- warm-up, discarded -------------------------------------------------
     ep_frame_stat_t junk;
     for (int w = 0; w < EDGE_NWARM; w++) {
-        int fid = EDGE_FIRST_TIMED + w;
+        /* NOT EDGE_FIRST_TIMED + w. The stage trace buckets by frame id, so
+         * warming on 21..23 and then timing 21..23 merged each pair into one
+         * bucket: those three #STSUM rows came out at exactly 2x every stage
+         * and #STPIPE reported a 1,509 ms overlap that does not exist. */
+        int fid = EDGE_FIRST_TIMED - EDGE_NWARM + w;   /* 18, 19, 20 */
         if (edge_prepare2(fid, layout, use_synth, &ms_load, &ms_deint) != 0) return -1;
         edge_one(fid, &vq, &M, 0, &junk);
     }
@@ -1189,6 +1223,36 @@ int edge_validation_run(void)
             printf("[PAIR]   share of total PL analysis : %.2f %%\n",
                    (tot_ms > 0.0) ? 100.0 * m6 / tot_ms : 0.0);
 
+#if EDGE_USE_PW_VQ
+            /* The dedicated VQ block is not in this bitstream. Its trailing-read
+             * overlap and its stream-fusion question were both about two engines
+             * running at once; there is one engine now, and #STEXCL confirms the
+             * two phases never overlap. Printing the old analysis here would be
+             * describing hardware that was removed at 62cbfbc. */
+            printf("\n[PAIR] ---- VQ on the SHARED PW engine ----\n");
+            printf("[PAIR]   T_analysis (SILICON, measured) = %.4f ms\n", tot_ms);
+            printf("[PAIR]   T_pair%d    (SILICON, measured) = %.4f ms\n", npairs, m6);
+            printf("[PAIR]   T_reload   (SILICON, measured) = %.4f ms\n",
+                   vq_pw_pl_last_prog_ms());
+            printf("[PAIR]   T_VQ       (SILICON, measured) = %.4f ms\n",
+                   vq_pw_pl_last_run_ms());
+            printf("[PAIR]   T_frame = T_analysis + T_reload + T_VQ = %.4f ms\n",
+                   tot_ms + vq_pw_pl_last_prog_ms() + vq_pw_pl_last_run_ms());
+            printf("[PAIR]   No trailing-read subtraction: the search cannot start\n");
+            printf("[PAIR]   until the cascade has released the engine, so the final\n");
+            printf("[PAIR]   pair does not overlap it. This is measurement, not a\n");
+            printf("[PAIR]   model -- every term above came off the board.\n");
+
+            printf("\n[PAIR] ---- direct PW->VQ stream fusion ----\n");
+            printf("[PAIR]   pair%d producer rate : %.1f cycles/group\n", npairs, prod);
+            printf("[PAIR]   NOT APPLICABLE. Producer and consumer are the same\n");
+            printf("[PAIR]   engine. Streaming pair %d into the search would need the\n", npairs);
+            printf("[PAIR]   engine to hold the layer weights and the codebook at\n");
+            printf("[PAIR]   once, in the one weight BRAM they contend for -- which\n");
+            printf("[PAIR]   is the resource the sharing gave up. The %.4f ms reload\n",
+                   vq_pw_pl_last_prog_ms());
+            printf("[PAIR]   per frame is the price of that contention.\n");
+#else
             printf("\n[PAIR] ---- same-frame DDR trailing-read overlap, QUERY_LANES=2 ----\n");
             printf("[PAIR]   T_analysis (SILICON, measured)      = %.4f ms\n", tot_ms);
             printf("[PAIR]   T_pair6    (SILICON, measured)      = %.4f ms\n", m6);
@@ -1212,6 +1276,7 @@ int edge_validation_run(void)
                 printf("[PAIR]            direct stream fusion is NOT rate-feasible; VQ would\n");
                 printf("[PAIR]            backpressure the PW and stretch pair %d.\n", npairs);
             }
+#endif
         }
         printf("[PAIR] ===== end per-pair report =====\n");
     }
