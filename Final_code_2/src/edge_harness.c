@@ -191,6 +191,34 @@ extern const char *edge_pm_group_name(int i);
 #define EDGE_PIPELINED 0
 #endif
 
+/* EDGE_PIPELINED_AB -- run the pipelined loop as a SECOND timed pass after
+ * the serial one, in the same session, on the same board, at the same
+ * temperature, and report both interval-per-frame figures. The serial pass
+ * keeps the CSV and every STAT line it has always emitted, so nothing in
+ * the existing record changes; the pipelined pass reports only its II and
+ * its hiding accounting. Running them together is the point: an overlap
+ * claim compared against a number from a different run is not an A/B. */
+#ifndef EDGE_PIPELINED_AB
+#define EDGE_PIPELINED_AB 1
+#endif
+#define EDGE_PIPE_ANY (EDGE_USE_PW_VQ && (EDGE_PIPELINED || EDGE_PIPELINED_AB))
+
+/* Symbols coded per slice inside a DMA wait. 64 symbols is ~2.9 us at the
+ * measured 45.8 ns/symbol: long enough that the indirect call is noise,
+ * short enough that the MM2S loop's S2MM re-arm check is never delayed by
+ * more than that. Larger slices hide no more work -- the window is 2.6x
+ * bigger than the job -- they only add latency to the cascade's polling. */
+#ifndef EDGE_BG_SLICE_SYMS
+#define EDGE_BG_SLICE_SYMS 64
+#endif
+
+/* Frames in the pipelined pass. Fewer than the serial pass: the quantity
+ * being measured is a wall-clock interval per frame with a cv of ~0.01%,
+ * so 40 is already far past the point where more frames buy precision. */
+#ifndef EDGE_PIPE_FRAMES
+#define EDGE_PIPE_FRAMES 40
+#endif
+
 #ifndef EDGE_POWER
 #define EDGE_POWER 1      /* 1 = run the power measurement after all timing */
 #endif
@@ -208,7 +236,9 @@ static uint8_t         g_bs   [VQ_IDX_BYTES * 2 + 4096];
 static uint8_t        *g_cal_idx[EDGE_NCAL];
 static uint8_t         g_cal_store[EDGE_NCAL][VQ_IDX_BYTES];
 #if EDGE_USE_PL_VQ || EDGE_USE_PW_VQ
-static uint8_t         g_pl_idx[VQ_IDX_BYTES];
+/* 32-byte aligned: the coder now reads one of these while the VQ's S2MM
+ * writes the other, so they must not share a cache line with each other. */
+static uint8_t         g_pl_idx[VQ_IDX_BYTES] __attribute__((aligned(32)));
 static int             g_pl_ok = 0;      /* set only after the block identifies */
 #endif
 #if EDGE_USE_PW_VQ
@@ -235,10 +265,43 @@ static int8_t          g_pw_cb[VQPW_M * VQPW_K * VQPW_DSUB];
  * otherwise this is 57.6 KB of BSS reserved for a path that is switched
  * off, on a board where the harness already holds >1 MB of static index
  * storage. */
-#if EDGE_PIPELINED
-static uint8_t         g_pw_idx_b[VQ_IDX_BYTES];
+#if EDGE_PIPE_ANY
+static uint8_t         g_pw_idx_b[VQ_IDX_BYTES] __attribute__((aligned(32)));
 static uint8_t        *g_idx_cur  = 0;   /* the search is writing this      */
 static uint8_t        *g_idx_prev = 0;   /* complete, safe for the PS       */
+#endif
+
+#if EDGE_PIPE_ANY
+/* ---- entropy coding as background work -------------------------------
+ * Registered with the cascade for the duration of the analysis, so the
+ * coder advances inside the DMA spin loops instead of after them. The
+ * stream is armed on the PREVIOUS frame's indices, which are complete and
+ * which nothing else touches until the ping-pong swaps at end of frame.
+ *
+ * No timer reads in here. Two register reads per slice, 1,800 slices per
+ * frame, would be a measurable tax on the thing being measured -- and an
+ * unnecessary one, because rc_stream_coded() gives the same accounting for
+ * free by counting symbols instead of cycles. */
+extern void cascade_set_bg_work(void (*fn)(void));
+
+static rc_stream_t g_bg_rc;
+static int         g_bg_armed = 0;
+
+static void edge_bg_range_slice(void)
+{
+    if (!g_bg_armed) return;
+    if (rc_stream_step(&g_bg_rc, (unsigned long)EDGE_BG_SLICE_SYMS)) g_bg_armed = 0;
+}
+
+/* Per-frame hiding accounting, printed after the pass so no printf lands
+ * inside a timed bracket. */
+#define EDGE_BG_MAXF 128
+static unsigned long g_bg_an [EDGE_BG_MAXF];   /* coded during the analysis */
+static unsigned long g_bg_srch[EDGE_BG_MAXF];  /* coded under the VQ search */
+static unsigned long g_bg_exp[EDGE_BG_MAXF];   /* left over, coded exposed  */
+static double        g_bg_exp_ms[EDGE_BG_MAXF];
+static size_t        g_bg_bytes[EDGE_BG_MAXF];
+static int           g_bg_n = 0;
 #endif
 
 static void edge_pw_synth_codebook(void)
@@ -522,7 +585,42 @@ static void edge_power_measure(const vq_pq_ctx_t *vq)
  * while frame f's search runs in PL. That is the largest piece of CPU work
  * available to hide the search behind.
  * ------------------------------------------------------------------------ */
-#if EDGE_USE_PW_VQ && EDGE_PIPELINED
+#if EDGE_PIPE_ANY
+/* ===========================================================================
+ * edge_one_pipelined -- one frame with the entropy coder hidden.
+ *
+ * WHAT OVERLAPS WHAT, and why those and nothing else.
+ *
+ * The PW engine is a single resource. The analysis cascade and the VQ search
+ * both need it, so they are strictly serial and no amount of buffering changes
+ * that (#STEXCL asserts it every run). What CAN overlap is CPU work that
+ * touches neither the engine nor a buffer in flight, and on this design there
+ * is exactly one such job: entropy coding of the PREVIOUS frame's indices.
+ *
+ * It gets two windows, and it needs both only in the sense that the first is
+ * already more than enough:
+ *
+ *   window 1  the analysis, 13.4816 ms MEASURED, of which the CPU spends
+ *             essentially all of it spinning on DMA status registers. The
+ *             coder runs there via the cascade's background hook.
+ *   window 2  the VQ search, 2.6428 ms MEASURED, the CPU spinning on the
+ *             accelerator's done flag. The coder runs there in this function's
+ *             own poll loop.
+ *
+ * Entropy coding is 5.275 ms MEASURED, against 16.12 ms of window. So the
+ * expectation is that it disappears entirely and the frame period falls to
+ * what the engine alone dictates. The accounting below reports symbols coded
+ * in each window and the exposed remainder, so if it does NOT disappear the
+ * numbers say where it went rather than leaving the claim to arithmetic.
+ *
+ * WHAT IS NOT OVERLAPPED, deliberately:
+ *   - the codebook reload. It writes the same weight BRAM the cascade just
+ *     used and the search is about to read. It is the price of sharing the
+ *     engine and it is measured, not hidden.
+ *   - input preparation. edge_prepare2() already runs it outside the frame in
+ *     the measured loop, so crediting it here would be counting it twice. An
+ *     earlier version of this function did exactly that.
+ * ========================================================================= */
 static int edge_one_pipelined(int frame_id, int next_seed,
                               const rc_models_t *M, ep_frame_stat_t *st)
 {
@@ -530,21 +628,42 @@ static int edge_one_pipelined(int frame_id, int next_seed,
     st->frame_id = frame_id;
     st->pl_mismatch = -1;
     st->pl_flushed  = 0;
+    st->t_range     = 0.0;
 
-    if (!g_idx_cur) { g_idx_cur = g_pl_idx; g_idx_prev = g_pw_idx_b; }
+    if (!g_idx_cur) { g_idx_cur = g_pl_idx; g_idx_prev = 0; }
 
     edge_reset_accums();
     st_set_frame((uint32_t)frame_id);
     ST_BEGIN_S(ST_FRAME);
 
-    /* ---- analysis: the PW engine is busy for this whole interval -------- */
+    /* ---- arm the coder on the previous frame's indices ------------------
+     * g_idx_prev is 0 on the first frame of a pass: there is no previous
+     * frame, so that one frame legitimately codes nothing. It is excluded
+     * from the reported mean rather than averaged in as a fast frame. */
+    const int have_prev = (g_idx_prev != 0);
+    if (have_prev) {
+        rc_stream_start(&g_bg_rc, M, g_idx_prev, g_bs, sizeof g_bs);
+        g_bg_armed = 1;
+        cascade_set_bg_work(edge_bg_range_slice);
+    }
+
+    /* ---- analysis. The engine is busy for this whole interval; the CPU is
+     * not, and the hook above is spending it. --------------------------- */
     const unsigned long long t0 = NOW();
-    if (edge_run_six_pairs(edge_chw_ptr()) != 0) return -1;
+    const int an_rc = edge_run_six_pairs(edge_chw_ptr());
     const unsigned long long t_an = NOW();
 
+    /* Unregister BEFORE anything else can call into the cascade. Leaving a
+     * stale callback armed would let the coder run inside a later frame's
+     * analysis against a buffer this frame is about to overwrite. */
+    cascade_set_bg_work(0);
+    if (an_rc != 0) { g_bg_armed = 0; return -1; }
+
+    const unsigned long syms_an = have_prev ? rc_stream_coded(&g_bg_rc) : 0ul;
+    unsigned long syms_srch = 0ul;
+
     if (g_pl_ok) {
-        /* ---- codebook reload: cannot overlap anything, it writes the same
-         * weight BRAM the cascade just used ------------------------------- */
+        /* ---- codebook reload: overlaps nothing, by construction --------- */
         ST_BEGIN_S(ST_VQ_PROG);
         const int cb_ok = vq_pw_pl_load_codebook(g_pw_cb, 128);
         ST_END_S(ST_VQ_PROG);
@@ -552,58 +671,83 @@ static int edge_one_pipelined(int frame_id, int next_seed,
         if (cb_ok == 0) {
             ST_BEGIN_S(ST_VQ_RUN);
             vq_pw_pl_cache_prep(edge_latent_ptr(), g_idx_cur, 0);
-            const int ok = (vq_pw_pl_start(edge_latent_ptr(), g_idx_cur) == 0);
+            const int started = (vq_pw_pl_start(edge_latent_ptr(), g_idx_cur) == 0);
 
-            /* ---- OVERLAP, both items on the CPU while the search runs in PL.
-             * Neither touches the PW engine nor a buffer in flight. --------- */
-
-            /* (a) entropy-code the PREVIOUS frame's indices. g_idx_prev is
-             * complete; g_idx_cur is being written by the S2MM right now.
-             * This is what the range coder rebuild was for -- before it, the
-             * coder could not read this geometry at all. */
-            if (g_idx_prev && frame_id > 0) {
-                ST_BEGIN_S(ST_RANGE);
-                const size_t nb = rc_encode_frame(M, g_idx_prev, g_bs, sizeof g_bs);
-                ST_END_S(ST_RANGE);
-                st->range_bytes = nb;
-                st->range_bits  = (double)nb * 8.0;
-                st->range_bpp   = st->range_bits / ((double)EP_W * (double)EP_H);
-            }
-
-            /* There is deliberately NO input-preparation overlap here.
-             * An earlier version generated frame f+1's input under the search,
-             * but edge_prepare2() in the measured loop already prepares every
-             * frame BEFORE calling this function -- so that was duplicated
-             * work, and crediting it as hidden would have inflated the
-             * overlap. Input preparation is also outside the timed bracket
-             * (t_load / t_deint are reported but excluded), so hiding it buys
-             * nothing measurable. Range coding above is the real overlap.
-             */
-            (void)next_seed;
-
-            if (ok) {
-                int r; unsigned long long guard = 0;
-                while ((r = vq_pw_pl_poll_done()) == 0 && ++guard < 200000000u) { }
+            /* ---- window 2: code while the search runs ------------------
+             * The search writes g_idx_cur by DMA; the coder reads g_idx_prev.
+             * Disjoint buffers, and the engine is untouched either way.
+             *
+             * poll_done() is read every slice rather than every symbol so the
+             * AXI-Lite reads stay a rounding error, and the loop exits on
+             * whichever finishes first. */
+            int r = 0;
+            unsigned long long guard = 0;
+            if (started) {
+                while (r == 0 && ++guard < 200000000u) {
+                    if (g_bg_armed) {
+                        if (rc_stream_step(&g_bg_rc, (unsigned long)EDGE_BG_SLICE_SYMS))
+                            g_bg_armed = 0;
+                    }
+                    r = vq_pw_pl_poll_done();
+                }
                 if (r > 0) vq_pw_pl_finish(g_idx_cur);
             }
             ST_END_S(ST_VQ_RUN);
+
+            syms_srch = have_prev ? (rc_stream_coded(&g_bg_rc) - syms_an) : 0ul;
 
             st->t_vq_pw_prog  = vq_pw_pl_last_prog_ms();
             st->t_vq_pl_block = vq_pw_pl_last_run_ms();
             st->t_vq_pl       = st->t_vq_pw_prog + st->t_vq_pl_block;
 
-            /* ping-pong for the next frame */
-            uint8_t *tmp = g_idx_prev; g_idx_prev = g_idx_cur; g_idx_cur = tmp;
+            /* ping-pong: what the search just wrote becomes next frame's
+             * coding input. Only on a completed search -- handing the coder a
+             * partially-written buffer would produce a clean-looking bitstream
+             * of nothing in particular. */
+            if (r > 0) {
+                uint8_t *tmp = g_idx_prev ? g_idx_prev : g_pw_idx_b;
+                g_idx_prev = g_idx_cur;
+                g_idx_cur  = tmp;
+            }
         }
     }
 
+    /* ---- whatever the two windows did not absorb is EXPOSED -------------
+     * This bracket is the entropy cost the frame actually pays. If the
+     * windows were big enough it contains only the 4-byte flush. */
+    if (have_prev) {
+        ST_BEGIN_S(ST_RANGE);
+        const unsigned long long r0 = NOW();
+        const size_t nb = rc_stream_finish(&g_bg_rc);
+        const unsigned long long r1 = NOW();
+        ST_END_S(ST_RANGE);
+        g_bg_armed = 0;
+
+        st->t_range     = MS(r0, r1);
+        st->range_bytes = nb;
+        st->range_bits  = (double)nb * 8.0;
+        st->range_bpp   = st->range_bits / ((double)EP_W * (double)EP_H);
+
+        if (g_bg_n < EDGE_BG_MAXF) {
+            const unsigned long tot = (unsigned long)RC_NSYM_PER_FRAME;
+            const unsigned long got = syms_an + syms_srch;
+            g_bg_an  [g_bg_n] = syms_an;
+            g_bg_srch[g_bg_n] = syms_srch;
+            g_bg_exp [g_bg_n] = (tot > got) ? (tot - got) : 0ul;
+            g_bg_exp_ms[g_bg_n] = st->t_range;
+            g_bg_bytes[g_bg_n]  = nb;
+            g_bg_n++;
+        }
+    }
+
+    (void)next_seed;
     ST_END_S(ST_FRAME);
 
     const unsigned long long t1 = NOW();
     st->t_pl          = MS(t0, t_an);
     st->t_vq          = st->t_vq_pl;
     st->t_edge_direct = MS(t0, t1);
-    st->t_edge_sum    = st->t_pl + st->t_vq;
+    st->t_edge_sum    = st->t_pl + st->t_vq + st->t_range;
 
     double pack, prog, cache, pl, total;
     edge_read_accums(&pack, &prog, &cache, &pl, &total);
@@ -612,7 +756,47 @@ static int edge_one_pipelined(int frame_id, int next_seed,
     st->fixed_bpp = ((double)VQPW_IDX_BYTES * 8.0) / ((double)EP_W * (double)EP_H);
     return 0;
 }
-#endif /* EDGE_USE_PW_VQ && EDGE_PIPELINED */
+
+
+/* Print the hiding accounting for a pipelined pass. Outside every timed
+ * bracket by construction: nothing here runs until the pass is over. */
+static void edge_bg_report(double ii_ms, int nframes, double t_range_serial)
+{
+    if (g_bg_n <= 0) { printf("#PIPE,no frames with a previous frame to code\n"); return; }
+
+    double an = 0.0, sr = 0.0, ex = 0.0, ms = 0.0, by = 0.0;
+    double ex_max = 0.0;
+    for (int i = 0; i < g_bg_n; i++) {
+        an += (double)g_bg_an[i];
+        sr += (double)g_bg_srch[i];
+        ex += (double)g_bg_exp[i];
+        ms += g_bg_exp_ms[i];
+        by += (double)g_bg_bytes[i];
+        if (g_bg_exp_ms[i] > ex_max) ex_max = g_bg_exp_ms[i];
+    }
+    const double n   = (double)g_bg_n;
+    const double tot = (double)RC_NSYM_PER_FRAME;
+
+    printf("#PIPE,frames,%d,II_ms,%.4f,fps,%.2f\n", nframes, ii_ms, 1000.0 / ii_ms);
+    printf("#PIPE,symbols_per_frame,%lu\n", (unsigned long)RC_NSYM_PER_FRAME);
+    printf("#PIPE,coded_in_analysis,%.1f,%.2f%%\n", an / n, 100.0 * an / (n * tot));
+    printf("#PIPE,coded_under_search,%.1f,%.2f%%\n", sr / n, 100.0 * sr / (n * tot));
+    printf("#PIPE,coded_exposed,%.1f,%.2f%%\n", ex / n, 100.0 * ex / (n * tot));
+    printf("#PIPE,exposed_ms_mean,%.4f,max,%.4f\n", ms / n, ex_max);
+    printf("#PIPE,range_bytes_mean,%.1f,bpp,%.5f\n",
+           by / n, (by / n) * 8.0 / ((double)EP_W * (double)EP_H));
+
+    /* The claim, stated as a subtraction against a number measured in THIS
+     * session by the serial pass, not against a remembered one. */
+    if (t_range_serial > 0.0) {
+        const double hidden = t_range_serial - (ms / n);
+        printf("#PIPE,serial_range_ms,%.4f,exposed_ms,%.4f,hidden_ms,%.4f,%.1f%%\n",
+               t_range_serial, ms / n, hidden, 100.0 * hidden / t_range_serial);
+    }
+    printf("#PIPE,NOTE,II is wall time over the pass divided by frames; it is\n");
+    printf("#PIPE,NOTE,not a sum of stages and does not assume they are disjoint\n");
+}
+#endif /* EDGE_PIPE_ANY */
 
 static int edge_one(int frame_id, const vq_pq_ctx_t *vq, const rc_models_t *M,
                     int do_roundtrip, ep_frame_stat_t *st)
@@ -1087,6 +1271,7 @@ int edge_validation_run(void)
     ep_print_summary(g_stat, n);
 
     /* ---- stage trace: the pipeline figure's raw data ---------------------- */
+    printf("#STPASS,serial\n");
     st_print_frame_summary();
     st_print_pipeline();
     st_print_hiding();      /* how much of the VQ the CPU work actually hid */
@@ -1290,6 +1475,103 @@ int edge_validation_run(void)
     printf("XCHK,difference_ms,%.4f\n", d - s);
     printf("XCHK,difference_pct,%.3f\n", (s != 0.0) ? 100.0 * (d - s) / s : 0.0);
     printf("MODEL,t_model_build_ms,%.4f\n", t_model_build);
+#if EDGE_PIPELINED_AB && EDGE_USE_PW_VQ
+    /* ======================================================================
+     * SECOND TIMED PASS -- identical work, entropy coding hidden.
+     *
+     * Same board, same session, same temperature, minutes after the serial
+     * pass. That matters: an overlap claim is a DIFFERENCE, and a difference
+     * against a number from another run is not one.
+     *
+     * The serial pass above keeps every CSV row and STAT line it has always
+     * emitted; nothing already in the record changes. This pass reports only
+     * what is new: the interval per frame, and where the entropy symbols got
+     * coded.
+     *
+     * II is wall time over the pass divided by frames. It is not a sum of
+     * stages, so it cannot quietly assume the stages are disjoint -- if the
+     * overlap does not work, this number does not move.
+     * ==================================================================== */
+    if (g_pl_ok) {
+        double rs = 0.0;
+        for (int i = 0; i < n; i++) rs += g_stat[i].t_range;
+        rs = (n > 0) ? rs / (double)n : 0.0;
+
+        printf("\n[EDGE] ---- pipelined pass: entropy coding hidden ----\n");
+        printf("[EDGE] the serial pass just measured T_RANGE = %.4f ms/frame,\n", rs);
+        printf("[EDGE] fully exposed. Target: the same work, none of it exposed.\n");
+
+        st_reset();
+        g_bg_n     = 0;
+        g_bg_armed = 0;
+        g_idx_cur  = 0;      /* fresh ping-pong; frame 1 of the pass has no */
+        g_idx_prev = 0;      /* predecessor and therefore codes nothing     */
+        edge_set_quiet(1);
+
+        static ep_frame_stat_t pstat;
+        int np = 0, ok = 1;
+
+        /* Priming frame: produces the first index set, codes nothing, untimed. */
+        if (edge_prepare2(EDGE_FIRST_TIMED, layout, use_synth, &ms_load, &ms_deint) != 0
+            || edge_one_pipelined(1000 + EDGE_FIRST_TIMED, 0, &M, &pstat) != 0)
+            ok = 0;
+
+        if (ok) {
+            /* TWO intervals, because they answer different questions.
+             *
+             * ii_frame is the frame's own wall time and is what compares with
+             * the serial pass's T_EDGE_DIRECT. ii_wall additionally contains
+             * edge_prepare2(), i.e. generating the next synthetic input.
+             *
+             * Keeping them apart is not bookkeeping. ep_synth_frame_planar()
+             * has never been measured on this board, it stands in for a camera
+             * that does not exist, and folding an unmeasured stand-in into the
+             * headline interval would be quoting a frame rate for a pipeline
+             * nobody is going to build. The gap between the two is exactly
+             * that cost, reported rather than buried. */
+            double acc_frame = 0.0;
+            const unsigned long long q0 = NOW();
+            for (int i = 1; i <= EDGE_PIPE_FRAMES; i++) {
+                const int fid = EDGE_FIRST_TIMED + i;
+                if (fid > 100) break;
+                if (edge_prepare2(fid, layout, use_synth, &ms_load, &ms_deint) != 0) { ok = 0; break; }
+                /* +1000 so the stage trace buckets these separately from the
+                 * serial pass's frames -- the trace keys on frame id. */
+                const unsigned long long f0 = NOW();
+                if (edge_one_pipelined(1000 + fid, 0, &M, &pstat) != 0) { ok = 0; break; }
+                acc_frame += MS(f0, NOW());
+                np++;
+            }
+            const double ii_wall  = (np > 0) ? MS(q0, NOW()) / (double)np : 0.0;
+            const double ii_frame = (np > 0) ? acc_frame / (double)np : 0.0;
+            edge_set_quiet(0);
+            if (np > 0) {
+                edge_bg_report(ii_frame, np, rs);
+                printf("#PIPE,II_frame_ms,%.4f,II_wall_ms,%.4f,input_prep_ms,%.4f\n",
+                       ii_frame, ii_wall, ii_wall - ii_frame);
+                printf("#PIPE,NOTE,II_frame excludes synthetic input generation;\n");
+                printf("#PIPE,NOTE,that cost is the difference and is UNMEASURED\n");
+                printf("#PIPE,NOTE,elsewhere in this project. Quote II_frame.\n");
+            }
+        } else {
+            edge_set_quiet(0);
+        }
+        if (!ok) printf("#PIPE,ABORT,the pipelined pass did not complete\n");
+
+        printf("#STPASS,pipelined\n");
+        printf("#STPASS,NOTE,ST_RANGE here is the EXPOSED remainder only. The\n");
+        printf("#STPASS,NOTE,coding done inside ST_DW_PW and ST_VQ_RUN is not\n");
+        printf("#STPASS,NOTE,bracketed as a stage, so #STHIDE understates it --\n");
+        printf("#STPASS,NOTE,use the #PIPE symbol counts, which are exact.\n");
+        st_print_frame_summary();
+        st_print_pipeline();
+        st_print_hiding();
+        st_check_exclusive();
+        if (st_overflowed())
+            printf("[EDGE] WARNING: stage trace overflowed in the pipelined pass\n");
+    }
+#endif /* EDGE_PIPELINED_AB && EDGE_USE_PW_VQ */
+
 #if EDGE_POWER
     /* LAST. Minutes of wall time and I2C traffic -- must never precede
      * any timed bracket. */

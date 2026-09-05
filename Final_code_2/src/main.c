@@ -655,6 +655,35 @@ static u64_cycles g_acc_pwbusy_p[SURR_MAX_PAIRS];
 #define ENGINE_POLL() do { } while (0)
 #endif
 
+/* ---------------------------------------------------------------------------
+ * BACKGROUND CPU WORK INSIDE THE CASCADE'S DMA WAITS.
+ *
+ * The cascade spends nearly all of its wall time in two spin loops reading a
+ * DMA status register. On the measured 16-48-64 schedule that is 13.4816 ms
+ * per frame in which the CPU does nothing at all, while entropy coding of the
+ * PREVIOUS frame's indices -- 5.275 ms of pure CPU work touching neither the
+ * PW engine nor any buffer in flight -- sits outside the frame waiting its
+ * turn. This hook lets that work run there.
+ *
+ * DELIBERATELY NOT ENGINE_POLL. That one is a diagnostic: it perturbs the
+ * timed interval, it is compiled out for clean runs (CASCADE_ENGINE_SPLIT=0),
+ * and its cadence is chosen to minimise disturbance. This one is load-bearing
+ * and wants to run as often as possible.
+ *
+ * THE CALLBACK MUST NOT BLOCK. The MM2S loop below is also what re-arms S2MM
+ * chunks, and a long stall there is exactly the 2026-07-28 deadlock: PW's
+ * output FIFO fills, DW throttles, MM2S can never finish. At the schedules
+ * used here out_bytes never exceeds one CASCADE_S2MM_CHUNK so no re-arm
+ * actually occurs, but the callback is still required to return promptly --
+ * the caller slices its work, it does not get to finish it here.
+ *
+ * Registering 0 disables it with no residual cost beyond a null test. */
+static void (*g_casc_bg_fn)(void) = 0;
+
+void cascade_set_bg_work(void (*fn)(void)) { g_casc_bg_fn = fn; }
+
+#define CASCADE_BG() do { if (g_casc_bg_fn) g_casc_bg_fn(); } while (0)
+
 /* FUSION-TRAFFIC CAPTURE (2026-07-30). The DW debug counters are per-run (they
  * reset on start_in), so after the timed loop they only hold the LAST pair's
  * values. Capture them in a dedicated UNTIMED pass instead: reading 3 AXI-Lite
@@ -3517,6 +3546,7 @@ static int hw_dw_pw_cascade_l0_l1(const layer_desc_t *dw_d,
     t = 0;
     while (XAxiDma_Busy(&DwDma, XAXIDMA_DMA_TO_DEVICE)) {
         if ((t & ENGINE_POLL_MASK) == 0) ENGINE_POLL();
+        CASCADE_BG();
         if (armed < out_bytes && !XAxiDma_Busy(&PwDma, XAXIDMA_DEVICE_TO_DMA)) {
             size_t rest  = out_bytes - armed;
             size_t chunk = (rest > CASCADE_S2MM_CHUNK) ? CASCADE_S2MM_CHUNK : rest;
@@ -3576,6 +3606,7 @@ static int hw_dw_pw_cascade_l0_l1(const layer_desc_t *dw_d,
 
             while (XAxiDma_Busy(&PwDma, XAXIDMA_DEVICE_TO_DMA)) {
                 if ((spins & ENGINE_POLL_MASK) == 0) ENGINE_POLL();
+                CASCADE_BG();
 #if !CASCADE_INSTRUMENT
                 /* measurement mode: plain timeout, no buffer scanning */
                 if (++spins > 400000000ul) {

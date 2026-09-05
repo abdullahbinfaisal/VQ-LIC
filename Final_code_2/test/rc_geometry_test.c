@@ -133,6 +133,68 @@ int main(void)
                emp_bits > 0.0 ? 100.0 * (coded_bits - emp_bits) / emp_bits : 0.0);
     }
 
+    /* ---- 1b. SLICED encoding must be byte-identical to one-shot ----------
+     * The incremental encoder exists so the coder can run inside the analysis
+     * cascade's DMA waits. That is only safe if suspending between any two
+     * symbols is unobservable in the output. Test it with RAGGED slice sizes,
+     * including 1 and including boundaries that fall inside a position's group
+     * of RC_NMODEL symbols -- an implementation that only resumed cleanly on
+     * position boundaries would pass a round-number test and fail here. */
+    {
+        static uint8_t bs_ref[sizeof bs];
+        int bad_len = 0, bad_bytes = 0, bad_rt = 0;
+        fill(1);
+        { const uint8_t *f[1] = { idx }; rc_model_build(&M, f, 1); }
+        const size_t nref = rc_encode_frame(&M, idx, bs_ref, sizeof bs_ref);
+
+        /* slice sizes chosen to be coprime-ish with RC_NMODEL so the cut lands
+         * mid-position on most iterations */
+        static const unsigned long slices[] = { 1, 3, 7, 64, 1000, 99991 };
+        for (unsigned si = 0; si < sizeof slices / sizeof slices[0]; si++) {
+            rc_stream_t st;
+            unsigned long steps = 0;
+            memset(bs, 0, sizeof bs);
+            rc_stream_start(&st, &M, idx, bs, sizeof bs);
+            while (!rc_stream_step(&st, slices[si])) {
+                if (++steps > 4ul * RC_NSYM_PER_FRAME) break;   /* no-progress guard */
+            }
+            const size_t n = rc_stream_finish(&st);
+            if (n != nref) { bad_len++; continue; }
+            if (memcmp(bs, bs_ref, n) != 0) bad_bytes++;
+            rc_decode_frame(&M, bs, n, rt);
+            if (memcmp(rt, idx, RC_IDX_BYTES) != 0) bad_rt++;
+        }
+        chk(bad_len   == 0, "sliced encode: same length as one-shot, every slice size");
+        chk(bad_bytes == 0, "sliced encode: byte-identical to one-shot");
+        chk(bad_rt    == 0, "sliced encode: still decodes back to the input");
+
+        /* A stream that never gets a slice must still produce a correct frame:
+         * rc_stream_finish() codes the remainder. This is the path taken when
+         * the analysis window turns out to be shorter than the coding. */
+        {
+            rc_stream_t st;
+            memset(bs, 0, sizeof bs);
+            rc_stream_start(&st, &M, idx, bs, sizeof bs);
+            const size_t n = rc_stream_finish(&st);
+            chk(n == nref && memcmp(bs, bs_ref, n) == 0,
+                "finish with no slices coded equals a one-shot encode");
+        }
+
+        /* rc_stream_coded() is the hiding metric, so it has to be exact. */
+        {
+            rc_stream_t st;
+            rc_stream_start(&st, &M, idx, bs, sizeof bs);
+            rc_stream_step(&st, 1000ul);
+            const unsigned long c1 = rc_stream_coded(&st);
+            rc_stream_step(&st, 337ul);
+            const unsigned long c2 = rc_stream_coded(&st);
+            rc_stream_finish(&st);
+            chk(c1 == 1000ul && c2 == 1337ul &&
+                rc_stream_coded(&st) == (unsigned long)RC_NSYM_PER_FRAME,
+                "rc_stream_coded() counts symbols exactly");
+        }
+    }
+
     /* ---- 2. uniform model must not beat fixed length --------------------- */
     fill(0);
     rc_model_uniform(&M);

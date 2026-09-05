@@ -205,17 +205,52 @@ uint8_t rc_dec_sym(rc_dec_t *d, const rc_model_t *m)
 // rc_encode_frame is EXACTLY what gets bracketed as T_RANGE: model lookup plus
 // coding plus flush, nothing else. No allocation, no model construction.
 // ---------------------------------------------------------------------------
+void rc_stream_start(rc_stream_t *s, const rc_models_t *M,
+                     const uint8_t *idx, uint8_t *out, size_t cap)
+{
+    rc_enc_init(&s->e, out, cap);
+    s->M = M; s->idx = idx; s->pos = 0; s->m = 0; s->done = 0;
+}
+
+int rc_stream_step(rc_stream_t *s, unsigned long nsym)
+{
+    const int unlimited = (nsym == 0ul);
+    if (s->done) return 1;
+    while (s->pos < RC_NPOS) {
+        while (s->m < RC_NMODEL) {
+            if (!unlimited && nsym == 0ul) return 0;      /* budget spent */
+            rc_enc_sym(&s->e, &s->M->m[s->m], rc_get_sym(s->idx, s->pos, s->m));
+            s->m++;
+            if (!unlimited) nsym--;
+        }
+        s->m = 0;
+        s->pos++;
+    }
+    s->done = 1;
+    return 1;
+}
+
+size_t rc_stream_finish(rc_stream_t *s)
+{
+    rc_stream_step(s, 0ul);                  /* anything the slices did not reach */
+    const size_t n = rc_enc_finish(&s->e);
+    return s->e.overflow ? 0 : n;
+}
+
+unsigned long rc_stream_coded(const rc_stream_t *s)
+{
+    return (unsigned long)s->pos * (unsigned long)RC_NMODEL + (unsigned long)s->m;
+}
+
+/* One-shot encode. Deliberately a thin wrapper rather than a second copy of
+ * the loop: the sliced and unsliced paths must not be able to diverge, and the
+ * only way to be sure of that is for there to be one path. */
 size_t rc_encode_frame(const rc_models_t *M, const uint8_t *idx,
                        uint8_t *out, size_t cap)
 {
-    rc_enc_t e;
-    rc_enc_init(&e, out, cap);
-    for (int pos = 0; pos < RC_NPOS; pos++) {
-        for (int m = 0; m < RC_NMODEL; m++)
-            rc_enc_sym(&e, &M->m[m], rc_get_sym(idx, pos, m));
-    }
-    size_t n = rc_enc_finish(&e);
-    return e.overflow ? 0 : n;
+    rc_stream_t s;
+    rc_stream_start(&s, M, idx, out, cap);
+    return rc_stream_finish(&s);
 }
 
 int rc_decode_frame(const rc_models_t *M, const uint8_t *in, size_t n,

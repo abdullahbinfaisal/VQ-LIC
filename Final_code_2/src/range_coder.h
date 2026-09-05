@@ -194,4 +194,48 @@ long   rc_selftest_frame(const rc_models_t *M, const uint8_t *idx,
                          uint8_t *scratch_bs, size_t bs_cap,
                          uint8_t *scratch_idx, long *first_bad);
 
+// ---- incremental encoder ----------------------------------------------------
+// Same coder, driven a slice at a time so it can run in someone else's idle
+// gaps. The Subbotin coder is a sequential state machine over (low, range,
+// output cursor), so suspending it between any two symbols costs nothing and
+// changes nothing: rc_encode_frame() is IMPLEMENTED on top of this, which is
+// what guarantees the sliced output is byte-identical to the one-shot output
+// rather than merely intended to be.
+//
+// Why this exists: on the 16-48-64 schedule the CPU spends 13.4816 ms per
+// frame spinning on the analysis cascade's DMA status registers, and entropy
+// coding of the PREVIOUS frame's indices is 5.275 ms of pure CPU work that
+// touches neither the PW engine nor any buffer in flight. It fits in that gap
+// 2.6x over.
+//
+//   rc_stream_start (s, M, idx, out, cap);
+//   while (!rc_stream_step(s, 64)) { ...someone else's wait loop... }
+//   n = rc_stream_finish(s);
+//
+// rc_stream_finish() codes whatever is left before flushing, so it is always
+// safe to call -- a stream that never got a single slice still produces a
+// correct frame, just with none of it hidden.
+typedef struct {
+    rc_enc_t           e;
+    const rc_models_t *M;
+    const uint8_t     *idx;
+    int                pos;      // next position
+    int                m;        // next sub-codebook within that position
+    int                done;     // all symbols coded (flush may still be due)
+} rc_stream_t;
+
+void   rc_stream_start (rc_stream_t *s, const rc_models_t *M,
+                        const uint8_t *idx, uint8_t *out, size_t cap);
+
+// Code up to nsym more symbols; nsym == 0 means "code all that remain".
+// Returns 1 when no symbols are left, 0 when the budget ran out first.
+int    rc_stream_step  (rc_stream_t *s, unsigned long nsym);
+
+// Code any remainder, flush the coder, return bytes written (0 on overflow).
+size_t rc_stream_finish(rc_stream_t *s);
+
+// Symbols coded so far. Cheap: no timer, no side effects -- call it around a
+// window to find out how much of the frame that window absorbed.
+unsigned long rc_stream_coded(const rc_stream_t *s);
+
 #endif // RANGE_CODER_H
