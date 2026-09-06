@@ -690,6 +690,29 @@ void cascade_set_bg_work(void (*fn)(void)) { g_casc_bg_fn = fn; }
  * registers per pair inside the timed loop would land inside f_cyc and perturb
  * the very distribution we are trying to measure. */
 static int      g_capture_beats = 0;
+/* WHICH ENGINE BINDS EACH FUSED PAIR (2026-09-06).
+ *
+ * A fused DW->PW pair runs both cores concurrently and the slower one sets
+ * the pair time. Which one that is CANNOT be read from the two done bits:
+ * the cores are coupled by an AXIS link with backpressure, so if PW is slow
+ * it stalls DW and DW cannot finish early, and if DW is slow PW starves and
+ * finishes just after DW's last beat. Either way both done bits land within
+ * a pipeline depth of each other and the split is invisible. That is why
+ * CASCADE_ENGINE_SPLIT cannot answer this question, whatever its sampling
+ * rate.
+ *
+ * DW's output FIFO does answer it. If it ever reached prog_full, PW could
+ * not drain what DW produced and PW is the binding engine. If it never did,
+ * PW always kept up and DW binds. One sticky bit, read once per pair after
+ * the hardware window closes.
+ *
+ * Counted per frame rather than OR-ed, because a single set bit could be a
+ * transient at the drain: 80 of 80 frames is structural, 2 of 80 is not. */
+static uint32_t g_dw_flags_p  [SURR_MAX_PAIRS];   /* last frame's raw word */
+static uint32_t g_dw_nfull_p  [SURR_MAX_PAIRS];   /* frames with out_full_ever */
+static uint32_t g_dw_nframe_p [SURR_MAX_PAIRS];   /* frames sampled           */
+static int      g_capture_flags = 0;
+
 static uint32_t g_dw_consumed_p[SURR_MAX_PAIRS];
 static uint32_t g_dw_written_p [SURR_MAX_PAIRS];
 static uint32_t g_dw_produced_p[SURR_MAX_PAIRS];
@@ -3755,6 +3778,16 @@ static int hw_dw_pw_cascade_l0_l1(const layer_desc_t *dw_d,
         g_dw_produced_p[g_acc_pair] = dw_read_reg(DWF_REG_DBG_PRODUCED);
     }
 
+    /* One AXI-Lite read per pair, after t_end, and only when asked for. The
+     * flags are sticky for the whole run and are cleared by the next start,
+     * so reading here covers exactly this pair. */
+    if (g_capture_flags && g_acc_pair >= 0 && g_acc_pair < SURR_MAX_PAIRS) {
+        const u32 fl = dw_read_reg(DWF_REG_DBG_FLAGS);
+        g_dw_flags_p[g_acc_pair] = fl;
+        g_dw_nframe_p[g_acc_pair]++;
+        if ((fl >> 2) & 1u) g_dw_nfull_p[g_acc_pair]++;   /* out_full_ever */
+    }
+
     if (g_cascade_accum) {
         g_acc_pack  += t_pack  - t_fn0;
         g_acc_prog  += t_prog  - t_pack;
@@ -6422,6 +6455,21 @@ void edge_reset_pair_accums(void)
 {
     for (int i = 0; i < SURR_MAX_PAIRS; i++) {
         g_acc_hw_p[i] = g_acc_pack_p[i] = g_acc_prog_p[i] = g_acc_cache_p[i] = 0;
+        g_dw_flags_p[i] = g_dw_nfull_p[i] = g_dw_nframe_p[i] = 0;
+    }
+}
+
+/* Enable the per-pair DW flag capture. Off by default so a clean timing run
+ * stays clean; one register read per pair when on. */
+void edge_set_capture_flags(int on) { g_capture_flags = (on != 0); }
+
+void edge_read_pair_flags(uint32_t *flags, uint32_t *nfull, uint32_t *nframe,
+                          int n)
+{
+    for (int i = 0; i < n && i < SURR_MAX_PAIRS; i++) {
+        if (flags)  flags[i]  = g_dw_flags_p[i];
+        if (nfull)  nfull[i]  = g_dw_nfull_p[i];
+        if (nframe) nframe[i] = g_dw_nframe_p[i];
     }
 }
 

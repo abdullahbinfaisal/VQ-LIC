@@ -122,6 +122,9 @@ extern void          edge_set_quiet(int q);     // VQ codebook (may be synthetic
 extern int  edge_num_pairs(void);
 extern int  edge_split_mode(void);
 extern void edge_reset_pair_accums(void);
+extern void edge_set_capture_flags(int on);
+extern void edge_read_pair_flags(uint32_t *flags, uint32_t *nfull,
+                                 uint32_t *nframe, int n);
 extern void edge_read_pair_cycles(unsigned long long *hw, unsigned long long *pack,
                                   unsigned long long *prog, unsigned long long *cache,
                                   int n);
@@ -1413,6 +1416,10 @@ int edge_validation_run(void)
     static unsigned long long p_sum[EP_MAXP], p_min[EP_MAXP], p_max[EP_MAXP];
     const int npairs = edge_num_pairs();
     edge_reset_pair_accums();
+    /* One AXI-Lite read per pair, after the hardware window closes, for the
+     * whole of the serial timed loop. The [PAIR] report below covers exactly
+     * this pass. */
+    edge_set_capture_flags(1);
     for (int p = 0; p < EP_MAXP; p++) {
         p_prev[p] = 0; p_sum[p] = 0; p_max[p] = 0;
         p_min[p] = (unsigned long long)-1;
@@ -1593,6 +1600,42 @@ int edge_validation_run(void)
             printf("[PAIR]   share of total PL analysis : %.2f %%\n",
                    (tot_ms > 0.0) ? 100.0 * m6 / tot_ms : 0.0);
 
+            /* ---- WHICH ENGINE BINDS EACH FUSED PAIR ----------------------
+             * The pair time is set by the slower of the two cores, and which
+             * one that is cannot be recovered from the done bits: the AXIS link
+             * backpressures, so if PW is slow it stalls DW and DW cannot finish
+             * early, and if DW is slow PW starves and finishes just after DW's
+             * last beat. Both bits land within a pipeline depth either way.
+             *
+             * DW's output FIFO separates them. Reaching prog_full means PW could
+             * not drain what DW produced, so PW binds. Never reaching it means
+             * PW always kept up, so DW binds.
+             *
+             * Frames are counted rather than OR-ed because one set bit could be
+             * a transient at the drain. Structural means every frame. */
+            {
+                uint32_t fl[EP_MAXP], nf[EP_MAXP], nn[EP_MAXP];
+                edge_read_pair_flags(fl, nf, nn, EP_MAXP);
+                printf("\n[PAIR] ---- which engine binds each fused pair ----\n");
+                printf("[PAIR]  pair    HW ms   out_full   frames   binds   raw flags\n");
+                for (int p = 0; p < npairs && p < EP_MAXP; p++) {
+                    const double hwms = ms[p];   /* the same array the table above prints */
+                    const char *who;
+                    if (nn[p] == 0u)            who = "n/a";
+                    else if (nf[p] == nn[p])    who = "PW";
+                    else if (nf[p] == 0u)       who = "DW";
+                    else                        who = "MIXED";
+                    printf("[PAIR]  %3d  %8.4f  %8u %8u   %-6s  0x%08X\n",
+                           p + 1, hwms, (unsigned)nf[p], (unsigned)nn[p],
+                           who, (unsigned)fl[p]);
+                }
+                printf("[PAIR]  out_full = frames in which DW's output FIFO reached\n");
+                printf("[PAIR]  prog_full, i.e. PW was the limiter. MIXED means the\n");
+                printf("[PAIR]  two engines are close enough that it goes either way.\n");
+                printf("[PAIR]  Binary per pair, not a duration: this says WHICH core\n");
+                printf("[PAIR]  binds, not by how much. The margin is still modelled.\n");
+            }
+
 #if EDGE_USE_PW_VQ
             /* The dedicated VQ block is not in this bitstream. Its trailing-read
              * overlap and its stream-fusion question were both about two engines
@@ -1649,6 +1692,7 @@ int edge_validation_run(void)
 #endif
         }
         printf("[PAIR] ===== end per-pair report =====\n");
+    edge_set_capture_flags(0);   /* clean again for the passes that follow */
     }
 
     /* sum-vs-direct cross-check.
