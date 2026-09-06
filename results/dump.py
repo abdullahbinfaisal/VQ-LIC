@@ -264,6 +264,18 @@ def power():
           % ("SoC rails only, deployed", B.II_PIPE, soc, soc * B.II_PIPE))
     rule()
     print()
+    if getattr(B, "PWR_TOPOLOGY_STALE", False):
+        print("  *** THE POWER ROWS ABOVE ARE PENDING RE-MEASUREMENT ***")
+        print("  They measure the run-2 topology, because edge_power_measure()")
+        print("  drove its own loop and that loop packed inside the cascade and")
+        print("  never entropy-coded. The A/B DELTA survives -- both phases ran")
+        print("  the same loop, only the VQ differed -- so the < %.1f mW bound"
+              % (B.PWR_BOUND * 1000.0))
+        print("  stands. The ABSOLUTE W does not, and neither does any mJ below.")
+        print("  The loop was pointed at the deployed topology on 2026-09-06 and")
+        print("  now cross-checks its own period against the pipelined pass.")
+        print("  Re-run to replace every number in this section.")
+        print()
     print("  THE CAVEAT ON THE DERIVED ROWS, and it is not small.")
     print("  edge_power_measure() drives its own loop, and that loop still packs")
     print("  inside the cascade and never entropy-codes -- it is the run-2")

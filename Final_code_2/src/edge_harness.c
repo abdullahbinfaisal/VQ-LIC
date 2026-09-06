@@ -227,6 +227,13 @@ extern const char *edge_pm_group_name(int i);
 #define EDGE_PIPE_FRAMES 40
 #endif
 
+/* The pipelined pass's own interval per frame, so the power loop can check
+ * itself against it. Two independent code paths now drive the same
+ * topology and must agree on the period. Declared outside every feature
+ * guard because the pass writes it and only the power loop reads it, and
+ * those two are switched independently. */
+static double g_pipe_ii_ms = 0.0;
+
 #ifndef EDGE_POWER
 #define EDGE_POWER 1      /* 1 = run the power measurement after all timing */
 #endif
@@ -439,9 +446,56 @@ static int edge_prepare(int n, ep_src_layout_t layout,
  */
 static const uint8_t *g_pipe_lat = 0;
 
+#if EDGE_PIPE_ANY
+/* Set by edge_power_measure() before it primes. A null model means the
+ * background work is not armed, which is only the case before set-up. */
+static const rc_models_t *g_pwr_M   = 0;
+static int                g_pwr_par = 0;
+
+#endif
+
 static int edge_pipe_frame(int run_vq)
 {
-    if (edge_run_six_pairs(edge_chw_ptr()) != 0) return -1;
+#if EDGE_PIPE_ANY
+    /* THE DEPLOYED TOPOLOGY, not a simplified stand-in for it. Until
+     * 2026-09-06 this loop packed inside the cascade and never entropy-coded,
+     * so it measured the run-2 pipeline while the shipped one was run 3 -- and
+     * every energy-per-frame figure derived from it was taken with the CPU
+     * SPINNING through DMA waits that the real pipeline fills with work. A
+     * busier CPU draws more, so those figures were low by an unknown amount.
+     *
+     * BOTH PHASES DO THE BACKGROUND WORK. run_vq gates the VQ and nothing
+     * else, which is the entire point of the A/B: if phase A also skipped the
+     * pack and the entropy coding, the delta would be the VQ plus 11.8 ms of
+     * CPU work and would mean nothing. Phase A codes the same symbol count
+     * over whatever the index buffer last held -- the coder's cost is set by
+     * the count, not by the values.
+     *
+     * No index ping-pong here, and none is needed: the coder reads g_pl_idx
+     * during the cascade, the search overwrites it afterwards. Strictly
+     * ordered inside one frame. */
+    if (g_pwr_M) {
+        if (edge_pack_arm_frame(edge_chw_for(1 - g_pwr_par),
+                                edge_gm_in_for(1 - g_pwr_par)) != 0) {
+            printf("[EDGE] PWRBAD could not arm the input pack" "\n");
+            return -1;
+        }
+        rc_stream_start(&g_bg_rc, g_pwr_M, g_pl_idx, g_bs, sizeof g_bs);
+        g_bg_armed = 1;
+        cascade_set_bg_work(edge_bg_slice);
+    }
+#endif
+
+    const int an_rc = edge_run_six_pairs(edge_chw_ptr());
+
+#if EDGE_PIPE_ANY
+    cascade_set_bg_work(0);
+    if (g_pwr_M) {
+        edge_pack_finish();                  /* hard deadline: next frame reads it */
+        if (g_bg_armed) { rc_stream_finish(&g_bg_rc); g_bg_armed = 0; }
+    }
+#endif
+    if (an_rc != 0) return -1;
     g_pipe_lat = edge_latent_ptr();
 
 #if EDGE_USE_PW_VQ
@@ -459,6 +513,10 @@ static int edge_pipe_frame(int run_vq)
 #else
     (void)run_vq;
 #endif
+
+#if EDGE_PIPE_ANY
+    if (g_pwr_M) { g_pwr_par ^= 1; edge_set_in_parity(g_pwr_par); }
+#endif
     return 0;
 }
 
@@ -475,7 +533,8 @@ static int edge_pipe_frame(int run_vq)
  *
  * The pad is a spin, not a sleep. That is deliberate: the CPU behaves
  * identically in both phases, so it cancels in the difference. */
-static void edge_power_measure(const vq_pq_ctx_t *vq)
+static void edge_power_measure(const vq_pq_ctx_t *vq, const rc_models_t *M,
+                               ep_src_layout_t layout, int use_synth)
 {
     const int nr = edge_pm_nrails();
     double sum[2][EDGE_PWR_MAXR], sq[2][EDGE_PWR_MAXR], now[EDGE_PWR_MAXR];
@@ -490,6 +549,31 @@ static void edge_power_measure(const vq_pq_ctx_t *vq)
         for (int r = 0; r < nr; r++) { sum[ph][r] = 0.0; sq[ph][r] = 0.0; }
 
     edge_set_quiet(1);
+
+    /* ---- put the module into the deployed topology -----------------------
+     * Both input buffers must hold a frame: the loop packs one while the
+     * cascade streams the other. Then one frame with the pack still done
+     * inside the cascade, to fill gm_in[0] before anything relies on it. */
+#if EDGE_PIPE_ANY
+    double pm_l, pm_d;
+    g_pwr_M   = 0;                       /* off during the priming frame */
+    g_pwr_par = 0;
+    edge_set_gm_prepacked(0);
+    edge_set_in_parity(0);
+    if (edge_prepare2(EDGE_FIRST_TIMED, layout, use_synth, &pm_l, &pm_d) != 0) {
+        edge_set_quiet(0); printf("PWRBAD prepare 0\n"); return; }
+    edge_set_in_parity(1);
+    if (edge_prepare2(EDGE_FIRST_TIMED + 1, layout, use_synth, &pm_l, &pm_d) != 0) {
+        edge_set_quiet(0); printf("PWRBAD prepare 1\n"); return; }
+    edge_set_in_parity(0);
+    if (edge_pipe_frame(1) != 0) { edge_set_quiet(0); printf("PWRBAD prime 0\n"); return; }
+    g_pwr_M = M;                         /* from here: pack ahead + entropy code */
+    edge_set_gm_prepacked(1);
+    g_pwr_par = 0;
+    edge_set_in_parity(0);
+#else
+    (void)M; (void)layout; (void)use_synth;
+#endif
 
     /* ---- calibrate the pipelined period, and report it: this is also the
      * first MEASURED confirmation of max(analysis, VQ) rather than arithmetic */
@@ -550,8 +634,15 @@ static void edge_power_measure(const vq_pq_ctx_t *vq)
     for (int ph = 0; ph < 2; ph++) dut[ph] = 100.0*t_fr[ph]/wall[ph];
 
     printf("PWRSUM samples A=%lu B=%lu   frames A=%lu B=%lu\n", ns[0], ns[1], nfr[0], nfr[1]);
-    printf("PWRSUM compute duty A=%.1f%% B=%.1f%%  (must match; the rest is pad+scan)\n",
+    /* These do NOT match, and cannot: B does the VQ where A spins, so B's
+     * compute occupies more of the same fixed period. That is the measurement,
+     * not a defect in it -- the delta is the VQ's power ABOVE a spinning CPU,
+     * which is the only incremental figure this rig can produce. What must
+     * match is the PERIOD and the frame count, and those are printed above. */
+    printf("PWRSUM compute duty A=%.1f%% B=%.1f%%  (B does the VQ where A spins)\n",
            dut[0], dut[1]);
+    printf("PWRSUM period %.4f ms both phases; frames differ by %ld of %lu\n",
+           pad_ms, (long)nfr[0] - (long)nfr[1], nfr[1]);
     printf("PWRSUM board A (no VQ)   = %.4f W +- %.4f\n", totA, seA);
     printf("PWRSUM board B (with VQ) = %.4f W +- %.4f\n", totB, seB);
     printf("PWRSUM VQ incremental    = %+.4f W +- %.4f\n", totB-totA, seD);
@@ -561,10 +652,32 @@ static void edge_power_measure(const vq_pq_ctx_t *vq)
     else
         printf("PWRSUM resolved at %.1f sigma\n", (totB-totA)/seD);
 
-    printf("PWRSUM PIPELINED energy per frame = %.4f W x %.4f ms = %.2f mJ\n",
+    printf("PWRSUM measured frame period = %.4f ms -> %.2f fps\n",
+           t_pipe, 1000.0 / t_pipe);
+#if EDGE_PIPELINED_AB && EDGE_USE_PW_VQ
+    /* Self-check. The pipelined pass and this loop are separate code paths
+     * driving the same topology, so their periods must agree. A gap says one
+     * of them is not running what it says it is, and the energy figure below
+     * would then be pairing a power with the wrong period. */
+    if (g_pipe_ii_ms > 0.0) {
+        const double d = t_pipe - g_pipe_ii_ms;
+        printf("PWRSUM vs the pipelined pass: %.4f vs %.4f ms, %+.4f (%+.2f%%) %s\n",
+               t_pipe, g_pipe_ii_ms, d, 100.0 * d / g_pipe_ii_ms,
+               (d < 0.0 ? -d : d) < 0.25 ? "AGREE" : "*** DISAGREE ***");
+    }
+#endif
+    printf("PWRSUM energy per frame = %.4f W x %.4f ms = %.2f mJ  MEASURED\n",
            totB, t_pipe, totB*t_pipe);
+    printf("PWRSUM the power and the period now come from the SAME topology --\n");
+    printf("PWRSUM the deployed one, packing ahead and entropy coding inside the\n");
+    printf("PWRSUM cascade waits. Before 2026-09-06 this loop measured neither.\n");
     printf("PWRSUM regulator OUTPUT power only -- excludes conversion losses and\n");
     printf("PWRSUM the unmonitored 5 V USB rail. NOT 12 V input power.\n");
+#if EDGE_PIPE_ANY
+    g_pwr_M = 0;
+    edge_set_gm_prepacked(0);
+    edge_set_in_parity(0);
+#endif
 }
 #endif /* EDGE_POWER */
 
@@ -1678,6 +1791,7 @@ int edge_validation_run(void)
             const double ii_frame = (np > 0) ? acc_frame / (double)np : 0.0;
             edge_set_quiet(0);
             if (np > 0) {
+                g_pipe_ii_ms = ii_frame;
                 edge_bg_report(ii_frame, np, rs);
                 printf("#PIPE,II_frame_ms,%.4f,II_wall_ms,%.4f,input_prep_ms,%.4f\n",
                        ii_frame, ii_wall, ii_wall - ii_frame);
@@ -1709,7 +1823,7 @@ int edge_validation_run(void)
 #if EDGE_POWER
     /* LAST. Minutes of wall time and I2C traffic -- must never precede
      * any timed bracket. */
-    edge_power_measure(&vq);
+    edge_power_measure(&vq, &M, layout, use_synth);
 #endif
     printf("[EDGE] done\n");
     return 0;

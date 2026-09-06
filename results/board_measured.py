@@ -127,7 +127,21 @@ II_PWRPIPE = 22.9631   # edge_power_measure()'s loop. NOT the deployed path any
 
 # ---------------------------------------------------------------------------
 # 6. Power, duty-matched interleaved A/B.  MEASURED IN RUN 3.
+#
+# SUPERSEDED BY CONSTRUCTION, PENDING RUN 4. These numbers are a correct
+# measurement of the WRONG TOPOLOGY: edge_power_measure() drove a loop that
+# packed inside the cascade and never entropy-coded, i.e. the run-2
+# pipeline, while the deployed one is run 3. The A/B DELTA survives that --
+# both phases ran the same loop and only the VQ differed -- so the < 14.6 mW
+# bound stands. The ABSOLUTE mean power does not transfer: it was taken with
+# the CPU spinning through DMA waits that the deployed pipeline fills with
+# 11.8 ms of packing and entropy coding, and a busy CPU draws more.
+#
+# Fixed on 2026-09-06: the loop now runs the deployed topology and
+# cross-checks its own period against the pipelined pass. Re-run to replace
+# PWR_A/PWR_B and every energy figure below.
 # ---------------------------------------------------------------------------
+PWR_TOPOLOGY_STALE = True   # set False once run 4 refreshes the rails below
 PWR_A     = 2.0342   # +- 0.0052 W, pipelined loop with the VQ never started
 PWR_B     = 2.0359   # +- 0.0051 W, same loop with the VQ overlapped
 PWR_DELTA = +0.0017  # +- 0.0073 W

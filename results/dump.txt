@@ -166,6 +166,16 @@ duty differences cancel instead of being absorbed into the delta.
   SoC rails only, deployed                   17.9024    1.2299     22.02   DERIVED
 ------------------------------------------------------------------------------
 
+  *** THE POWER ROWS ABOVE ARE PENDING RE-MEASUREMENT ***
+  They measure the run-2 topology, because edge_power_measure()
+  drove its own loop and that loop packed inside the cascade and
+  never entropy-coded. The A/B DELTA survives -- both phases ran
+  the same loop, only the VQ differed -- so the < 14.6 mW bound
+  stands. The ABSOLUTE W does not, and neither does any mJ below.
+  The loop was pointed at the deployed topology on 2026-09-06 and
+  now cross-checks its own period against the pipelined pass.
+  Re-run to replace every number in this section.
+
   THE CAVEAT ON THE DERIVED ROWS, and it is not small.
   edge_power_measure() drives its own loop, and that loop still packs
   inside the cascade and never entropy-codes -- it is the run-2
