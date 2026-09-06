@@ -1,0 +1,70 @@
+# =============================================================================
+# board_measurements.yaml -- per-block measured latency of the deployed
+# analysis transform, from the ARM Global Timer, post warm-up.
+#
+# WHAT A "BLOCK" IS HERE. Within a block the DW engine streams straight into
+# the PW engine over an on-chip AXIS link with no DDR round trip, so the fused
+# pair IS the block. That makes these figures the correct target for
+#
+#     T_block = max(T_read, T_DW, T_PW, T_write)
+#
+# and it also means the board cannot report DW alone -- only the pair. The
+# DW-versus-model validation therefore comes from simulation (Experiment A);
+# this file is the block-level check (Experiment B).
+#
+# PROVENANCE. Read off the PL cycle counters in the 2026-09-05 run-3 log,
+# 80 timed frames, mean per frame. Recorded in results/board_measured.py.
+# No new board run was needed for this study.
+#
+#   519919 + 470288 + 357989 = 1,348,196 cycles = 13.482 ms at 100 MHz,
+#   which is the paper's measured analysis-phase figure.
+#
+# TO ADD A NEW MEASUREMENT: fill cycles (and optionally ms). A null entry makes
+# the report fall back to predicted-only for that block and say so.
+# =============================================================================
+
+meta:
+  source: "results/board_measured.py, 2026-09-05 run 3, serial pass"
+  method: "PL cycle counters, 80 timed frames, mean; 3 warm-up frames discarded"
+  f_clk_hz: 100000000
+  transform: "16-48-64, 3 stride-2 DW-PW blocks, 720p input"
+  note: >
+    Per-block figures are the FUSED DW+PW pair. There is no DDR round trip
+    inside a block, so the pair is the block. The board cannot separate DW
+    from PW here; simulation does that.
+
+blocks:
+  - block: 1
+    h_in: 720
+    w_in: 1280
+    c_in: 3
+    c_out: 16
+    stride: 2
+    cycles: 519919
+    ms: 5.19919
+    sd_ms: 0.0003
+
+  - block: 2
+    h_in: 360
+    w_in: 640
+    c_in: 16
+    c_out: 48
+    stride: 2
+    cycles: 470288
+    ms: 4.70288
+    sd_ms: 0.0002
+
+  - block: 3
+    h_in: 180
+    w_in: 320
+    c_in: 48
+    c_out: 64
+    stride: 2
+    cycles: 357989
+    ms: 3.57989
+    sd_ms: 0.0002
+
+totals:
+  cycles: 1348196
+  ms: 13.48196
+  note: "matches the paper's measured analysis-phase figure, 13.482 ms"

@@ -1,0 +1,5 @@
+# smoke test: H W c_in stride  -- three small configs to prove the bench
+# and measure xsim throughput before committing to the full sweep
+8   64   3  1
+8   64   3  2
+16  128  8  1
