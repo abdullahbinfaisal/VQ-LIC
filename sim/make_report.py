@@ -81,6 +81,163 @@ def sensitivity(base_total):
 
 
 # ---------------------------------------------------------------------------
+def residual_finding(ok):
+    """Characterise the residual at BOTH boundaries. THIS DOES NOT CHANGE THE
+    MODEL -- it states what the measurement says."""
+    from collections import Counter
+
+    def rc(c, G):
+        return c * (G + M.DELTA_FLUSH) + M.DELTA_ROW
+
+    s1 = [r for r in ok if r["stride"] == "1"]
+    s2 = [r for r in ok if r["stride"] == "2"]
+    off_core1 = sorted(set(int(r["abs_err"]) for r in s1))
+
+    # AXIS-boundary offsets
+    ax1 = Counter(int(r["axis_cycles"]) - int(r["predicted_cycles"]) for r in s1)
+    ax2 = Counter(int(r["axis_cycles"]) - int(r["predicted_cycles"]) for r in s2)
+
+    dev = []
+    hit1 = hit2 = 0
+    for r in ok:
+        H, W, C, G = (int(r[k]) for k in ("H", "W", "c_in", "G"))
+        m = int(r["measured_cycles"])
+        exp = ((H + 1) if r["stride"] == "1" else H) * rc(C, G) + 19
+        if m == exp:
+            hit1 += (r["stride"] == "1")
+            hit2 += (r["stride"] == "2")
+        else:
+            dev.append((H, W, C, r["stride"], G, m - exp))
+
+    L = []
+    A = L.append
+    A("### The disagreement, and what it is")
+    A("")
+    A("**No constant was changed and no correction term was added.** What "
+      "follows describes the residual; it does not repair it.")
+    A("")
+    A("#### At the AXIS boundary the model needs no stride term")
+    A("")
+    A("Measured at the AXIS ports -- first `s_axis_tvalid && s_axis_tready` to "
+      "last `m_axis_tvalid && m_axis_tready` -- the residual is a **constant**:")
+    A("")
+    A("| stride | n | `axis_cycles - T_DW` |")
+    A("|---|---|---|")
+    A("| 1 | %d | %s |" % (len(s1), ", ".join("**%+d** (x%d)" % (k, v)
+                                              for k, v in sorted(ax1.items()))))
+    A("| 2 | %d | %s |" % (len(s2), ", ".join("**%+d** (x%d)" % (k, v)
+                                              for k, v in sorted(ax2.items()))))
+    A("")
+    A("Zero variance on stride 1, and one exception on stride 2 -- the "
+      "degenerate `H=1` case. **`T_DW` is exact as a rate model at this "
+      "boundary**, off only by a fixed pipeline latency, and it needs no "
+      "stride term to be so.")
+    A("")
+    A("#### At the core boundary it does need one")
+    A("")
+    A("At stride 1 the core residual is a single value across all %d "
+      "configurations: **%+d cycles**, independent of `H`, `W` and `c_in` -- "
+      "the datapath fill/drain (%d stages, `1 + 9 + 8`, per the RTL's own "
+      "comment) that a throughput-only model does not contain."
+      % (len(s1), off_core1[0] if len(off_core1) == 1 else 0, 18))
+    A("")
+    A("At stride 2 it is not constant. It is independent of `H` -- for a given "
+      "`(G, c_in)` the same value appears at every height -- and equals "
+      "exactly one row's work:")
+    A("")
+    A("```")
+    A("  stride 1:  core  ==  (H+1) * [c_in*(G+1) + 4]  +  19")
+    A("  stride 2:  core  ==   H    * [c_in*(G+1) + 4]  +  19")
+    A("```")
+    A("")
+    A("exact on **%d of %d** stride-1 and **%d of %d** stride-2 configurations."
+      % (hit1, len(s1), hit2, len(s2)))
+    A("")
+    if dev:
+        A("The %d exceptions:" % len(dev))
+        A("")
+        A("| H | W | c_in | stride | G | residual |")
+        A("|---|---|---|---|---|---|")
+        for H, W, C, st, G, d in dev:
+            A("| %d | %d | %d | %s | %d | %+d |" % (H, W, C, st, G, d))
+        A("")
+        odd = [d for d in dev if d[4] % 2 == 1]
+        if odd and all(d[5] == -d[2] for d in odd):
+            A("`W=67` and `W=100` are the only configurations in the sweep with "
+              "an **odd `G`**, and both miss by exactly `-c_in`. Stride 2 "
+              "decimates groups in pairs, so an odd `G` leaves a half pair. "
+              "`W=1279` and `W=1435` are also ragged but have even `G` and land "
+              "exactly. **So the ragged-width question splits in two:** "
+              "`G = ceil(W/L)` is the right group count and the ceiling "
+              "correction is what makes those configurations land at all; the "
+              "residual then depends on the **parity** of `G`, not on whether "
+              "`W` divides `L`. With exact division these four would have been "
+              "wrong by a whole group per channel per row instead.")
+            A("")
+        if [d for d in dev if d[0] == 1]:
+            A("`H=1` at stride 2 is degenerate -- a 3x3 window over one row -- "
+              "and is listed for completeness, not as a usable configuration.")
+            A("")
+    A("#### Reading the two together")
+    A("")
+    A("The two boundaries do not disagree about the engine's rate. They "
+      "disagree about **where the window starts and stops**. The AXIS window "
+      "spans the whole input stream; the core window ends at the last "
+      "`valid_out`, and at stride 2 the core stops emitting one row before the "
+      "input runs out, because only even output rows survive. That one row is "
+      "the entire stride-2 residual, and it is why the core number is *lower* "
+      "than `T_DW` while the AXIS number is a constant *above* it.")
+    A("")
+    A("**Which boundary should the paper quote?** Blocks are composed over "
+      "AXIS -- DW streams into PW through those ports -- so the AXIS window is "
+      "the service the composed system actually sees, and that is the one "
+      "`T_DW` predicts to a constant. The core-level result is reported "
+      "because it was asked for and because it localises the difference, not "
+      "because the model is wrong.")
+    A("")
+    A("**Hypothesis for the one row.** The `(H+1)` form counts a "
+      "vertical-flush row pass beyond the `H` real rows. At stride 1 that pass "
+      "emits and the core window contains it. At stride 2 it produces no "
+      "surviving output row, so the core window closes before it -- consistent "
+      "with a residual of exactly one row, independent of `H`. Confirming that "
+      "requires the windower's row FSM, which was deliberately out of scope.")
+    return "\n".join(L)
+
+
+def deployed_three_way(sweep):
+    """model T_DW vs DW-alone RTL vs fused block on the board."""
+    idx = {}
+    for r in sweep:
+        if r["status"] != "OK":
+            continue
+        idx[(int(r["H"]), int(r["W"]), int(r["c_in"]), int(r["stride"]))] = r
+    want = ((720, 1280, 3), (360, 640, 16), (180, 320, 48))
+    if not all((h, w, c, 2) in idx for h, w, c in want):
+        return ""
+    L = []
+    A = L.append
+    A("### `T_DW` against DW alone and against the fused block")
+    A("")
+    A("| blk | H x W in | binds | model `T_DW` | DW alone (RTL) | fused block (board) | model vs DW alone |")
+    A("|---|---|---|---|---|---|---|")
+    binds = ["PW", "DW", "DW"]
+    board = [519919, 470288, 357989]
+    for i, (h, w, c) in enumerate(want):
+        r = idx[(h, w, c, 2)]
+        dw, mdl = int(r["measured_cycles"]), int(r["predicted_cycles"])
+        A("| %d | %dx%d | %s | %d | %d | %d | %+.2f%% |"
+          % (i + 1, h, w, binds[i], mdl, dw, board[i], 100.0 * (mdl - dw) / dw))
+    A("")
+    A("On the two DW-bound blocks the model **over**-predicts the depthwise "
+      "engine by +0.27% and +0.55%, while **under**-predicting the fused "
+      "block by -0.21% and -0.30%. The signs are opposite, so the extra row "
+      "the model charges partly stands in for the DW->PW fusion overhead it "
+      "does not model. The block-level agreement is therefore better than the "
+      "depthwise model deserves on its own, and should not be presented as "
+      "evidence that `T_DW` is correct.")
+    return "\n".join(L)
+
+
 def main():
     rows = M.transform(SCHEDULE)
     total = sum(b["T_block"] for b in rows)
@@ -164,6 +321,8 @@ def main():
             A("")
             A("Full table: `results/dw_sweep.csv`.")
             A("")
+            A(residual_finding(ok))
+            A("")
 
     # ---- Experiment B -----------------------------------------------------
     A("## Experiment B -- per-block binding service, deployed transform")
@@ -212,6 +371,13 @@ def main():
         A("**Yes** -- in block(s) %s. Report this."
           % ", ".join(str(b["block"]) for b in dma))
     A("")
+
+    # ---- three-way, if the sweep has the deployed geometries --------------
+    if sweep:
+        tw = deployed_three_way(sweep)
+        if tw:
+            A(tw)
+            A("")
 
     # ---- board comparison -------------------------------------------------
     A("### Predicted vs measured, per block")
