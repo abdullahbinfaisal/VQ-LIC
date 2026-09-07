@@ -106,6 +106,8 @@ The tightest margin is block 2, where `T_read` is only **1.81%** below the bindi
 | 2 | 360x640 | DW | 469300 | 468019 | 470288 | +0.27% |
 | 3 | 180x320 | DW | 356932 | 354979 | 357989 | +0.55% |
 
+> **Superseded by Item 1 below.** The cancellation described in this paragraph is an artifact of the core boundary; at the AXIS boundary the two terms have the same sign and add. Kept for the record.
+
 On the two DW-bound blocks the model **over**-predicts the depthwise engine by +0.27% and +0.55%, while **under**-predicting the fused block by -0.21% and -0.30%. The signs are opposite, so the extra row the model charges partly stands in for the DW->PW fusion overhead it does not model. The block-level agreement is therefore better than the depthwise model deserves on its own, and should not be presented as evidence that `T_DW` is correct.
 
 ### Predicted vs measured, per block
@@ -137,6 +139,125 @@ Change in total predicted latency for the deployed transform.
 | `DELTA_ROW` | 4 | -542 | -0.040% | +542 | +0.040% |
 
 A constant with zero sensitivity does not appear in ANY binding service on this schedule, so this transform cannot validate it at all -- neither can the board. Say that rather than implying it was checked.
+
+## Item 1 -- fusion overhead, separated from model error
+
+`a` is the model. `b` is the DW engine **alone**, measured in simulation at the **AXIS** boundary on the identical geometry -- the boundary blocks are actually composed over. `c` is the four-way max. `d` is the fused block on silicon.
+
+| | blk 1 | blk 2 | blk 3 |
+|---|---|---|---|
+| geometry (H x W in) | 720x1280 | 360x640 | 180x320 |
+| c_in / c_out | 3 / 16 | 16 / 48 | 48 / 64 |
+| **a** `T_DW` predicted | 351127 | 469300 | 356932 |
+| **b** DW alone, AXIS, measured | 351160 | 469333 | 356965 |
+| **c** `T_block` predicted | 518400 | 469300 | 356932 |
+| &nbsp;&nbsp;binds | **PW** | **DW** | **DW** |
+| **d** fused block, silicon | 519919 | 470288 | 357989 |
+
+### e. implied fusion overhead
+
+**Blocks 2 and 3 (DW binds).** `d - b` is a difference of two measurements, so it is what the fused pair costs over the depthwise engine running alone:
+
+| blk | d | b | overhead | as % of block |
+|---|---|---|---|---|
+| 2 | 470288 | 469333 | **+955** | 0.203% |
+| 3 | 357989 | 356965 | **+1024** | 0.286% |
+
+**Block 1 (PW binds).** `b` is not the binding term, so `d - b` is not a fusion overhead and is not reported as one. The comparable residual is `d - T_PW` = +1519, but `T_PW` is a **model**, not a measurement, so that number mixes PW model error with fusion cost and cannot separate them. **Isolating fusion overhead on block 1 needs a PW-alone RTL measurement, which this study does not have.**
+
+### The block-level error decomposes exactly
+
+| blk | `T_block - d` | `T_DW - b` | `b - d` |
+|---|---|---|---|
+| 2 | -988 | -33 | -955 |
+| 3 | -1057 | -33 | -1024 |
+
+**This corrects a statement made earlier in this report.** The earlier text said the model's extra row and the unmodelled fusion overhead have *opposite* signs and partly cancel, so the block agreement flattered the model. That was an artifact of comparing against the **core** boundary. At the AXIS boundary -- the correct one, since blocks compose over AXIS -- both terms are **negative and simply add**: the model sits a constant -33 cycles below the depthwise engine, and fusion adds ~1,000 more. There is no cancellation, and the block-level agreement is not luck.
+
+### Constant, or does it scale?
+
+| quantity | blk 2 | blk 3 | ratio |
+|---|---|---|---|
+| **overhead (cyc)** | 955 | 1024 | **0.933** |
+| output pixels | 57600 | 14400 | 4.00 |
+| c_in | 16 | 48 | 0.33 |
+| c_out | 48 | 64 | 0.75 |
+| G | 80 | 40 | 2.00 |
+
+**Approximately constant.** Output volume changes by 4x between the two blocks while the overhead changes by 7%, in the *opposite* direction. A per-beat cost is therefore excluded: fitting `overhead = F + k*P_out` gives `k = -0.001597` cycles per output pixel, **negative and unphysical**. `c_in` moves 3x the other way, `c_out` 1.33x and `G` 2x, and none of them tracks it either.
+
+**What two points cannot settle.** A fixed handshake cost and a *weak* per-beat cost cannot be separated -- two usable measurements, two free parameters. A *strong* per-beat cost is ruled out by the ratio; anything smaller is not resolvable, and no trend is fitted to two points. Block 1 supplies no third point because PW binds there.
+
+### One sentence, or a real gap?
+
+**One sentence, with a stated bound.** The model omits a per-block DW->PW fusion overhead of about 955-1024 cycles, 0.20-0.29% of a block, which on the available evidence does not scale with output volume, channel count or group count. It is a real omission -- once the constant pipeline offset is removed it is the *whole* of the block-level residual -- but it is small, one-directional and bounded. What would make it a real gap is a schedule where it stops being roughly constant, and two points cannot say where that is.
+
+## Item 2 -- the stride-2 row mechanism, confirmed against the RTL
+
+Scope restriction lifted after `model/service_model.py` was committed unchanged, so the model's independence is banked and this read cannot retroactively affect it.
+
+**Confirmed. The RTL states it in its own header comment.**
+
+### The `(H+1)` row count
+
+`dw_banked_window_8x.sv`, emission order:
+
+```
+  for row r in 0..H-1: for group g in 0..G-1: for channel c in 0..C-1:
+    one 8-sample beat
+  (plus one extra vertical-flush row, r==H, all zp_in)
+```
+
+and the control logic that implements it:
+
+```systemverilog
+real_row         = running && (r_cnt < H_r);   // input needed only r < H
+real_group       = (g_cnt < G_r);              // false only in the flush slot
+last_beat_of_row = last_beat_of_group && (g_cnt == G_r);
+...
+pending_finish  <= (r_cnt == H_r);             // terminate AFTER the r==H pass
+if (r_cnt != H_r) r_cnt <= r_cnt + 12'd1;
+```
+
+`r_cnt` takes the values `0 .. H_r` inclusive -- **H+1 row passes** -- and the last is not an input row (`real_row` false), which is why it costs time without consuming beats. Two more model constants fall out of the same block:
+
+| constant | value | RTL |
+|---|---|---|
+| `delta_flush` | 1 | `real_group = (g_cnt < G_r)` -- `g_cnt` runs `0..G`, the extra slot being the per-row horizontal flush |
+| `delta_row` | 4 | `localparam int DRAIN_CYCLES = 4` -- the per-row pend_ram write-back drain |
+
+### Why the core window closes one row early at stride 2
+
+From the same header:
+
+> Rows: only even Y survive (Y = s2_row - 1). **The r==H vertical-flush row emits Y=H-1, odd, so for even H it is discarded** -- harmless, and left in place rather than special-cased so the FSM is untouched.
+
+That is the mechanism verbatim. The `r==H` pass still **runs** -- the FSM is identical at both strides, which is why the AXIS window, which spans the input stream and the engine's full execution, shows no stride dependence -- but at stride 2 it **emits nothing that survives**, so the last `valid_out` falls one row earlier and the core window closes one row short. Exactly the measured residual: one row, independent of `H`, on 71 of 74 configurations.
+
+### Do the AXIS constants follow from the same mechanism?
+
+Partly. The part that does not is stated rather than guessed at.
+
+`dw_fused_core.sv` sets `TOT_LAT = 1 + MAC_LAT + 8 = 1 + 9 + 8 = 18` and delays `done_out` by that much. The measured core offset is **+19 = TOT_LAT + 1** -- datapath fill/drain plus the one cycle between accepting the first beat and the window's first counted cycle. The core constant is fully accounted for.
+
+The AXIS constants are that plus the shell:
+
+```
+  stride 1:  +36  =  19 (core)  +  17 (AXIS FIFOs + output holding reg)
+  stride 2:  +33  =  19 (core)  +  14
+```
+
+The 17-versus-14 difference is a **3-cycle constant** on the output side, uniform across every `c_in` from 3 to 64, so it is structural and not data-dependent. `m_axis` is driven from an output holding register rather than straight off the FIFO (for TLAST), and that path drains differently when the core emits at a quarter rate. **I have not localised those 3 cycles to a specific stage.** The honest statement: the AXIS offset is a constant per stride, its dominant term is the datapath latency the RTL declares, and a 3-cycle stride-dependent tail in the output path remains unexplained.
+
+### A precondition the sweep tripped over -- and it is not a timing bug
+
+The same header, for stride 2:
+
+> **PRECONDITIONS for stride2 (checked by the driver, NOT by hardware):** `n_groups` must be EVEN, i.e. `img_width` a multiple of 16. Otherwise the final group of every row is an even-index group that never gets a partner, and **its 4 output pixels are silently dropped**.
+
+That is exactly the `W=67` (`G=9`) and `W=100` (`G=13`) residual: `-c_in` cycles, one dropped beat per channel per row. So those two configurations are **functionally invalid, not merely three cycles off** -- the RTL drops output there and says the driver must prevent it. They are kept in `dw_sweep.csv` with this note rather than deleted: the timing is real and the reason they differ is now understood.
+
+It also sharpens the ragged-width answer. `G = ceil(W/L)` is required and correct. Beyond that, stride 2 needs `G` **even**, which is stronger than `W` dividing `L`: `W=1279` and `W=1435` are ragged, have even `G`, and land exactly. Every deployed width (1280/640/320) is a multiple of 16, so all three deployed blocks satisfy the precondition.
 
 ## LaTeX tables
 
