@@ -75,6 +75,12 @@ int  vq_pw_pl_encode_frame(const void *latent, void *idx_out);
 long vq_pw_pl_verify(const int8_t *cb, uint8_t zp, const void *latent,
                      uint8_t *pl_idx, uint8_t *sw_idx, long *first_bad);
 
+/* Raw STATUS2. Bit 5 is cfg_err: the core REFUSED the last start because the
+ * geometry would have aliased. Zero on a pre-2026-09-09 bitstream, which has
+ * no such bit -- so 0 is not proof of anything, it is only the absence of a
+ * complaint. See the note in vq_pw_pl.c. */
+uint32_t vq_pw_pl_status2(void);
+
 /* Timing of the most recent frame, milliseconds. */
 double vq_pw_pl_last_prog_ms(void);   /* codebook + geometry reload        */
 double vq_pw_pl_last_run_ms(void);    /* start -> DMA idle, accelerator    */

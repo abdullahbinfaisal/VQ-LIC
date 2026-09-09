@@ -68,6 +68,14 @@ static vqpw_ctx_t s_ctx;
 static int8_t     s_wimg[VQPW_W_BYTES];
 static int32_t    s_nimg[VQPW_COUT_TOTAL];     /* 256 or 128 codeword norms */
 
+/* STATUS2 as the engine reports it. Bit 5 is cfg_err -- the sticky flag the
+ * core raises instead of running a geometry it would alias. A bitstream built
+ * before 2026-09-09 has no such bit and reads 0 here, so a 0 means EITHER the
+ * geometry was accepted OR the PL is too old to have an opinion. Use it as a
+ * diagnostic hint, never as proof the configuration is right; the thing that
+ * proves that is vq_pw_pl_verify(). */
+uint32_t vq_pw_pl_status2(void) { return pw_r(PW_REG_STATUS2); }
+
 double vq_pw_pl_last_prog_ms(void) { return s_prog_ms; }
 double vq_pw_pl_last_run_ms(void)  { return s_run_ms;  }
 

@@ -6193,6 +6193,29 @@ int main(void)
     printf(" Real DW/PW full-network runner\n");
     printf("========================================\n");
 
+    /* WHICH PATH IS THIS BUILD GOING TO RUN?
+     *
+     * The three flags below are mutually exclusive -- see the #if/#elif chain
+     * further down -- and only ONE of them produces a frame rate and a power
+     * measurement. Printing the choice at boot costs nothing and stops a run
+     * being misread: an OOS build looks much like an edge build for the first
+     * few seconds of log and then simply never reports fps or a PWRSUM block,
+     * because it runs no VQ and no range coding at all.
+     */
+#if RUN_OOS_VALIDATION
+    printf("[MODE] OOS service-model sweep.\n");
+    printf("[MODE] NO VQ, NO range coding, NO frame rate, NO power.\n");
+    printf("[MODE] Set RUN_OOS_VALIDATION 0 for the edge-encoder run.\n");
+#elif RUN_EDGE_VALIDATION
+    printf("[MODE] complete edge encoder: PL analysis -> VQ -> range coding.\n");
+    printf("[MODE] frame rate: #PIPE,fps and PWRPIPE.  power: PWRSUM.\n");
+    printf("[MODE] the quantiser geometry is printed as #GEOM below.\n");
+#elif RUN_SURROGATE_ESTIMATE
+    printf("[MODE] legacy surrogate timing loop. No VQ, no power.\n");
+#else
+    printf("[MODE] full 42-layer SD-card network. No VQ, no power.\n");
+#endif
+
     /* See start_global_timer() above: an SD-card boot through the FSBL
      * usually leaves the Global Timer already running, but a JTAG/debugger
      * launch often doesn't. Without this, timer_now() reads a frozen

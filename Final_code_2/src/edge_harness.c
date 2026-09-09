@@ -655,6 +655,10 @@ static void edge_power_measure(const vq_pq_ctx_t *vq, const rc_models_t *M,
     else
         printf("PWRSUM resolved at %.1f sigma\n", (totB-totA)/seD);
 
+#if EDGE_USE_PW_VQ
+    printf("PWRSUM geometry M=%d K=%d Dsub=%d, %d bits/position\n",
+           VQPW_M, VQPW_K, VQPW_DSUB, VQPW_BITS_PER_POS);
+#endif
     printf("PWRSUM measured frame period = %.4f ms -> %.2f fps\n",
            t_pipe, 1000.0 / t_pipe);
 #if EDGE_PIPELINED_AB && EDGE_USE_PW_VQ
@@ -929,7 +933,20 @@ static int edge_one_pipelined(int frame_id, const rc_models_t *M,
     edge_read_accums(&pack, &prog, &cache, &pl, &total);
     st->t_pack = pack; st->t_prog = prog; st->t_cache = cache;
     st->t_host = total;
-    st->fixed_bpp = ((double)VQPW_IDX_BYTES * 8.0) / ((double)EP_W * (double)EP_H);
+    /* RATE. VQPW_IDX_BYTES is the TRANSPORT size -- always 4 bytes per latent
+     * position, at every K, so the S2MM length and the cache ranges never
+     * change. It is NOT the rate. Only VQPW_BITS_PER_POS = M*log2(K) of those
+     * 32 bits carry index; the rest are structurally zero (VQ_WORD_MASK in
+     * pw_pixel_major_core.sv).
+     *
+     *   M=8, K=16 : 32 bits/position -> the two coincided, which is why this
+     *               line was right before and wrong now
+     *   M=4, K=64 : 24 bits/position -> 0.375 bpp, not 0.500
+     *
+     * Counting the transport word here overstated the uncompressed index rate
+     * by 33% at the deployed geometry. */
+    st->fixed_bpp = ((double)VQPW_BITS_PER_POS * (double)VQPW_NPOS)
+                  / ((double)EP_W * (double)EP_H);
     return 0;
 }
 
@@ -1207,6 +1224,39 @@ int edge_validation_run(void)
     printf(" PL analysis -> VQ -> range coding -> byte stream\n");
     printf("================================================\n");
 
+    /* ---- WHICH QUANTISER IS THIS? ---------------------------------------
+     * Both profiles build from one source, so a log that does not say is not
+     * attributable. Machine-readable so results/ can parse it, and printed
+     * BEFORE anything else so it survives a truncated capture. */
+#if EDGE_USE_PW_VQ
+    printf("#GEOM,profile,%d,M,%d,K,%d,Dsub,%d,bits_per_pos,%d,cin_mac,%d,"
+           "cout_run,%d,batches,%d,score_bits,%d\n",
+           VQPW_PROFILE, VQPW_M, VQPW_K, VQPW_DSUB, VQPW_BITS_PER_POS,
+           VQPW_CIN_MAC, VQPW_COUT_TOTAL, VQPW_NBATCH, VQPW_SCORE_BITS);
+    printf("#GEOM,entropy,models,%d,alphabet,%d,symbols_per_frame,%lu\n",
+           RC_NMODEL, RC_NSYM, (unsigned long)RC_NSYM_PER_FRAME);
+    printf("#GEOM,rate,index_bpp,%.5f,idx_bytes_per_frame,%d\n",
+           ((double)VQPW_BITS_PER_POS * (double)VQPW_NPOS)
+             / ((double)EP_W * (double)EP_H),
+           VQPW_IDX_BYTES);
+    printf("[EDGE] quantiser: M=%d K=%d Dsub=%d -> %d bits/position, %.3f bpp\n",
+           VQPW_M, VQPW_K, VQPW_DSUB, VQPW_BITS_PER_POS,
+           ((double)VQPW_BITS_PER_POS * (double)VQPW_NPOS)
+             / ((double)EP_W * (double)EP_H));
+    printf("[EDGE] the BITSTREAM must match: VQ_K=%d VQ_NORM_D=%d "
+           "VQ_SCORE_W=%d COUT_MAX>=%d\n",
+           VQPW_K, VQPW_COUT_TOTAL, VQPW_SCORE_BITS, VQPW_COUT_TOTAL);
+    {
+        const int grc = vqpw_check_build();
+        if (grc != 0) {
+            printf("[EDGE] ABORT: vqpw_check_build() = %d -- this firmware's\n", grc);
+            printf("[EDGE] derived geometry is not self-consistent. Nothing below\n");
+            printf("[EDGE] would mean anything. See vq_pw.c for the codes.\n");
+            return -1;
+        }
+    }
+#endif
+
     // ---- probe the dataset before doing anything else ----------------------
     edge_path(path, sizeof path, 1);
     ep_src_layout_t layout = ep_probe_source(path, &nbytes);
@@ -1270,6 +1320,18 @@ int edge_validation_run(void)
         if (bad != 0) {
             printf("[EDGE] ABORT: PW VQ is not reference-exact. No VQ timing will\n");
             printf("[EDGE] be reported -- a fast wrong answer is not a result.\n");
+            printf("[EDGE] MOST LIKELY CAUSE: firmware and bitstream disagree.\n");
+            printf("[EDGE] This firmware is built for M=%d K=%d Dsub=%d, which needs\n",
+                   VQPW_M, VQPW_K, VQPW_DSUB);
+            printf("[EDGE] a bitstream with VQ_K=%d, VQ_NORM_D=%d, VQ_SCORE_W=%d and\n",
+                   VQPW_K, VQPW_COUT_TOTAL, VQPW_SCORE_BITS);
+            printf("[EDGE] COUT_MAX>=%d. A pre-2026-09-09 bitstream is VQ_K=16,\n",
+                   VQPW_COUT_TOTAL);
+            printf("[EDGE] VQ_NORM_D=128, COUT_MAX=240 and CANNOT run this; it has\n");
+            printf("[EDGE] no cfg_err either, so it aliases silently and lands here.\n");
+            printf("[EDGE] Either reprogram the PL or rebuild with VQPW_PROFILE=0.\n");
+            printf("[EDGE] STATUS2=0x%08x (bit 5 = cfg_err, set only by a NEW build)\n",
+                   (unsigned)vq_pw_pl_status2());
             edge_set_quiet(0);
             return -1;
         }
