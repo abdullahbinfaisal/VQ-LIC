@@ -529,6 +529,107 @@ int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
     return worst;
 }
 
+/* ---------------------------------------------------------------------------
+ * CODEWORD REACHABILITY SWEEP
+ *
+ * The self-test proved the norm ROM correct and, because it drives a CONSTANT
+ * latent, proved the activation window irrelevant -- reading the wrong sixteen
+ * channels of a constant frame gives identical data. What is left feeding the
+ * score is the WEIGHTS, so test them directly instead of inferring.
+ *
+ * For a constant latent u = +1 in every dimension,
+ *
+ *     score(k) = ||v_k||^2 - 2 * sum_d v_k[d]
+ *
+ * Set codeword k_target to all +1 and every other codeword to 0:
+ *
+ *     score(k_target) = 16 - 32 = -16      every other score = 0
+ *
+ * so k_target is the unique argmin, in every sub-codebook at once. Sweeping
+ * k_target over 0..K-1 asks the engine to name each codeword in turn. A
+ * codeword it cannot name has weights that did not arrive, or arrived
+ * somewhere else, and the sweep says exactly which (m,k) those are.
+ *
+ * Cost is one codebook reload per step, about 1 ms, so a full sweep is ~64 ms.
+ * ------------------------------------------------------------------------- */
+static int8_t s_sw_cb[VQPW_M * VQPW_K * VQPW_DSUB];
+
+int vq_pw_pl_sweep_codewords(void)
+{
+    int bad_total = 0;
+    int first_bad_k[VQPW_M];
+    int bad_per_m[VQPW_M];
+
+    for (int m = 0; m < VQPW_M; m++) { first_bad_k[m] = -1; bad_per_m[m] = 0; }
+
+    xil_printf("[VQSW] codeword reachability sweep, %d codewords x %d "
+               "sub-codebooks\r\n", VQPW_K, VQPW_M);
+
+    for (size_t i = 0; i < sizeof s_st_lat; i++) s_st_lat[i] = 129u;  /* u = +1 */
+    Xil_DCacheFlushRange((UINTPTR)s_st_lat, sizeof s_st_lat);
+
+    for (int kt = 0; kt < VQPW_K; kt++) {
+        for (size_t i = 0; i < sizeof s_sw_cb; i++) s_sw_cb[i] = 0;
+        for (int m = 0; m < VQPW_M; m++)
+            for (int d = 0; d < VQPW_DSUB; d++)
+                s_sw_cb[((size_t)m * VQPW_K + kt) * VQPW_DSUB + d] = 1;
+
+        if (vq_pw_pl_load_codebook(s_sw_cb, 128) != 0) return -1;
+
+        Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, sizeof s_st_hw);
+        pw_w(PW_REG_TILE_PIXELS, (uint32_t)VQPW_LANES);
+        pw_w(PW_REG_CIN_RUN,     (uint32_t)VQPW_CIN_MAC);
+        pw_w(PW_REG_COUT_RUN,    (uint32_t)VQPW_COUT_TOTAL);
+        pw_w(PW_REG_ZP_RELU,     0x00008080u);
+        pw_w(PW_REG_VQ_CTRL,     ((uint32_t)VQPW_CIN_LOAD << 12) | 1u);
+        pw_w(PW_REG_CTRL,        CTRL_CLEAR_ERR);
+        pw_w(PW_REG_CTRL,        CTRL_START);
+
+        dma_w(S2MM_DMACR,  DMACR_RS);
+        dma_w(S2MM_DA,     (uint32_t)(UINTPTR)s_st_hw);
+        dma_w(S2MM_LENGTH, (uint32_t)sizeof s_st_hw);
+        dma_w(MM2S_DMACR,  DMACR_RS);
+        dma_w(MM2S_SA,     (uint32_t)(UINTPTR)s_st_lat);
+        dma_w(MM2S_LENGTH, (uint32_t)sizeof s_st_lat);
+
+        for (uint32_t i = 0; i < SPIN_LIMIT; i++)
+            if (dma_r(S2MM_DMASR) & DMASR_IDLE) break;
+
+        pw_w(PW_REG_VQ_CTRL, 0u);
+        dma_w(MM2S_DMACR, DMACR_RESET);
+        dma_w(S2MM_DMACR, DMACR_RESET);
+        for (uint32_t i = 0; i < 100000u; i++)
+            if (!(dma_r(MM2S_DMACR) & DMACR_RESET)
+                && !(dma_r(S2MM_DMACR) & DMACR_RESET)) break;
+        Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, sizeof s_st_hw);
+
+        for (int m = 0; m < VQPW_M; m++) {
+            const int got = (int)vqpw_get_index(s_st_hw, 0, m);
+            if (got != kt) {
+                bad_per_m[m]++;
+                bad_total++;
+                if (first_bad_k[m] < 0) {
+                    first_bad_k[m] = kt;
+                    xil_printf("[VQSW]   m=%d asked for k=%d, engine said %d\r\n",
+                               m, kt, got);
+                }
+            }
+        }
+    }
+
+    xil_printf("[VQSW] unreachable codewords per sub-codebook:");
+    for (int m = 0; m < VQPW_M; m++)
+        xil_printf(" m%d=%d", m, bad_per_m[m]);
+    xil_printf("  (of %d each)\r\n", VQPW_K);
+    if (bad_total == 0)
+        xil_printf("[VQSW] every codeword reachable -> the weight path is "
+                   "sound, look elsewhere.\r\n");
+    else
+        xil_printf("[VQSW] some codewords cannot be selected -> their weights "
+                   "did not land where the engine reads them.\r\n");
+    return bad_total;
+}
+
 long vq_pw_pl_verify(const int8_t *cb, uint8_t zp, const void *latent,
                      uint8_t *pl_idx, uint8_t *sw_idx, long *first_bad)
 {

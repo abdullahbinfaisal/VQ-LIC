@@ -75,6 +75,11 @@ int  vq_pw_pl_encode_frame(const void *latent, void *idx_out);
 long vq_pw_pl_verify(const int8_t *cb, uint8_t zp, const void *latent,
                      uint8_t *pl_idx, uint8_t *sw_idx, long *first_bad);
 
+/* Ask the engine to name each codeword in turn, by loading a codebook in which
+ * exactly one codeword can win. Returns the number of (m,k) it could not name;
+ * 0 means every codeword is reachable and the weight path is sound. */
+int vq_pw_pl_sweep_codewords(void);
+
 /* One-group runs on crafted latents that remove terms from the score, so a
  * disagreement can be attributed to the norm ROM or to the MAC rather than
  * just to "the engine". Returns the worst per-case mismatch count, 0 = all

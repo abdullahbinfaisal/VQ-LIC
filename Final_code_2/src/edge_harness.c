@@ -1544,6 +1544,9 @@ int edge_validation_run(void)
 
         /* Attribute the fault before measuring its size. */
         (void)vq_pw_pl_selftest(g_pw_cb, 128);
+        (void)vq_pw_pl_sweep_codewords();
+        /* The sweep leaves its own probe codebook loaded. */
+        (void)vq_pw_pl_load_codebook(g_pw_cb, 128);
 
         long first = -1;
         const long bad = vq_pw_pl_verify(g_pw_cb, 128, edge_latent_ptr(),
