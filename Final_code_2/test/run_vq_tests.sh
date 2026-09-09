@@ -55,6 +55,10 @@ for prof in 1 0; do
   gcc -O2 -Wall -I$SRC -DVQPW_PROFILE=$prof \
       -o vq_slot_probe_$prof.exe vq_slot_probe_test.c $SRC/vq_pw.c || FAIL=1
   run "slot-probe premise, $tag" ./vq_slot_probe_$prof.exe
+
+  gcc -O2 -Wall -I$SRC -DVQPW_PROFILE=$prof \
+      -o vq_stale_arb_$prof.exe vq_stale_arbitration_test.c $SRC/vq_pw.c || FAIL=1
+  run "stale-slot arbitration, $tag" ./vq_stale_arb_$prof.exe
 done
 
 if [ "${1:-}" = "--rtl" ]; then

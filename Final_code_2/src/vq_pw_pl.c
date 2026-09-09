@@ -831,49 +831,24 @@ static uint8_t s_sp_hw [SLOTP_GROUPS * (VQPW_LANES / 2) * 8]
                         __attribute__((aligned(64)));
 static int8_t  s_sp_cb [VQPW_M * VQPW_K * VQPW_DSUB];
 
-int vq_pw_pl_probe_slots(void)
+/* One probe run of `ng` groups. Returns the number of readings that were not
+ * the group's own beat. STATUS2 is cleared immediately before the start and
+ * read immediately after, so in_udf below belongs to THIS run and nothing
+ * else -- which matters, because the analysis convolution shares the engine
+ * and its flags are sticky. */
+static int slot_run(int ng, const char *label)
 {
-    const size_t in_bytes  = (size_t)SLOTP_GROUPS * ONEG_IN;
-    const size_t out_bytes = (size_t)SLOTP_GROUPS * ONEG_OUT;
+    const size_t in_bytes  = (size_t)ng * ONEG_IN;
+    const size_t out_bytes = (size_t)ng * ONEG_OUT;
+    uint32_t s2;
     int lag_hist[4];
-    int other = 0, i;
+    int other = 0, i, wrong = 0;
     int k_first = -1, all_same = 1;
-    /* If channel 0 never reaches the score at all -- whether because its MAC
-     * term is dropped or because the read returns the zero point -- then
-     * score(k) = a_k^2 and the winner is the a_k nearest zero, the SAME index
-     * for every group. That is a different fault from a stale beat, and until
-     * now nothing has separated them: every earlier test used raw byte 128 as
-     * the stale value, and 128 IS the zero point, so "holds the previous
-     * group's byte" and "channel 0 contributes nothing" predicted the same
-     * answer every time. Here they cannot: a stale beat tracks the group
-     * number, a dead channel does not move at all. */
-    int k_zero = 0;
-    for (i = 1; i < VQPW_K; i++) {
-        const int a  = -128 + 4 * i,      ab = a  < 0 ? -a  : a;
-        const int b  = -128 + 4 * k_zero, bb = b  < 0 ? -b  : b;
-        if (ab < bb) k_zero = i;
-    }
 
     for (i = 0; i < 4; i++) lag_hist[i] = 0;
 
-    xil_printf("[VQSP] activation slot read-out, %d groups, step 4 scalar "
-               "quantiser on channel m*%d\r\n", SLOTP_GROUPS, VQPW_DSUB);
-
-    /* Codebook: a_k = -128 + 4k in dimension 0, zero elsewhere. */
-    for (size_t z = 0; z < sizeof s_sp_cb; z++) s_sp_cb[z] = 0;
-    for (int m = 0; m < VQPW_M; m++)
-        for (int k = 0; k < VQPW_K; k++)
-            s_sp_cb[((size_t)m * VQPW_K + k) * VQPW_DSUB + 0] =
-                (int8_t)(-128 + 4 * k);
-
-    if (vq_pw_pl_load_codebook(s_sp_cb, 128) != 0) return -1;
-
-    /* Latent: everything at the zero point, except each window's first channel
-     * which carries this group's marker. The zeroed dimensions are multiplied
-     * by weight 0, so their value cannot reach the score -- only channel
-     * m*DSUB can. */
     for (size_t z = 0; z < in_bytes; z++) s_sp_lat[z] = 128u;
-    for (int g = 0; g < SLOTP_GROUPS; g++) {
+    for (int g = 0; g < ng; g++) {
         const uint8_t b = (uint8_t)(4 * (g + 8));
         for (int m = 0; m < VQPW_M; m++)
             for (int l = 0; l < VQPW_LANES; l++)
@@ -884,7 +859,7 @@ int vq_pw_pl_probe_slots(void)
     Xil_DCacheInvalidateRange((UINTPTR)s_sp_hw, out_bytes);
 
     dma_quiesce();
-    pw_w(PW_REG_TILE_PIXELS, (uint32_t)(SLOTP_GROUPS * VQPW_LANES));
+    pw_w(PW_REG_TILE_PIXELS, (uint32_t)(ng * VQPW_LANES));
     pw_w(PW_REG_CIN_RUN,     (uint32_t)VQPW_CIN_MAC);
     pw_w(PW_REG_COUT_RUN,    (uint32_t)VQPW_COUT_TOTAL);
     pw_w(PW_REG_ZP_RELU,     0x00008080u);
@@ -908,14 +883,17 @@ int vq_pw_pl_probe_slots(void)
                        (unsigned)dma_r(S2MM_DMASR),
                        (unsigned)pw_r(PW_REG_STATUS));
     }
+    s2 = pw_r(PW_REG_STATUS2);
     pw_w(PW_REG_VQ_CTRL, 0u);
     dma_quiesce();
     Xil_DCacheInvalidateRange((UINTPTR)s_sp_hw, out_bytes);
 
-    /* Lane 0 of every group is enough to read the story; the per-lane spread
-     * is reported only where it disagrees with lane 0. */
-    for (int g = 0; g < SLOTP_GROUPS; g++) {
-        xil_printf("[VQSP] group %d wants k=%2d :", g, g + 8);
+    xil_printf("[VQSP] %s: %d group(s), STATUS2=0x%08x  in_udf=%d in_ovf=%d\r\n",
+               label, ng, (unsigned)s2,
+               (int)((s2 >> 1) & 1u), (int)((s2 >> 0) & 1u));
+
+    for (int g = 0; g < ng; g++) {
+        xil_printf("[VQSP]   group %d wants k=%2d :", g, g + 8);
         for (int m = 0; m < VQPW_M; m++) {
             const int pos = g * VQPW_LANES;
             const int k   = (int)vqpw_get_index(s_sp_hw, pos, m);
@@ -926,39 +904,71 @@ int vq_pw_pl_probe_slots(void)
                 if ((int)vqpw_get_index(s_sp_hw, pos + l, m) != k) spread++;
 
             xil_printf("  m%d=%2d", m, k);
-            if (spread) xil_printf("(+%d lanes differ)", spread);
+            if (spread) xil_printf("(%d/7 lanes differ)", spread);
 
-            if (k_first < 0) k_first = k;
-            else if (k != k_first) all_same = 0;
-
-            if (k == 0)                        other++;      /* never written */
-            else if (lag >= 0 && lag <= 3)     lag_hist[lag]++;
-            else                               other++;
+            if (k_first < 0) k_first = k; else if (k != k_first) all_same = 0;
+            if (k != g + 8) wrong++;
+            if (k == 0)                    other++;
+            else if (lag >= 0 && lag <= 3) lag_hist[lag]++;
+            else                           other++;
         }
         xil_printf("\r\n");
     }
 
-    xil_printf("[VQSP] lag histogram over %d readings: ",
-               SLOTP_GROUPS * VQPW_M);
+    xil_printf("[VQSP]   lag histogram of %d readings: ", ng * VQPW_M);
     for (i = 0; i < 4; i++) xil_printf("lag%d=%d ", i, lag_hist[i]);
-    xil_printf("other/unwritten=%d\r\n", other);
-    if (all_same)
-        xil_printf("[VQSP] every reading is k=%d (a_k nearest zero is k=%d) -> "
-                   "channel 0 never reaches the score at all.\r\n",
-                   k_first, k_zero);
+    xil_printf("other=%d\r\n", other);
+    (void)all_same; (void)k_first;
+    return wrong;
+}
 
-    xil_printf("[VQSP] READ IT AS: all lag0 -> the slots are correct and the "
-               "fault is not the activation buffer.\r\n");
-    xil_printf("[VQSP]            every reading k=%d, not tracking the group "
-               "-> channel 0 contributes nothing; a stale BEAT is ruled out.\r\n",
-               k_zero);
-    xil_printf("[VQSP]            m0 lag1, m1..m3 lag0 -> channel 0's beat is "
-               "one group late; every other channel is fine.\r\n");
-    xil_printf("[VQSP]            m0 lag2 -> slot 0 is never rewritten, so it "
-               "keeps the same buffer half's previous contents.\r\n");
-    xil_printf("[VQSP]            group 0 unwritten but the rest lag0 -> only "
-               "a run's first group is exposed.\r\n");
-    return lag_hist[1] + lag_hist[2] + lag_hist[3] + other;
+int vq_pw_pl_probe_slots(void)
+{
+    int one, many;
+
+    xil_printf("[VQSP] activation slot read-out: each sub-codebook is a step-4 "
+               "scalar quantiser\r\n");
+    xil_printf("[VQSP] on channel m*%d, so the index NAMES the group whose beat "
+               "is in the slot.\r\n", VQPW_DSUB);
+
+    /* Codebook: a_k = -128 + 4k in dimension 0, zero elsewhere, so
+     * score(k) = (a_k - u[0])^2 - u[0]^2 and argmin k = round(B/4) for raw
+     * byte B. Verified against the golden model in vq_slot_probe_test.c. */
+    for (size_t z = 0; z < sizeof s_sp_cb; z++) s_sp_cb[z] = 0;
+    for (int m = 0; m < VQPW_M; m++)
+        for (int k = 0; k < VQPW_K; k++)
+            s_sp_cb[((size_t)m * VQPW_K + k) * VQPW_DSUB + 0] =
+                (int8_t)(-128 + 4 * k);
+
+    if (vq_pw_pl_load_codebook(s_sp_cb, 128) != 0) return -1;
+
+    /* ONE group, then EIGHT, because that is the whole remaining question.
+     *
+     * A run-level fault -- the FIFO reset window at CTRL_START, which is the
+     * only thing that fits in_udf being set at all, since in_rd_en is gated on
+     * !in_empty and the flag should be unreachable -- can only ever spoil the
+     * FIRST group of a run. A group-level fault spoils all of them. The frame
+     * touched 233 groups of 1800 in a SINGLE run, so something must recur at
+     * every group boundary; these two runs say whether that is so, and whether
+     * in_udf scales with the number of groups or fires exactly once. */
+    one  = slot_run(1, "run A");
+    many = slot_run(SLOTP_GROUPS, "run B");
+
+    xil_printf("[VQSP] VERDICT\r\n");
+    if (one == 0 && many == 0)
+        xil_printf("[VQSP]   both clean -> the slots are right here; the fault "
+                   "needs the frame's traffic to appear.\r\n");
+    else if (many > 0 && one == 0)
+        xil_printf("[VQSP]   1 group clean, %d groups not -> the fault is at "
+                   "GROUP BOUNDARIES, not at run start.\r\n", SLOTP_GROUPS);
+    else if (one > 0)
+        xil_printf("[VQSP]   even a single group is wrong -> the fault is at "
+                   "RUN START, i.e. the CTRL_START FIFO reset window.\r\n");
+    xil_printf("[VQSP]   a group reading k=g+7 lags one group; k=g+6 lags two "
+               "(its own buffer half, never rewritten).\r\n");
+    xil_printf("[VQSP]   in_udf set on run A but not B -> once per run. Set on "
+               "both -> once per run. Scaling -> per group.\r\n");
+    return one + many;
 }
 
 long vq_pw_pl_verify(const int8_t *cb, uint8_t zp, const void *latent,
