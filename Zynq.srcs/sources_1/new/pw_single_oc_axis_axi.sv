@@ -594,6 +594,7 @@ module pw_single_oc_axis_axi #(
   // ============================================================
   logic pw_done_out;
   logic pw_cfg_err;
+  logic pw_cfg_err_stb;
 
   pw_single_oc_axis #(
     .DATA_WIDTH(DATA_WIDTH), .ACC_WIDTH(ACC_WIDTH), .CIN_MAX(CIN_MAX),
@@ -615,6 +616,7 @@ module pw_single_oc_axis_axi #(
     .vq_cin_load((USE_PW_VQ != 0) ? reg_vq_ctrl[23:12] : 12'd0),
     .vq_norm_we(vq_norm_we), .vq_norm_addr(vq_norm_addr),
     .vq_norm_data(vq_norm_data), .cfg_err(pw_cfg_err),
+    .cfg_err_stb(pw_cfg_err_stb),
 
     // Weight BRAM read (from core)
     .w_rd_addr(core_w_rd_addr), .w_rd_en(core_w_rd_en),
@@ -688,7 +690,17 @@ module pw_single_oc_axis_axi #(
           start_while_busy_sticky <= 1'b1;
         // The core refused a start because the geometry would alias. This
         // is the flag that replaces the SIMCOPY-only $error.
-        if (pw_cfg_err)
+        //
+        // FROM THE STROBE. Not from pw_cfg_err, which is a LEVEL the core
+        // holds until the next start it accepts:
+        //   - latching the level makes this bit UNCLEARABLE, because the write
+        //     zeroes it for one cycle and the level sets it straight back;
+        //   - latching the level's rising EDGE makes it clearable but MISSES a
+        //     second refusal that follows a first with no accepted start in
+        //     between, since the level never fell.
+        // Both were observed. The strobe is one cycle per refused start, which
+        // is exactly what a clearable latch needs.
+        if (pw_cfg_err_stb)
           cfg_err_sticky <= 1'b1;
       end
     end

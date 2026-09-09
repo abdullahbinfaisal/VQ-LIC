@@ -62,7 +62,7 @@ module pw_vq_bench #(
   longint unsigned cyc = 0;
   always_ff @(posedge clk) cyc <= cyc + 1;
 
-  logic        start_in = 0, done_out, cfg_err;
+  logic        start_in = 0, done_out, cfg_err, cfg_err_stb;
   logic [31:0] tile_pixels;
   logic [11:0] cin_run  = 12'(CIN_MAC);
   logic [11:0] cout_run = 12'(COUT_TOTAL);
@@ -128,7 +128,7 @@ module pw_vq_bench #(
     .zp_in(zp_in), .zp_out(zp_out), .relu_en(relu_en),
     .vq_mode(vq_mode), .vq_cin_load(vq_cin_load),
     .vq_norm_we(vq_norm_we), .vq_norm_addr(vq_norm_addr),
-    .vq_norm_data(vq_norm_data), .cfg_err(cfg_err),
+    .vq_norm_data(vq_norm_data), .cfg_err(cfg_err), .cfg_err_stb(cfg_err_stb),
     .w_rd_addr(w_rd_addr), .w_rd_en(w_rd_en), .w_rd_data(w_rd_data),
     .param_rd_addr(param_rd_addr), .param_rd_en(param_rd_en),
     .param_bias_data(param_bias_data), .param_mult_data(param_mult_data),

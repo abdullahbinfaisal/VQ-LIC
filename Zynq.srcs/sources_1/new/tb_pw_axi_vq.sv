@@ -56,6 +56,7 @@ module pw_axi_vq_bench #(
   localparam int W_PER_BANK = NBATCH * CIN_MAC;
   localparam int VQ_AW      = $clog2(VQ_NORM_D);
 
+  localparam [11:0] ADDR_STATUS2     = 12'h020;
   localparam [11:0] ADDR_CTRL        = 12'h000;
   localparam [11:0] ADDR_TILE_PIXELS = 12'h008;
   localparam [11:0] ADDR_CIN_RUN     = 12'h00C;
@@ -236,6 +237,22 @@ module pw_axi_vq_bench #(
     end
   end
 
+  // AXI-lite read. Used only by the sticky-bit check below; every other read
+  // in this bench pokes the DUT hierarchy directly.
+  task automatic rdreg(input [11:0] a, output logic [31:0] d);
+    begin
+      @(posedge clk);
+      araddr  <= a;
+      arvalid <= 1'b1;
+      @(posedge clk);
+      while (arready !== 1'b1) @(posedge clk);
+      arvalid <= 1'b0;
+      while (rvalid !== 1'b1) @(posedge clk);
+      d = rdata;
+      @(posedge clk);
+    end
+  endtask
+
   initial begin
     $readmemh({DIR, "/latent.hex"},  latent_mem);
     $readmemh({DIR, "/weights.hex"}, w_mem);
@@ -321,6 +338,59 @@ module pw_axi_vq_bench #(
     $display("  WEIGHT reads checked=%0d bad=%0d ; INPUT beats at core=%0d bad=%0d", wchk, wbad, icnt, ibad);
     $display("ordinary pair while vq_mode=1: s_axis_tready high %0d cyc, m_axis_tvalid high %0d cyc",
              leak_ready, leak_valid);
+    // ---- STATUS2[5] must be CLEARABLE ------------------------------------
+    // cfg_err out of the core is a LEVEL: it stays high from a refused start
+    // until the next ACCEPTED start. A sticky bit set from that level rather
+    // than from its rising edge cannot be cleared -- the write zeroes it for
+    // one cycle and the level sets it straight back. Software then reads one
+    // old refusal as a refusal of every frame afterwards, which is exactly how
+    // a good board run came back rejected.
+    //
+    // The engine is idle here and the data path has already been proved, so
+    // this needs no traffic: refuse a geometry, then clear, then look.
+    begin
+      logic [31:0] rd;
+      int          sfail;
+      sfail = 0;
+
+      wr(ADDR_CTRL, 32'h6);                      // clear done + error
+      rdreg(ADDR_STATUS2, rd);
+      if (rd[5] !== 1'b0) begin
+        sfail++; $display("  STICKY FAIL cfg_err set before the test, STATUS2=%08x", rd);
+      end
+
+      // A geometry the engine cannot execute: 288 needs 9 weight batches.
+      wr(ADDR_COUT_RUN, 32'd288);
+      wr(ADDR_CTRL,     32'h1);
+      rdreg(ADDR_STATUS2, rd);
+      if (rd[5] !== 1'b1) begin
+        sfail++; $display("  STICKY FAIL refused start did not set cfg_err, STATUS2=%08x", rd);
+      end
+
+      // THE POINT: this clear must take, even though the core is still holding
+      // cfg_err high because no accepted start has happened since.
+      wr(ADDR_CTRL, 32'h4);
+      rdreg(ADDR_STATUS2, rd);
+      if (rd[5] !== 1'b0) begin
+        sfail++;
+        $display("  STICKY FAIL cfg_err will not clear while the level is high,");
+        $display("              STATUS2=%08x -- the sticky is set from the LEVEL", rd);
+        $display("              instead of from its rising edge.");
+      end
+
+      // And a NEW refusal must still be caught after the clear.
+      wr(ADDR_CTRL, 32'h1);
+      rdreg(ADDR_STATUS2, rd);
+      if (rd[5] !== 1'b1) begin
+        sfail++; $display("  STICKY FAIL a later refusal was missed, STATUS2=%08x", rd);
+      end
+      wr(ADDR_CTRL, 32'h4);
+
+      if (sfail == 0) $display("  STICKY ok  cfg_err sets on refusal, clears on demand, re-arms");
+      else            nbad_prog = nbad_prog + sfail;
+      wr(ADDR_COUT_RUN, 32'(COUT_TOTAL));        // put the geometry back
+    end
+
     $display("  STATUS2 cfg_err bit = %0b (must be 0)",
              dut.cfg_err_sticky);
     if (dut.cfg_err_sticky) nbad_prog++;

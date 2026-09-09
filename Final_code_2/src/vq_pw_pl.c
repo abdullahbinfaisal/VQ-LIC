@@ -111,22 +111,54 @@ uint32_t vq_pw_pl_status2(void) { return pw_r(PW_REG_STATUS2); }
  *          0 = guard absent    -> OLD bitstream
  *         <0 = inconclusive    -> engine not responding, verdict unsafe
  * ------------------------------------------------------------------------- */
+/* One group of traffic: cin_load beats of 8 bytes in, N_LANES/2 beats out.
+ * Contents are irrelevant -- nothing checks them. This exists so that an
+ * engine which does NOT refuse a start still reaches S_DONE instead of
+ * stalling in S_LOAD_FIRST with busy stuck high, which the register map has
+ * no soft reset to recover from. */
+static uint8_t s_probe_in [64 * 8] __attribute__((aligned(64)));
+static uint8_t s_probe_out[ 4 * 8] __attribute__((aligned(64)));
+
+static void probe_run(uint32_t cout_run)
+{
+    Xil_DCacheFlushRange((UINTPTR)s_probe_in, sizeof s_probe_in);
+    Xil_DCacheInvalidateRange((UINTPTR)s_probe_out, sizeof s_probe_out);
+
+    pw_w(PW_REG_TILE_PIXELS, (uint32_t)VQPW_LANES);   /* exactly one group */
+    pw_w(PW_REG_CIN_RUN,     (uint32_t)VQPW_CIN_MAC);
+    pw_w(PW_REG_COUT_RUN,    cout_run);
+    pw_w(PW_REG_ZP_RELU,     0x00008080u);
+    pw_w(PW_REG_VQ_CTRL,     ((uint32_t)VQPW_CIN_LOAD << 12) | 1u);
+    pw_w(PW_REG_CTRL,        CTRL_START);
+
+    dma_w(S2MM_DMACR,  DMACR_RS);
+    dma_w(S2MM_DA,     (uint32_t)(UINTPTR)s_probe_out);
+    dma_w(S2MM_LENGTH, (uint32_t)sizeof s_probe_out);
+    dma_w(MM2S_DMACR,  DMACR_RS);
+    dma_w(MM2S_SA,     (uint32_t)(UINTPTR)s_probe_in);
+    dma_w(MM2S_LENGTH, (uint32_t)sizeof s_probe_in);
+
+    for (uint32_t i = 0; i < 2000000u; i++) {
+        if (dma_r(S2MM_DMASR) & DMASR_IDLE) break;
+        if (pw_r(PW_REG_STATUS) & 0x1u)     break;    /* done_sticky */
+    }
+
+    dma_w(MM2S_DMACR, DMACR_RESET);
+    dma_w(S2MM_DMACR, DMACR_RESET);
+    for (uint32_t i = 0; i < 100000u; i++)
+        if (!(dma_r(MM2S_DMACR) & DMACR_RESET) && !(dma_r(S2MM_DMACR) & DMACR_RESET))
+            break;
+}
+
 int vq_pw_pl_probe_guard(void)
 {
-    /* One group: cin_load = 64 beats of 8 bytes in, N_LANES/2 = 4 beats out.
-     * Contents are irrelevant -- nothing checks them; this only has to let an
-     * unguarded engine reach S_DONE. */
-    static uint8_t probe_in [64 * 8] __attribute__((aligned(64)));
-    static uint8_t probe_out[ 4 * 8] __attribute__((aligned(64)));
     const uint32_t OVER = (uint32_t)VQPW_PW_COUT_MAX + 32u;   /* 288: 9 batches */
     uint32_t s2;
 
     if (pw_r(PW_REG_STATUS) == 0xFFFFFFFFu) return -1;
 
-    memset(probe_in, 128, sizeof probe_in);          /* zp: u = 0 */
-    memset(probe_out, 0, sizeof probe_out);
-    Xil_DCacheFlushRange((UINTPTR)probe_in, sizeof probe_in);
-    Xil_DCacheInvalidateRange((UINTPTR)probe_out, sizeof probe_out);
+    memset(s_probe_in, 128, sizeof s_probe_in);       /* zp: u = 0 */
+    memset(s_probe_out, 0, sizeof s_probe_out);
 
     /* Start from a clean slate so a pre-existing sticky bit cannot be read as
      * this probe's answer. */
@@ -136,39 +168,34 @@ int vq_pw_pl_probe_guard(void)
         return -2;                                    /* will not clear */
     }
 
-    pw_w(PW_REG_TILE_PIXELS, (uint32_t)VQPW_LANES);   /* exactly one group */
-    pw_w(PW_REG_CIN_RUN,     (uint32_t)VQPW_CIN_MAC);
-    pw_w(PW_REG_COUT_RUN,    OVER);
-    pw_w(PW_REG_ZP_RELU,     0x00008080u);
-    pw_w(PW_REG_VQ_CTRL,     ((uint32_t)VQPW_CIN_LOAD << 12) | 1u);
-    pw_w(PW_REG_CTRL,        CTRL_START);
-
+    /* THE QUESTION: does this engine refuse a geometry it cannot execute? */
+    probe_run(OVER);
     s2 = pw_r(PW_REG_STATUS2);
 
-    /* Feed the old engine so it cannot wedge. On a NEW build the run was
-     * already refused, both channels simply move their data into a stopped
-     * engine and go idle, and none of it is looked at. */
-    dma_w(S2MM_DMACR,  DMACR_RS);
-    dma_w(S2MM_DA,     (uint32_t)(UINTPTR)probe_out);
-    dma_w(S2MM_LENGTH, (uint32_t)sizeof probe_out);
-    dma_w(MM2S_DMACR,  DMACR_RS);
-    dma_w(MM2S_SA,     (uint32_t)(UINTPTR)probe_in);
-    dma_w(MM2S_LENGTH, (uint32_t)sizeof probe_in);
+    /* THE CLEAN-UP, and it is not optional.
+     *
+     * On a bitstream whose cfg_err_sticky is set from the LEVEL rather than
+     * its rising edge -- which is every build up to and including
+     * pwvq_k64 -- the sticky bit CANNOT be cleared while the core still holds
+     * cfg_err high, and the core holds it until the next start it ACCEPTS.
+     * Writing clear on its own leaves the bit set, the next real run reads it,
+     * and a perfectly good frame is rejected as a refused geometry.
+     *
+     * So issue a LEGAL run first. That drives the core's cfg_err low, and only
+     * then does the clear take. Cheap: one group, about 3 us. */
+    probe_run((uint32_t)VQPW_COUT_TOTAL);
 
-    for (uint32_t i = 0; i < 2000000u; i++) {
-        if (dma_r(S2MM_DMASR) & DMASR_IDLE) break;
-        if (pw_r(PW_REG_STATUS) & 0x1u)     break;    /* done_sticky */
-    }
-
-    /* Leave nothing behind: VQ mode off, both channels reset, flags cleared. */
     pw_w(PW_REG_VQ_CTRL, 0u);
-    dma_w(MM2S_DMACR, DMACR_RESET);
-    dma_w(S2MM_DMACR, DMACR_RESET);
-    for (uint32_t i = 0; i < 100000u; i++)
-        if (!(dma_r(MM2S_DMACR) & DMACR_RESET) && !(dma_r(S2MM_DMACR) & DMACR_RESET))
-            break;
     pw_w(PW_REG_CTRL, CTRL_CLEAR_DONE | CTRL_CLEAR_ERR);
 
+    if (pw_r(PW_REG_STATUS2) & PW_STATUS2_CFG_ERR) {
+        /* Still set after a legal run and a clear. Report rather than let the
+         * caller mistake it for a refusal of its own geometry. */
+        xil_printf("[VQPW] WARNING: cfg_err would not clear after the probe "
+                   "(STATUS2=0x%08x). Runs will be reported as refused.\r\n",
+                   (unsigned)pw_r(PW_REG_STATUS2));
+        return -3;
+    }
     return (s2 & PW_STATUS2_CFG_ERR) ? 1 : 0;
 }
 
@@ -286,12 +313,20 @@ int vq_pw_pl_start(const void *latent, void *idx_out)
     pw_w(PW_REG_VQ_CTRL, ((uint32_t)VQPW_CIN_LOAD << 12) | 1u);
 
     // START. This RESETS the input FIFO -- see note 1 in the header. Nothing
-    // may be in flight yet.
-    pw_w(PW_REG_CTRL, 0x1u);
+    // may be in flight yet. Clear the sticky error in the same breath so the
+    // read below reports THIS start and not an older one.
+    pw_w(PW_REG_CTRL, CTRL_CLEAR_ERR);
+    pw_w(PW_REG_CTRL, CTRL_START);
 
     // The core validates the geometry at start and REFUSES an aliasing one.
     // A refused run still pulses done, so without this check the frame would
     // come back as whatever the buffer already held. Cheap: one AXI read.
+    //
+    // STATUS2[5] is STICKY -- it answers "was any start refused since the last
+    // clear", not "was THIS start refused". Reading it without clearing first
+    // makes one old refusal reject every frame thereafter. The clear is issued
+    // above, immediately before CTRL_START, so what is read here can only have
+    // come from the start just issued.
     if (pw_r(PW_REG_STATUS2) & PW_STATUS2_CFG_ERR) {
         xil_printf("[VQPW] engine REFUSED the geometry: cin=%u cout=%u "
                    "cin_load=%u -- check VQ_K / VQ_NORM_D / COUT_MAX in the "

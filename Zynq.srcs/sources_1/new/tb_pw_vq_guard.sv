@@ -39,7 +39,7 @@ module tb_pw_vq_guard;
   logic clk = 0, rst_n = 0;
   always #5 clk = ~clk;
 
-  logic        start_in = 0, done_out, cfg_err;
+  logic        start_in = 0, done_out, cfg_err, cfg_err_stb;
   // One group of N_LANES pixels: enough to prove a legal geometry runs and
   // emits, short enough that every case retires immediately.
   logic [31:0] tile_pixels = 32'd8;
@@ -80,7 +80,7 @@ module tb_pw_vq_guard;
     .zp_in(zp_in), .zp_out(zp_out), .relu_en(relu_en),
     .vq_mode(vq_mode), .vq_cin_load(vq_cin_load),
     .vq_norm_we(vq_norm_we), .vq_norm_addr(vq_norm_addr),
-    .vq_norm_data(vq_norm_data), .cfg_err(cfg_err),
+    .vq_norm_data(vq_norm_data), .cfg_err(cfg_err), .cfg_err_stb(cfg_err_stb),
     .w_rd_addr(w_rd_addr), .w_rd_en(w_rd_en), .w_rd_data(w_rd_data),
     .param_rd_addr(param_rd_addr), .param_rd_en(param_rd_en),
     .param_bias_data(param_bias_data), .param_mult_data(param_mult_data),

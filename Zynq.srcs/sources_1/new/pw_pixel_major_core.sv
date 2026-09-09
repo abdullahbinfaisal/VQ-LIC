@@ -57,10 +57,20 @@ module pw_pixel_major_core #(
   input  logic [$clog2(VQ_NORM_D)-1:0]      vq_norm_addr,
   input  logic signed [VQ_SCORE_W-1:0]      vq_norm_data,
 
-  // Sticky configuration-error flag. Set for one run whenever start_in is
-  // taken with a geometry this build cannot execute, INSTEAD of running and
-  // aliasing silently. Cleared by the next legal start. See S_IDLE.
+  // Configuration-error reporting. Both describe the same event; they differ
+  // in how long they last, and both are needed.
+  //
+  //   cfg_err      LEVEL. "the last start was refused." Holds until the next
+  //                start this engine ACCEPTS. Convenient to read at leisure.
+  //   cfg_err_stb  STROBE. One cycle per refused start.
+  //
+  // A latching flag must be built from the STROBE. Built from the level it
+  // cannot be cleared -- the level is still high, so it sets straight back --
+  // and built from the level's rising EDGE it misses a second refusal that
+  // follows a first with no accepted start in between. Both of those were
+  // observed; see the sticky-bit check in tb_pw_axi_vq.sv.
   output logic                              cfg_err,
+  output logic                              cfg_err_stb,
 
   // Weight BRAM read interface (all N_OC banks, 1-cycle latency)
   output logic [$clog2((COUT_MAX/N_OC)*CIN_MAX)-1:0] w_rd_addr,
@@ -1086,6 +1096,7 @@ module pw_pixel_major_core #(
       w_addr_base   <= '0;
       vq_pb_base    <= '0;
       cfg_err       <= 1'b0;
+      cfg_err_stb   <= 1'b0;
       w_rd_addr     <= '0;
       w_rd_en       <= 1'b0;
       rd_issued     <= 1'b0;
@@ -1150,6 +1161,10 @@ module pw_pixel_major_core #(
       // ========================================================
       // [1] MAIN FSM
       // ========================================================
+      // The strobe is one cycle wide: default it low here, and let S_IDLE
+      // raise it on the cycle it refuses a start.
+      cfg_err_stb <= 1'b0;
+
       case (st)
 
         // --------------------------------------------------------
@@ -1226,8 +1241,9 @@ module pw_pixel_major_core #(
             // clears it, so it always describes the most recent start.
             // ------------------------------------------------------------
             if (cfg_bad_r) begin
-              cfg_err <= 1'b1;
-              st      <= S_DONE;
+              cfg_err     <= 1'b1;
+              cfg_err_stb <= 1'b1;      // one cycle, every refusal
+              st          <= S_DONE;
             end else begin
               cfg_err <= 1'b0;
               st      <= S_LOAD_FIRST;

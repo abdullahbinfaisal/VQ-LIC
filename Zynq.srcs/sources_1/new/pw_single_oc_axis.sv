@@ -49,6 +49,7 @@ module pw_single_oc_axis #(
   input  logic [$clog2(VQ_NORM_D)-1:0] vq_norm_addr,
   input  logic signed [VQ_SCORE_W-1:0] vq_norm_data,
   output logic                         cfg_err,
+  output logic                         cfg_err_stb,
 
   // Weight BRAM read interface (from AXI wrapper BRAMs)
   output logic [$clog2((COUT_MAX/N_OC)*CIN_MAX)-1:0] w_rd_addr,
@@ -336,7 +337,7 @@ module pw_single_oc_axis #(
     .zp_in(zp_in), .zp_out(zp_out), .relu_en(relu_en),
     .vq_mode(vq_mode), .vq_cin_load(vq_cin_load),
     .vq_norm_we(vq_norm_we), .vq_norm_addr(vq_norm_addr),
-    .vq_norm_data(vq_norm_data), .cfg_err(cfg_err),
+    .vq_norm_data(vq_norm_data), .cfg_err(cfg_err), .cfg_err_stb(cfg_err_stb),
     .w_rd_addr(w_rd_addr), .w_rd_en(w_rd_en), .w_rd_data(w_rd_data),
     .param_rd_addr(param_rd_addr), .param_rd_en(param_rd_en),
     .param_bias_data(param_bias_data), .param_mult_data(param_mult_data),
@@ -398,11 +399,32 @@ module pw_single_oc_axis #(
     else if (out_wr_en) produced_cnt <= produced_cnt + 32'd1;
   end
 
+  // A run the core REFUSED emits no beats, so done must come from the core
+  // rather than from the output-beat count. Latched per run, cleared at start.
+  //
+  // WITHOUT THIS THE ENGINE WEDGES. The three zero-tests below used to be the
+  // only way a run could produce nothing, so mirroring them here was complete.
+  // The configuration guard added many more -- cout_run past the weight
+  // batches, cin_run past CIN_MAX, a cout_run that is not a whole number of
+  // sub-codebooks -- and for every one of those this block would go on waiting
+  // for last_beat_accepted, which never arrives. done_out would never assert,
+  // busy in the AXI wrapper never clears, and since start_pulse requires
+  // !busy, NO FURTHER RUN IS EVER ACCEPTED. One bad geometry would take the
+  // engine out until reset, which is far worse than the silent aliasing the
+  // guard was added to prevent.
+  logic run_refused;
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n)           run_refused <= 1'b0;
+    else if (start_in)    run_refused <= 1'b0;
+    else if (cfg_err_stb) run_refused <= 1'b1;
+  end
+
   // Done: after last output beat accepted
   always_ff @(posedge clk or negedge rst_n) begin
     if (!rst_n)        done_out <= 1'b0;
     else if (start_in) done_out <= 1'b0;
-    else if ((tile_pixels == 0) || (cin_run == 0) || (cout_run == 0))
+    else if ((tile_pixels == 0) || (cin_run == 0) || (cout_run == 0)
+             || run_refused)
       done_out <= core_done;
     else done_out <= last_beat_accepted;
   end
