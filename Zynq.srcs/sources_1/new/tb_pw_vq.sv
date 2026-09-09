@@ -41,7 +41,12 @@ module pw_vq_bench #(
   // Output-sink backpressure. STALL_BURST cycles of refusal every
   // STALL_PERIOD cycles; 0 = the old free-running behaviour.
   parameter int    STALL_BURST  = 0,
-  parameter int    STALL_PERIOD = 512
+  parameter int    STALL_PERIOD = 512,
+  // Input-side gaps. The board feeds this port from a DMA that does NOT
+  // deliver a beat every cycle -- the board run set in_underflow -- while this
+  // bench has always driven valid_in continuously. Percent of cycles the
+  // source withholds a beat.
+  parameter int    IN_GAP_PCT   = 0
 )();
 
   localparam int DATA_WIDTH = 8;
@@ -165,8 +170,22 @@ module pw_vq_bench #(
   // pointer and hold until the handshake, and the pointer advances only on
   // (valid_in && consume_in).
   int beat_i;
+  function automatic int unsigned xs32(input int unsigned x);
+    int unsigned v;
+    begin v = x; v ^= v << 13; v ^= v >> 17; v ^= v << 5; xs32 = v; end
+  endfunction
+  int unsigned gap_lfsr = 32'h1357_9BDF;
+  logic        src_hold;
+  always_ff @(posedge clk) begin
+    // xorshift32. From any non-zero seed it never reaches zero. The
+    // shift-and-XOR taps used before COULD reach zero and did: src_hold stuck
+    // high, valid_in never asserted, and the bench reported 0 of 256 beats,
+    // which looks exactly like a wedged DUT and was not one.
+    gap_lfsr <= xs32(gap_lfsr);
+    src_hold <= (IN_GAP_PCT > 0) && ((gap_lfsr % 100) < IN_GAP_PCT);
+  end
   always_comb begin
-    valid_in = rst_n && (beat_i < NG*VQ_DIM);
+    valid_in = rst_n && !src_hold && (beat_i < NG*VQ_DIM);
     pixel_in = latent_mem[beat_i < NG*VQ_DIM ? beat_i : 0];
   end
   always_ff @(posedge clk) begin
@@ -292,6 +311,40 @@ endmodule
 // the VQ stream drains into DDR through a DMA that stalls, and an emit that is
 // still in flight when the next group starts committing index fields is a
 // data hazard the free-running bench cannot reach.
+// FULL FRAME. Every other top runs 64 groups; the board runs 1800. Anything
+// that accumulates across groups -- a base that fails to reset, a counter that
+// wraps -- is invisible at 64 and certain at 1800.
+module tb_pw_vq_full;
+  pw_vq_bench #(.VQ_K(64), .VQ_NORM_D(256), .VQ_SCORE_W(21),
+                .VQ_M(4), .VQ_DSUB(16), .COUT_MAX(256),
+                .NG(1800), .DIR("vq64"),
+                .TAG("DEPLOYED M=4 K=64, FULL 1800-group frame")) u();
+endmodule
+
+module tb_pw_vq_full_gap;
+  pw_vq_bench #(.VQ_K(64), .VQ_NORM_D(256), .VQ_SCORE_W(21),
+                .VQ_M(4), .VQ_DSUB(16), .COUT_MAX(256),
+                .NG(1800), .DIR("vq64"), .IN_GAP_PCT(70),
+                .TAG("DEPLOYED M=4 K=64, FULL frame + input gaps")) u();
+endmodule
+
+// Input starvation, which is what the board's in_underflow reports.
+module tb_pw_vq_gap;
+  pw_vq_bench #(.VQ_K(64), .VQ_NORM_D(256), .VQ_SCORE_W(21),
+                .VQ_M(4), .VQ_DSUB(16), .COUT_MAX(256),
+                .NG(64), .DIR("vq64"), .IN_GAP_PCT(70),
+                .TAG("DEPLOYED M=4 K=64, 70%% input gaps")) u();
+endmodule
+
+// Both sides constricted at once.
+module tb_pw_vq_both;
+  pw_vq_bench #(.VQ_K(64), .VQ_NORM_D(256), .VQ_SCORE_W(21),
+                .VQ_M(4), .VQ_DSUB(16), .COUT_MAX(256),
+                .NG(64), .DIR("vq64"), .IN_GAP_PCT(70),
+                .STALL_BURST(150), .STALL_PERIOD(512),
+                .TAG("DEPLOYED M=4 K=64, input gaps + output bursts")) u();
+endmodule
+
 module tb_pw_vq_stall;
   pw_vq_bench #(.VQ_K(64), .VQ_NORM_D(256), .VQ_SCORE_W(21),
                 .VQ_M(4), .VQ_DSUB(16), .COUT_MAX(256),

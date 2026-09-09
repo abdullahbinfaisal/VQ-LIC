@@ -1057,6 +1057,29 @@ static void edge_vq_mismatch_report(const uint8_t *pl, const uint8_t *sw)
             }
         printf("[VQDIAG] hw == sw<<1 : %ld,  hw == sw>>1 : %ld,  neither : %ld\n",
                shl, shr, other);
+        /* HOW MANY DISTINCT (sw -> hw) PAIRS? 581 mismatches that are all the
+         * same pair are ONE failing input repeated, not a law about indices.
+         * The shift relation above means nothing until this says how many
+         * independent cases it was drawn from. */
+        {
+            unsigned char seen[VQPW_K][VQPW_K];
+            int distinct = 0;
+            memset(seen, 0, sizeof seen);
+            for (int pos = 0; pos < VQPW_NPOS; pos++)
+                for (int m = 0; m < VQPW_M; m++) {
+                    const unsigned a = vqpw_get_index(pl, pos, m);
+                    const unsigned b = vqpw_get_index(sw, pos, m);
+                    if (a != b && !seen[b][a]) { seen[b][a] = 1; distinct++; }
+                }
+            printf("[VQDIAG] distinct (sw->hw) index pairs : %d\n", distinct);
+            if (distinct <= 12) {
+                printf("[VQDIAG] they are:");
+                for (int b = 0; b < VQPW_K; b++)
+                    for (int a = 0; a < VQPW_K; a++)
+                        if (seen[b][a]) printf(" %d->%d", b, a);
+                printf("\n");
+            }
+        }
         if (other == 0 && (shl + shr) > 0)
             printf("[VQDIAG] EVERY mismatch is a one-bit shift -> a FIELD OFFSET,"
                    " not a search error.\n");
@@ -1102,6 +1125,29 @@ static void edge_vq_mismatch_report(const uint8_t *pl, const uint8_t *sw)
                            " (rank %d of %d) | sw k=%-3u score %-10ld | diff %ld\n",
                            pos, m_bad, kh, (long)sc[kh], rank, VQPW_K,
                            ks, (long)sc[ks], (long)(sc[kh] - sc[ks]));
+                    /* norm and dot separately: score = norm - 2*acc, so seeing
+                     * both says whether the engine's disagreement is in the
+                     * codeword NORM it was given or in the MAC it computed. */
+                    printf("[VQDIAG]      norm[hw]=%ld norm[sw]=%ld  "
+                           "acc[hw]=%ld acc[sw]=%ld\n",
+                           (long)dctx.norm2[m_bad * VQPW_K + kh],
+                           (long)dctx.norm2[m_bad * VQPW_K + ks],
+                           (long)((dctx.norm2[m_bad * VQPW_K + kh] - sc[kh]) / 2),
+                           (long)((dctx.norm2[m_bad * VQPW_K + ks] - sc[ks]) / 2));
+                    /* THE INPUT VECTOR, so this exact case can be replayed in
+                     * xsim offline. The codebook is deterministic from a fixed
+                     * seed, so u plus (m,k) is the whole reproducer. */
+                    if (shown == 0) {
+                        printf("[VQDIAG]      REPRODUCER u[m=%d] =", m_bad);
+                        for (int d = 0; d < VQPW_DSUB; d++)
+                            printf(" %d", (int)u[m_bad * VQPW_DSUB + d]);
+                        printf("\n[VQDIAG]      raw latent bytes  =");
+                        for (int d = 0; d < VQPW_DSUB; d++)
+                            printf(" %u", (unsigned)((const uint8_t *)edge_latent_ptr())
+                                   [((size_t)g * VQPW_DIM + m_bad * VQPW_DSUB + d)
+                                    * VQPW_LANES + l]);
+                        printf("\n");
+                    }
                     shown++;
                 }
             }
