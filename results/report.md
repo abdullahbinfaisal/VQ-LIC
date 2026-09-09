@@ -1343,9 +1343,88 @@ DSP is the binding resource and it does not move. LUTs and registers go down.
 BRAM is unchanged. Timing has 1.809 ns of slack against 10 ns, 18% of the
 period, on a path this change did not touch.
 
-One thing this still does not establish: **post-route** timing for the FULL
-design -- PW plus the DW engine, the DMAs and the interconnect -- with the real
-floorplan at 220/220 DSP. That needs `synth_design` + `place_design` +
-`route_design` on the whole block design after Vivado re-packages the IP with
-the new parameters (see §10). Out-of-context synthesis of one IP is a strong
-indicator, not a substitute.
+Out-of-context synthesis of one IP is a strong indicator, not a substitute for
+the whole design at 220/220 DSP with the real floorplan. Section 10 does that.
+
+## 10. Full block design, post-route
+
+§9 was out-of-context synthesis of the PW IP alone. This is the whole design --
+PW plus the DW engine, three DMAs, the interconnect and the PS7 -- taken all
+the way to a bitstream.
+
+**Vivado 2020.2, `xc7z020clg484-1`, top `hw_wrapper`, post-route.** Built on a
+COPY of the project in scratch, so `Zynq.xpr` and its existing `impl_1` results
+are untouched. The baseline column is the shipped design's own
+`Zynq.runs/impl_1` reports (2026-09-04).
+
+| resource | shipped (M=8/K=16) | new (M=4/K=64) | delta | % of device |
+|---|---|---|---|---|
+| Slice LUTs | 34,358 | **34,343** | **−15** | 64.55% |
+| LUT as Logic | 32,823 | 32,749 | −74 | 61.56% |
+| LUT as Memory | 1,535 | 1,594 | +59 | 9.16% |
+| Slice Registers | 32,354 | **32,341** | **−13** | 30.40% |
+| Block RAM Tile | 82.5 | **82.5** | **0** | 58.93% |
+| **DSP48E1** | 220 | **220** | **0** | **100.00%** |
+| WNS (ns) | +0.077 | **+0.166** | **+0.089** | |
+| WHS (ns) | +0.012 | +0.013 | +0.001 | |
+| TNS / THS | 0.000 / 0.000 | 0.000 / 0.000 | | |
+| timed endpoints | 100,426 | 100,785 | +359 | |
+| bitstream | written | **written** | | |
+
+**It fits, it closes, and it builds.** `write_bitstream` completed.
+
+The headline is how little moves. The design is 15 LUTs and 13 registers
+SMALLER, BRAM is identical, and DSP is 220/220 in both -- the convolution
+engine saturates the DSP column and the VQ changes never touched it, because
+`Q = N_OC = 32` and `N_LANES = 8` are what size the MAC array and neither
+changed. The +59 LUT-as-Memory is the norm ROM growing 128x20 -> 256x21 as
+distributed RAM; the logic LUTs fall by more than that, mostly because the
+index-packing mux shrinks from eight 4-bit fields per 32-bit word to four
+6-bit fields per 24-bit word across 8 lanes.
+
+**Timing is the number that matters here, and it improves.** The shipped design
+closes with **0.077 ns** of margin on a 10 ns period -- 0.8%. That is tight
+enough that a careless change would break it. This build closes at **0.166 ns**,
+slightly better, with zero failing endpoints on either setup or hold. The
+improvement is not something to claim credit for -- it is on paths this work
+does not touch, and 0.089 ns is within the run-to-run variation of a design
+this close to the edge. The honest statement is: **no timing regression, and
+the margin is unchanged in practice.**
+
+That 0.077 ns baseline is also the reason the configuration guard was
+pipelined. §9 measured the in-cone version at +0.066 ns of slack out of context,
+where the rest of the design is absent. Dropping a new critical path into a
+full design that already has only 0.077 ns would not have closed.
+
+Power, post-route vector-less estimate: **2.531 W** total on-chip (2.354 W
+dynamic, 0.178 W static). This is a Vivado ESTIMATE at default switching
+activity, not a measurement -- the board's PMBus figures (2.0342 / 2.0359 W in
+`board_measured.py`) are the real numbers and are not comparable to it. Treat
+this only as a sanity check that nothing pathological happened.
+
+### One defect this caught that nothing else could
+
+The PW core source exists TWICE in the project:
+
+```
+Zynq.srcs/src/pw_pixel_major_core.sv            <- the IP PACKAGES THIS ONE
+Zynq.srcs/sources_1/new/pw_pixel_major_core.sv  <- the one normally edited
+```
+
+Both are tracked in git and were byte-identical. `Zynq.srcs/component.xml`
+lists `src/pw_pixel_major_core.sv`, while every other file of the IP comes from
+`sources_1/new/`. The RTL work in this study edited only `sources_1/new/`, so
+the packaged IP kept the OLD core -- and every check passed anyway, because
+xsim and out-of-context synthesis both read `sources_1/new/` directly.
+
+The full build failed immediately and unambiguously:
+
+```
+ERROR: [Synth 8-7136] In the module 'pw_pixel_major_core' ...
+       parameter 'VQ_K' used as named parameter override, is a localparam
+```
+
+New wrapper, stale core. The two files are now back in sync, and the trap is
+recorded in `CLAUDE.md`. The lesson generalises: **out-of-context synthesis of
+an IP cannot detect that the IP is packaging different source than you edited.**
+Only a full block-design build can.

@@ -48,6 +48,34 @@ figure without saying which tool and which part produced it.
 `xc7z020clg484-1` — 220 DSP48E1 (the binding resource; the shipped design sits
 at 220/220), 53,200 LUT, 106,400 FF, 140 BRAM36. PL at 100 MHz.
 
+## The PW core source exists TWICE — keep both in sync
+
+```
+Zynq.srcs/src/pw_pixel_major_core.sv            <- the IP PACKAGES THIS ONE
+Zynq.srcs/sources_1/new/pw_pixel_major_core.sv  <- the one you will open
+```
+
+They are byte-identical by convention, both tracked in git, and
+`Zynq.srcs/component.xml` lists **`src/pw_pixel_major_core.sv`** while every
+other file of the IP (`ppu.sv`, `pw_single_oc_axis.sv`,
+`pw_single_oc_axis_axi.sv`) comes from `sources_1/new/`.
+
+**Editing only `sources_1/new/` produces a tree that passes every simulation
+and out-of-context synthesis run and then fails the real build**, because
+xsim/OOC read `sources_1/new/` directly and the packaged IP reads `src/`. It
+surfaces as e.g. `[Synth 8-7136] parameter 'VQ_K' ... is a localparam` — the
+wrapper is new, the core is stale.
+
+After any edit to `pw_pixel_major_core.sv`:
+
+```bash
+cp Zynq.srcs/sources_1/new/pw_pixel_major_core.sv Zynq.srcs/src/pw_pixel_major_core.sv
+diff Zynq.srcs/sources_1/new/pw_pixel_major_core.sv Zynq.srcs/src/pw_pixel_major_core.sv
+```
+
+Only a FULL block-design build catches the divergence. OOC synthesis of the IP
+cannot.
+
 ## Verification entry points
 
 ```bash
