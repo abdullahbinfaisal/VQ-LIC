@@ -93,6 +93,34 @@ After a platform repoint, all three steps are required:
 2. rebuild the application,
 3. **program the FPGA** with the new bitstream.
 
+### The JSON repoint alone cannot change what gets PROGRAMMED
+
+`Final_code_2/_ide/launch.json` has `"programDevice": true` and a **hardcoded
+absolute path**:
+
+```json
+"bitstreamFile": "C:\Users\Fahad\Zynq\Zynq.runs\impl_1\hw_wrapper.bit",
+```
+
+It programs the FPGA from the **Vivado project's own impl_1 output**, NOT from
+the platform XSA. So the platform JSON governs what the software is COMPILED
+against, and `Zynq.runs/impl_1/hw_wrapper.bit` governs what the fabric actually
+RUNS. They are independent, and repointing the JSON has historically appeared
+to "fix" things only because implementation was normally run in this project,
+which kept that path current as a side effect.
+
+**Therefore: if a build is produced anywhere other than this project's own
+`impl_1` — a scratch copy, a different machine — the bitstream must be copied
+to `Zynq.runs/impl_1/hw_wrapper.bit`, or the launch config repointed. Otherwise
+new firmware runs against old fabric and the only symptom is wrong results.**
+
+Check both, they are different questions:
+
+```bash
+md5sum Zynq.runs/impl_1/hw_wrapper.bit    # what the board will run
+grep -oE 'pwvq[^\"]*\.xsa' Final_2/vitis-comp.json   # what the app compiles against
+```
+
 The current bitstream is extracted for convenience at
 `Final_2/hw/pwvq_k64.bit` (md5 e9893daf486df604e8b10a47ea84c6c6, identical to
 `Zynq.runs/impl_1/hw_wrapper.bit` of the build that produced it).
