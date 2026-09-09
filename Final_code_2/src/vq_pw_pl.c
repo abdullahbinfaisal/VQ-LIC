@@ -62,6 +62,40 @@ static inline uint32_t dma_r(uint32_t off)        { return Xil_In32(VQ_PW_PL_DMA
 extern unsigned long long ep_timer_now(void);
 extern double ep_cycles_to_ms(unsigned long long c);
 
+/* Put both DMA channels back to a known-idle state and wait for the reset to
+ * clear. A handful of cycles.
+ *
+ * WHY EVERY RUN MUST BEGIN WITH THIS. Writing CTRL bit 0 flushes the engine's
+ * input FIFO, but only for the five cycles the reset stretcher holds
+ * (pw_single_oc_axis.sv). It cannot flush what has not arrived yet. If the
+ * PREVIOUS run left beats inside the MM2S datamover -- and it does, because the
+ * engine stops consuming the moment its run retires while the DMA may still
+ * have descriptor left -- those beats are pushed into the FIFO AFTER the flush
+ * and become CHANNEL 0 of the next run. It is self-perpetuating: run N reads
+ * one stale beat plus the first 63 of its own data, leaving beat 63 for N+1.
+ *
+ * The silicon signature was unmistakable once the crafted self-tests isolated
+ * it. Channel 0 lies in sub-codebook 0's window (channels 0..15) and in no
+ * other, so ONLY m=0 was ever wrong while m1..m3 stayed perfect. Replaying the
+ * four self-test latents with channel 0 taken from the PREVIOUS case
+ * reproduced the board's answers exactly, including the two that passed:
+ *
+ *     latent 128 after 128 -> 54          board: ok   (stale == intended)
+ *     latent 255 after 128 ->  7 -> 14    board: 14
+ *     latent   0 after 255 -> 21          board: ok   (did not flip it)
+ *     latent 129 after   0 -> 54 ->  9    board:  9
+ *
+ * Simulation could not show it: the bench feeds from beat 0 of its vector
+ * file, so there is never a leftover beat to inherit. */
+static void dma_quiesce(void)
+{
+    dma_w(MM2S_DMACR, DMACR_RESET);
+    dma_w(S2MM_DMACR, DMACR_RESET);
+    for (uint32_t i = 0; i < 100000u; i++)
+        if (!(dma_r(MM2S_DMACR) & DMACR_RESET)
+            && !(dma_r(S2MM_DMACR) & DMACR_RESET)) break;
+}
+
 static double s_prog_ms = -1.0;
 static double s_run_ms  = -1.0;
 static unsigned long long s_t_start = 0;
@@ -124,6 +158,7 @@ static void probe_run(uint32_t cout_run)
     Xil_DCacheFlushRange((UINTPTR)s_probe_in, sizeof s_probe_in);
     Xil_DCacheInvalidateRange((UINTPTR)s_probe_out, sizeof s_probe_out);
 
+    dma_quiesce();
     pw_w(PW_REG_TILE_PIXELS, (uint32_t)VQPW_LANES);   /* exactly one group */
     pw_w(PW_REG_CIN_RUN,     (uint32_t)VQPW_CIN_MAC);
     pw_w(PW_REG_COUT_RUN,    cout_run);
@@ -143,11 +178,7 @@ static void probe_run(uint32_t cout_run)
         if (pw_r(PW_REG_STATUS) & 0x1u)     break;    /* done_sticky */
     }
 
-    dma_w(MM2S_DMACR, DMACR_RESET);
-    dma_w(S2MM_DMACR, DMACR_RESET);
-    for (uint32_t i = 0; i < 100000u; i++)
-        if (!(dma_r(MM2S_DMACR) & DMACR_RESET) && !(dma_r(S2MM_DMACR) & DMACR_RESET))
-            break;
+    dma_quiesce();
 }
 
 int vq_pw_pl_probe_guard(void)
@@ -300,6 +331,11 @@ void vq_pw_pl_cache_prep(const void *latent, void *idx_out, int flush_latent)
 
 int vq_pw_pl_start(const void *latent, void *idx_out)
 {
+    // NOTHING IN FLIGHT. Must precede the CTRL start below, because that write
+    // flushes the input FIFO and a beat still inside the datamover would land
+    // after the flush and be read as channel 0. See dma_quiesce().
+    dma_quiesce();
+
     // Geometry. cin_run is the MAC window (two sub-codebooks x Dsub), NOT the
     // number of channels streamed -- that is vq_cin_load, which is the whole
     // 64-channel latent vector read once per group.
@@ -364,6 +400,11 @@ int vq_pw_pl_poll_done(void)
 void vq_pw_pl_finish(void *idx_out)
 {
     s_run_ms = ep_cycles_to_ms(ep_timer_now() - s_t_start);
+    // Retire the channels rather than leaving whatever the engine did not
+    // consume sitting in the datamover. vq_pw_pl_start quiesces too, so this
+    // is belt and braces -- but it also protects the CONVOLUTION path, which
+    // shares the engine and does not go through vq_pw_pl_start.
+    dma_quiesce();
     // Clear VQ mode. Left set, the next convolution would emit onto
     // axi_dma_2 and wait forever for input the DW engine cannot deliver.
     pw_w(PW_REG_VQ_CTRL, 0u);
@@ -443,6 +484,7 @@ int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
         Xil_DCacheFlushRange((UINTPTR)s_st_lat, sizeof s_st_lat);
         Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, sizeof s_st_hw);
 
+        dma_quiesce();
         pw_w(PW_REG_TILE_PIXELS, (uint32_t)VQPW_LANES);
         pw_w(PW_REG_CIN_RUN,     (uint32_t)VQPW_CIN_MAC);
         pw_w(PW_REG_COUT_RUN,    (uint32_t)VQPW_COUT_TOTAL);
@@ -473,11 +515,7 @@ int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
         }
 
         pw_w(PW_REG_VQ_CTRL, 0u);
-        dma_w(MM2S_DMACR, DMACR_RESET);
-        dma_w(S2MM_DMACR, DMACR_RESET);
-        for (uint32_t i = 0; i < 100000u; i++)
-            if (!(dma_r(MM2S_DMACR) & DMACR_RESET)
-                && !(dma_r(S2MM_DMACR) & DMACR_RESET)) break;
+        dma_quiesce();
         Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, sizeof s_st_hw);
 
         /* The reference over the same one group. vqpw_encode_frame walks whole
@@ -577,6 +615,7 @@ int vq_pw_pl_sweep_codewords(void)
         if (vq_pw_pl_load_codebook(s_sw_cb, 128) != 0) return -1;
 
         Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, sizeof s_st_hw);
+        dma_quiesce();
         pw_w(PW_REG_TILE_PIXELS, (uint32_t)VQPW_LANES);
         pw_w(PW_REG_CIN_RUN,     (uint32_t)VQPW_CIN_MAC);
         pw_w(PW_REG_COUT_RUN,    (uint32_t)VQPW_COUT_TOTAL);
@@ -596,11 +635,7 @@ int vq_pw_pl_sweep_codewords(void)
             if (dma_r(S2MM_DMASR) & DMASR_IDLE) break;
 
         pw_w(PW_REG_VQ_CTRL, 0u);
-        dma_w(MM2S_DMACR, DMACR_RESET);
-        dma_w(S2MM_DMACR, DMACR_RESET);
-        for (uint32_t i = 0; i < 100000u; i++)
-            if (!(dma_r(MM2S_DMACR) & DMACR_RESET)
-                && !(dma_r(S2MM_DMACR) & DMACR_RESET)) break;
+        dma_quiesce();
         Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, sizeof s_st_hw);
 
         for (int m = 0; m < VQPW_M; m++) {
