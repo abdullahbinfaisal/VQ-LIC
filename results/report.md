@@ -961,3 +961,385 @@ a 256-channel run on this engine.
 Add the `cout_run > COUT_MAX` guard that exists only in
 `pw_pixel_major_core_SIMCOPY.sv:779` to the synthesised core, as a sticky status
 bit. Today an over-range `cout_run` produces a wrong frame with no indication.
+
+---
+
+# M=4, K=64, Dm=16 on the shared PW engine -- implementation
+
+The audit above concluded that the shipped VQ datapath could not execute this
+quantiser at any number of passes. This section records the change that makes
+it execute, in ONE invocation, and the evidence that it is correct.
+
+Everything is parameterised rather than retargeted: the same RTL source and the
+same C source build both the deployed M=4/K=64/Dm=16 geometry and the legacy
+M=8/K=16/Dm=8 one, and both are proved on every run.
+
+## 1. The five limits, and what replaced each
+
+| limit (shipped) | replacement | note |
+|---|---|---|
+| `VQ_K = 16` hardcoded | parameter `VQ_K` | 64 deployed, 16 legacy |
+| `vq_k = vq_oc_r[3:0]`, argmin resets every 16 | `vq_abs = {batch, oc}`, `vq_k = vq_abs[VQ_KW-1:0]` | one expression covers both |
+| `vq_word[i][{vq_m,2'b00} +: 4]` nibbles | `vq_word[i][VQ_KW*vq_m +: VQ_KW]` | 6-bit fields at K=64 |
+| `VQ_NORM_D = 128`, 7-bit AXI address | parameter `VQ_NORM_D`, `$clog2(VQ_NORM_D)`-bit address | 256 norms, 8-bit field |
+| `VQ_SCORE_W = 20` | parameter `VQ_SCORE_W` | 21 at Dm=16 -- see §3 |
+| `vq_m = {vq_batch_r[1:0], vq_half}` capping VQ c_out at 128 | `vq_m = vq_abs[VQ_AW-1:VQ_KW]` | c_out to VQ_NORM_D |
+| no synthesised geometry check | `cfg_err` + `STATUS2[5]` | see §5 |
+
+### The indexing generalisation is one expression
+
+Write `abs = batch*N_OC + oc` for the absolute output channel. Then for any
+power-of-two K,
+
+```
+k = abs mod K = abs[VQ_KW-1:0]      the codeword inside its sub-codebook
+m = abs div K = abs[VQ_AW-1:VQ_KW]  which sub-codebook
+```
+
+and the argmin resets exactly every K issues (`vq_first = (vq_k == 0)`) and
+commits on the last of them. Specialising:
+
+```
+K=16, N_OC=32 : k = abs[3:0] = oc[3:0],          m = {batch[1:0], oc[4]}
+K=64, N_OC=32 : k = abs[5:0] = {batch[0], oc[4:0]}, m = batch[2:1]
+```
+
+The K=16 case is character-for-character the old `vq_k` / `vq_m`, which is why
+the legacy regression is bit-identical. The K=64 case spreads ONE sub-codebook
+across TWO batches, and the running minimum survives that boundary because
+nothing but `vq_first` clears it.
+
+## 2. The one thing that is not a rename: the activation window
+
+`w_addr_base` used to serve two purposes at once -- the weight BRAM read
+address AND the pb_ram activation window base. At K <= N_OC that coincidence
+holds, because every batch opens a new input window. At K > N_OC the two
+DIVERGE:
+
+- the WEIGHT address must advance every batch (each batch holds different
+  codewords), and
+- the ACTIVATION window must HOLD STILL for `VQ_BPS = K/N_OC` batches, because
+  those codewords all belong to one sub-codebook and read the same Dm
+  dimensions.
+
+One counter cannot do both, so VQ mode gets `vq_pb_base`, stepped only on a
+sub-codebook boundary:
+
+```
+K=16, N_OC=32, VQ_BPS=1 : 0, 16, 32, 48            (every batch -- as before)
+K=64, N_OC=32, VQ_BPS=2 : 0, 0, 16, 16, 32, 32, 48, 48
+```
+
+At `VQ_BPS = 1` the step condition is constant-true and `vq_pb_base` tracks
+`w_addr_base` exactly, so the legacy geometry is untouched. Cost: one
+`PB_AW`-wide register and adder.
+
+## 3. Score dynamic range -- the bound depends on Dm, not on K
+
+Both `u = zq - 128` and `v = cq - 128` lie in `[-128, +127]`. Per dimension,
+`v^2 - 2uv` is maximised at `u=+127, v=-128` (`16384 + 2*127*128 = 48,896`) and
+minimised at `v = u = -128` (`16384 - 32768 = -16,384`). Over Dm dimensions,
+
+```
+score in [ -16384*Dm , +48896*Dm ]      and  2^(N-1) > 48896*Dm
+```
+
+| Dm | max score | needs | VQ_SCORE_W |
+|---|---|---|---|
+| 8 (legacy) | 391,168 | 2^19 = 524,288 | **20** |
+| 16 (deployed) | 782,336 | 2^20 = 1,048,576 | **21** |
+
+Dm = 16 overflows the shipped 20-bit width. This is proved, not asserted, three
+ways:
+
+1. `vq_pw_golden_test` attains 782,336 exactly on a directed corner and checks
+   that truncating it to 20 bits changes the value.
+2. `a_vq_score_fits` in the RTL checks `sc32 === 32'(vq_score[g])` on **every
+   compare**. At `VQ_SCORE_W = 21`, zero violations across all six data runs.
+3. A **negative control** -- the deployed geometry elaborated with
+   `VQ_SCORE_W = 20` -- fires **1,361 overflow assertions** on the INT8-extremes
+   vectors, with scores like 586,751 against a 524,287 ceiling.
+
+The accumulator is unaffected: `|acc| <= 16384*Dm = 262,144` at Dm=16, inside
+the shipped `ACC_WIDTH = 24`. So is the AXI norm field: `||v_k||^2` is at most
+262,144, which fits 20-bit signed, so `ADDR_VQ_NORM`'s DATA field is unchanged
+and only its ADDRESS field widened, 7 -> 8 bits. Addresses 0..127 decode
+identically, so the register map is backward compatible.
+
+## 4. COUT_MAX 240 -> 256
+
+`W_OC_BATCHES = COUT_MAX / N_OC` floors: 240/32 = 7, so the shipped ceiling on
+c_out was 224 and the top 16 entries of the param BRAM were unreachable. 256
+makes the two agree.
+
+| | 240 | 256 | change |
+|---|---|---|---|
+| `W_OC_BATCHES` | 7 | 8 | +1 |
+| `W_DEPTH` bytes/bank | 1,680 | 1,920 | +240 |
+| `W_AW = $clog2(W_DEPTH)` | **11** | **11** | none |
+| weight bits/bank | 13,440 | 15,360 | one BRAM18 (2048x9 = 18,432 b) either way |
+| `PARAM_AW = $clog2(COUT_MAX)` | **8** | **8** | none |
+| bias/mult BRAM bits | 7,680 | 8,192 | one BRAM18 either way |
+| `N_OC` / `Q` | 32 | 32 | none |
+
+No port widens (`w_rd_addr` and `param_rd_addr` are declared from those two
+`$clog2` expressions), no BRAM primitive grows, `Q` is untouched. Section 8
+reports the measured DSP effect.
+
+## 5. The synthesised configuration guard
+
+The `cout_run > COUT_MAX` check existed ONLY in
+`pw_pixel_major_core_SIMCOPY.sv`, which is not the synthesised file. An
+over-range geometry ran, aliased, and produced a wrong frame with nothing set
+to say so. `S_IDLE` now refuses to start and raises `cfg_err`, surfaced at
+`STATUS2[5]`; `vq_pw_pl_start()` reads it after every start.
+
+Refused: `cout_run > (COUT_MAX/N_OC)*N_OC`; `cin_run > CIN_MAX`; and in VQ mode
+`cout_run > VQ_NORM_D`, `vq_cin_load > CIN_MAX`, `cout_run` not a multiple of
+`VQ_K`, and window schedules that would read past the loaded channels. A legal
+start clears the flag, so it always describes the most recent start.
+
+The window-fit condition is the one that is easy to get wrong: the number of
+windows is NOT `cout_run/K`, it is `batches / VQ_BPS` -- at K <= N_OC every
+batch opens a window, at K > N_OC only every VQ_BPS-th does. Both deployed
+geometries need `4 x 16 = 64` channels, which is exactly `vq_cin_load`.
+
+## 6. The mapping at M=4, K=64, Dm=16, and why no structural zeros
+
+`vqpw_map_oc` gives, for batch b and channel oc: `m = b/2`,
+`k = 32*(b%2) + oc`, window base `16*(b/2)`, and offset within the window
+**always 0**. Since `Dm = 16 = cin_mac`, every one of the 16 weights each
+output channel reads is a real codeword coefficient.
+
+Confirmed rather than assumed: `vq_pw_golden_test` compares every entry of the
+4,096-byte weight image against the codebook directly and counts zeros. It
+finds **17 zeros in 4,096** -- consistent with a random int8 codebook producing
+a 0 about 1 byte in 256, and nothing structural. The legacy image, by contrast,
+is **1,026 of 2,048** zeros: block-diagonal packing wastes half the MAC there.
+
+So the deployed mapping runs the VQ search at **100% MAC utilisation** of the
+window it walks, against 50% for the legacy one.
+
+## 7. Verification
+
+### Software reference, both profiles
+
+`vq_pw_golden_test` re-derives every index from the HOST-LOADED IMAGES using
+the engine's own arithmetic -- window base `vqpw_batch_window(b)`, 16-tap MAC,
+uint8-minus-uint8 pre-adder, argmin resetting every K and persisting across
+batch boundaries, score truncated to `VQPW_SCORE_BITS` -- and compares against
+`vqpw_encode_frame()`.
+
+```
+DEPLOYED M=4 K=64 Dsub=16 : 58 checks, 0 failures
+LEGACY   M=8 K=16 Dsub=8  : 44 checks, 0 failures
+```
+
+Including: 3 full 14,400-position frames each, 0 mismatches; every (m,k) pair
+of 256 observed with highest index **63**; norm address **255** used; the
+transport word's unused bits [31:24] zero at every position; put/get
+round-tripping 12,279 indices above 15; and a **cross-batch tie** -- codewords
+31 and 32 of the same sub-codebook made identical -- resolving to the lower
+index every time (k=32 chosen 0 times, k=31 chosen 41 times). That last case is
+the one K > N_OC creates and K = 16 cannot.
+
+### RTL against the software reference
+
+`tb_pw_vq` drives real latent groups through `pw_pixel_major_core` and compares
+the packed index beats byte-for-byte. Vectors come from `gen_vq_vectors`, which
+links the SAME `vq_pw.c` the firmware uses.
+
+| scenario | DEPLOYED | LEGACY |
+|---|---|---|
+| 0 random | PASS, 0 mismatches, 272.00 cyc/grp | PASS, 0 mismatches, 136.00 cyc/grp |
+| 1 tie storm | PASS, 0 mismatches, 272.00 cyc/grp | PASS, 0 mismatches, 136.00 cyc/grp |
+| 2 INT8 extremes | PASS, 0 mismatches, 272.00 cyc/grp | PASS, 0 mismatches, 136.00 cyc/grp |
+
+256 of 256 beats every run, `cfg_err = 0`, zero assertion errors.
+
+### RTL through the real AXI-lite register map
+
+`tb_pw_axi_vq` programs the engine the way the driver does -- `OC_SEL` /
+`W_BRAM_OFF` / `W_BASE` for weights, `ADDR_VQ_NORM` for norms, `ADDR_VQ_CTRL`
+for mode -- and reads the norm ROM back.
+
+```
+DEPLOYED, all 3 scenarios : PASS, 256/256 beats, 0 mismatches,
+                            NORM ROM entries wrong: 0 / 256,
+                            262,144 weight reads checked, 0 bad, cfg_err = 0
+LEGACY,   all 3 scenarios : PASS, 256/256 beats, 0 mismatches,
+                            NORM ROM entries wrong: 0 / 128, cfg_err = 0
+```
+
+This is the only place the widened norm address is exercised end to end: the
+deployed run writes addresses 128..255, which the shipped 7-bit port could not
+express at all.
+
+### The driver emits the image the RTL was proved against
+
+`vq_pw_pl_prog_test` replays the driver's AXI-lite writes into a model of the
+weight banks and norm ROM. Both profiles: **0 checks failed**. Every weight
+entry and every norm written exactly once and matching
+`vqpw_build_weights()` / `vqpw_build_norms()`.
+
+### The configuration guard
+
+`tb_pw_vq_guard`: **18 cases, 0 failures**. Each refused case raises `cfg_err`
+AND emits zero beats; each legal case clears `cfg_err` and emits. Covered:
+zero geometry, `cout_run` 288 and 320, `cin_run` 256, `vq_cin_load` 256 and 48,
+`cout_run` 224 (not a multiple of K=64), and convolution-mode cases proving the
+VQ-only rules do not leak into conv while `COUT_HW_MAX` and `CIN_MAX` still
+apply there.
+
+### Entropy coder
+
+`rc_geometry_test` at the new geometry: RC_NMODEL=4, RC_NSYM=64, **0 checks
+failed**, round trips exact including the 6-bit fields that straddle byte
+boundaries. Legacy profile: also 0 failed.
+
+## 8. Cycle count and latency
+
+The per-group service is measured as the gap between successive first-beats of
+a group, in steady state with no input starvation and no output stall:
+
+| geometry | model `group_service` | RTL measured | over |
+|---|---|---|---|
+| M=4 K=64, c_out 256, B=8 | 272 | **272.00, min 272, max 272** | 63 gaps |
+| M=8 K=16, c_out 128, B=4 | 136 | **136.00, min 136, max 136** | 63 gaps |
+
+**`GroupService(16,256,32) = 272` matches the RTL exactly.** The frozen
+`svc_model.pw_cyc_per_group` needed no adjustment.
+
+`2 x 136 = 272` exactly, which is why the two-pass split the audit costed was
+free in service terms: both forms are bound by the output drain
+`c_out + delta_ppu*B`, additive in both terms.
+
+For the 90x160 latent, 14,400 positions / 8 lanes = 1,800 groups:
+
+```
+272 cyc/group x 1,800 = 489,600 cycles = 4.8960 ms at 100 MHz
+```
+
+Complete per-frame cost, now a SINGLE invocation because COUT_MAX is 256:
+
+| component | ms | provenance |
+|---|---|---|
+| PL search | 4.8960 | RTL-confirmed 272 cyc/group |
+| driver bracket, one invocation | 0.3714 | measured (`T_VQ_RUN_P - T_VQ_ACC`) |
+| codebook + norm reload, 4,416 writes | 0.9530 | measured 0.21580 us/write |
+| run config, 7 writes | 0.0015 | measured |
+| **total** | **6.2219** | |
+
+against **6.5948 ms** for the two-pass arrangement the audit costed. Raising
+COUT_MAX saves 0.3729 ms/frame (5.65%) and 921,600 B/frame of DDR re-read.
+
+The entropy stage moves the other way: M drops 8 -> 4, so symbols per frame
+halve, 115,200 -> **57,600**, on a 64-symbol alphabet instead of 16. `T_RANGE`
+was measured at M=8/K=16 and does not carry over; it should fall, and must be
+re-measured on the board.
+
+Rate: `M * log2(K) = 24` bits per position, **0.375 bpp** at 1280x720, down
+from 0.500 bpp at M=8/K=16. The transport word stays 32 bits with the top byte
+structurally zero, so `idx_out` is still 57,600 B/frame and the S2MM length,
+cache ranges and 4-beats-per-group output count are unchanged.
+
+## 9. Synthesis
+
+**Tool caveat, stated first.** The authoritative numbers for this project come
+from Vivado 2020.2 on xc7z020clg484-1. That build is **not runnable here**: the
+2020.2 tree has no `bin/` directory, and the 2025.1 install that does work has
+no Zynq-7000 devices (artix7 / kintex7 / spartan7 / virtex7 only). So the runs
+below are out-of-context synthesis of the PW IP alone on **xc7a200tfbg484-1**,
+the nearest available 7-series part -- same CLB, same BRAM18/36, same DSP48E1,
+same 10 ns constraint.
+
+The DELTAS between configurations transfer; the ABSOLUTE numbers do not, and
+they are not the ones for the paper. A 2020.2 xc7z020 run is still required
+before any resource claim is published.
+
+Four configurations, so each change can be attributed separately:
+
+| | orig | base | cout | deploy |
+|---|---|---|---|---|
+| RTL | **as shipped** | new | new | new |
+| COUT_MAX | 240 | 240 | **256** | **256** |
+| VQ_K / NORM_D / SCORE_W | 16 / 128 / 20 | 16 / 128 / 20 | 16 / 128 / 20 | **64 / 256 / 21** |
+
+| resource | orig | base | cout | deploy | base−orig | cout−orig | deploy−orig |
+|---|---|---|---|---|---|---|---|
+| Slice LUTs | 11,680 | 11,682 | 11,684 | 11,270 | **+2** | **+4** | **−410** |
+| LUT as Logic | 11,599 | 11,601 | 11,603 | 11,133 | +2 | +4 | −466 |
+| LUT as Memory | 81 | 81 | 81 | 137 | 0 | 0 | **+56** |
+| Slice Registers | 12,571 | 12,600 | 12,598 | 12,543 | **+29** | +27 | **−28** |
+| Block RAM Tile | 46 | 46 | 46 | 46 | **0** | **0** | **0** |
+| RAMB36 / RAMB18 | 28 / 36 | 28 / 36 | 28 / 36 | 28 / 36 | 0 | 0 | 0 |
+| **DSP48E1** | **274** | **274** | **274** | **274** | **0** | **0** | **0** |
+| WNS (ns) | +1.915 | +1.883 | +1.883 | **+1.522** | −0.032 | −0.032 | −0.393 |
+
+Reading it:
+
+- **COUT_MAX 240 -> 256 costs +2 LUTs and nothing else.** Zero registers, zero
+  BRAM, zero DSP, zero timing. Exactly as predicted in §4: `W_AW` stays 11,
+  `PARAM_AW` stays 8, and both memories still fit one BRAM18 per bank. The
+  audit's claim that this ceiling is free was correct.
+- **DSP48E1 is unchanged at 274 in all four.** Raising COUT_MAX does not touch
+  DSP usage, and neither does the VQ change. `Q` is 32 throughout.
+- **BRAM is unchanged at 46 tiles in all four.** The norm ROM stays distributed
+  RAM (`ram_style = "distributed"`), which is where the +56 LUT-as-Memory comes
+  from: 128x20 -> 256x21 bits.
+- **The deployed configuration uses 410 FEWER LUTs than the shipped one.** Not
+  a typo and not an error budget -- the packing mux shrinks from eight 4-bit
+  fields per 32-bit word to four 6-bit fields per 24-bit word, on each of 8
+  lanes, and that saving exceeds the +56 LUTRAM the larger norm ROM costs. The
+  causal attribution is inference; the measurement is not.
+- **The guard costs 29 registers and 0.032 ns**, isolated by base−orig.
+- All four **meet** the 10 ns constraint. The deployed configuration keeps
+  **1.522 ns of slack, 15.2% of the period**, and its critical path is
+  `u_ppu/sel_shift_s2 -> u_ppu/inc3_pre_r` -- the pre-existing requantiser
+  rounding path, not anything added here.
+
+### The guard had to be pipelined, and that is worth recording
+
+The first implementation put the geometry check directly in the
+`start_in -> next-state` cone. It worked, and it was the **critical path of the
+entire IP**:
+
+| guard placement | WNS | critical path |
+|---|---|---|
+| none (shipped RTL) | +1.915 | `u_ppu` requantiser |
+| in the S_IDLE next-state cone | **−1.019** | `reg_cout_run -> FSM_sequential_st` |
+| registered, 1 stage, inferred DSP multiply | **−0.789** | `reg_cout_run -> cfg_bad_r` |
+| registered, 1 stage, multiply forced to LUTs | +0.446 | `reg_cin_run -> cfg_bad_r` |
+| registered, 2 stages (shipped here) | **+1.883** | `u_ppu` requantiser |
+
+Two separate causes. First, the window-fit test contains a multiply and Vivado
+inferred a **DSP48E1** for it -- roughly 2.9 ns of combinational DSP delay
+inside a control path -- fixed with `(* use_dsp = "no" *)` and by replacing the
+`ceil` divide with a plain shift by `$clog2(max(N_OC, VQ_K))`. Second, even as
+LUTs the comparison chain was long enough to bind, so it was split across two
+registered stages.
+
+The guard has no throughput role: it only has to be settled by the time
+`start_in` arrives, and the geometry registers are written over AXI-lite many
+transactions earlier. `a_cfg_decision_settled` asserts that rather than
+assuming it. Two cycles of latency there are free; a safety check eating the
+headroom of the datapath it protects would not have been.
+
+### Does it still fit xc7z020clg484-1?
+
+On the evidence here, **yes, with the same margin as the shipped build** -- but
+that is a delta argument, not a measurement on the part:
+
+- DSP is the binding resource on this device (the shipped design sits at
+  220/220), and **DSP usage does not change**. Not by raising COUT_MAX, not by
+  the VQ generalisation.
+- BRAM does not change.
+- LUTs go **down** by 410 in the IP, so the 34,358 (64.6%) of the shipped
+  full-design build does not grow.
+- Registers go down by 28.
+- Timing slack falls 0.393 ns out of 10 ns, from a path that is not the one
+  this change touched.
+
+What this does NOT establish is post-route timing on the real part with the
+real floorplan at 220/220 DSP. That needs the 2020.2 xc7z020 run, and until it
+is done the fit should be described as expected rather than demonstrated.

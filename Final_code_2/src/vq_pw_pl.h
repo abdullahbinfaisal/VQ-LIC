@@ -8,9 +8,14 @@
  * PW engine (commit 62cbfbc); axi_dma_2 now feeds pw_single_oc_axis_axi_0's
  * s_axis_vq and drains its m_axis_vq.
  *
- * CONFIGURATION (see vq_pw.h): M = 8 sub-codebooks, K = 16 codewords,
- * Dsub = 8, so one output-channel batch of Q = 32 holds TWO sub-codebooks and
- * four batches cover all eight. 32 bits per latent position, unchanged.
+ * CONFIGURATION (see vq_pw.h, VQPW_PROFILE):
+ *   DEPLOYED  M = 4, K = 64, Dsub = 16. K exceeds Q = 32, so ONE sub-codebook
+ *             spans TWO output-channel batches and eight batches cover all
+ *             four. c_out = 256, which needs COUT_MAX = 256 in the bitstream
+ *             (240 floors to 7 batches = 224 and the engine refuses).
+ *             24 bits per latent position, in a 32-bit transport word.
+ *   LEGACY    M = 8, K = 16, Dsub = 8. One batch holds TWO sub-codebooks,
+ *             c_out = 128, 32 bits per position. Kept as a regression mode.
  *
  * ------------------------------------------------------------------------
  * THREE THINGS THAT ARE NOT OBVIOUS FROM THE REGISTER MAP

@@ -4,7 +4,14 @@ module pw_single_oc_axis_axi #(
   parameter int DATA_WIDTH         = 8,
   parameter int ACC_WIDTH          = 24,  // 24b sufficient for INT8: max=240×127×255=7.76M < 2^23
   parameter int CIN_MAX            = 240,
-  parameter int COUT_MAX           = 240,
+  // COUT_MAX. This is the param-BRAM depth AND, via COUT_MAX/N_OC, the
+  // number of weight batches. The division FLOORS, so the real ceiling on
+  // c_out is (COUT_MAX/N_OC)*N_OC: at 240 with N_OC=32 that is 224 and the
+  // top 16 channels of the param BRAM are unreachable. 256 makes the two
+  // agree and is free -- W_AW stays $clog2(8*240)=11 and PARAM_AW stays
+  // $clog2(256)=8, so no port widens and no BRAM primitive grows (weights
+  // 1920x8 and bias 256x32 both still fit one BRAM18 per bank).
+  parameter int COUT_MAX           = 256,
   parameter int TILE_PIXELS_MAX    = 16384,
   parameter int IN_FIFO_DEPTH      = 2048,
   parameter int OUT_FIFO_DEPTH     = 4096,
@@ -14,6 +21,12 @@ module pw_single_oc_axis_axi #(
   // USE_PW_VQ: compile in PW-hosted vector quantisation. 0 = this IP is
   // exactly what it was before the feature existed. See vq_pw.h.
   parameter int USE_PW_VQ          = 0,
+  // ---- VQ geometry (see pw_pixel_major_core.sv for the derivation) ----
+  //   deployed M=4,K=64,Dm=16 : 64 / 256 / 21
+  //   legacy   M=8,K=16,Dm=8  : 16 / 128 / 20
+  parameter int VQ_K               = 64,
+  parameter int VQ_NORM_D          = 256,
+  parameter int VQ_SCORE_W         = 21,
   parameter int M_AXIS_DATA_WIDTH  = N_LANES * DATA_WIDTH,
 
   parameter integer C_S_AXI_DATA_WIDTH = 32,
@@ -99,12 +112,13 @@ module pw_single_oc_axis_axi #(
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_MULT        = 12'h018; // W: writes mult_bram[reg_param_addr]
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_SHIFT       = 12'h01C; // W: writes shift_bram[reg_param_addr]
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_STATUS2     = 12'h020; // R: sticky error flags
+                                                                        //    [5] = cfg_err: last start REFUSED
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_OC_SEL      = 12'h024; // RW: weight bank select (0..N_OC-1)
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_COUT_RUN    = 12'h028; // RW: total output channels
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_W_BRAM_OFF  = 12'h02C; // RW: base offset in weight BRAM
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_PARAM_ADDR  = 12'h030; // RW: address for bias/mult/shift BRAM writes
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_VQ_CTRL     = 12'h034; // RW: [0]=vq_mode, [23:12]=vq_cin_load  (USE_PW_VQ only)
-  localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_VQ_NORM     = 12'h038; // W: [6:0]=OC, [31:12]=||v_k||^2 (USE_PW_VQ only)
+  localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_VQ_NORM     = 12'h038; // W: [7:0]=OC, [31:12]=||v_k||^2 (USE_PW_VQ only)
   localparam logic [C_S_AXI_ADDR_WIDTH-1:0] ADDR_W_BASE      = 12'h100; // W: weight BRAM data at offset w_bram_off + idx
 
   // ============================================================
@@ -114,6 +128,7 @@ module pw_single_oc_axis_axi #(
   localparam int W_DEPTH      = W_OC_BATCHES * CIN_MAX;
   localparam int W_AW         = (W_DEPTH <= 1) ? 1 : $clog2(W_DEPTH);
   localparam int PARAM_AW     = (COUT_MAX <= 1) ? 1 : $clog2(COUT_MAX);
+  localparam int VQ_AW        = (VQ_NORM_D <= 1) ? 1 : $clog2(VQ_NORM_D);
 
   // ============================================================
   // AXI-Lite internals
@@ -186,8 +201,8 @@ module pw_single_oc_axis_axi #(
   end
 `endif
   logic        vq_norm_we;       // 1-cycle pulse on a write to ADDR_VQ_NORM
-  logic [6:0]  vq_norm_addr;
-  logic signed [19:0] vq_norm_data;
+  logic [VQ_AW-1:0]   vq_norm_addr;
+  logic signed [VQ_SCORE_W-1:0] vq_norm_data;
 
   logic        busy;
   logic        done_sticky;
@@ -206,6 +221,7 @@ module pw_single_oc_axis_axi #(
   logic        out_overflow_sticky;
   logic        out_underflow_sticky;
   logic        start_while_busy_sticky;
+  logic        cfg_err_sticky;
 
   wire [$clog2(N_OC>1?N_OC:2)-1:0] oc_wr_sel = reg_oc_sel[$clog2(N_OC>1?N_OC:2)-1:0];
 
@@ -447,8 +463,13 @@ module pw_single_oc_axis_axi #(
       vq_norm_we <= 1'b0;
     end else begin
       vq_norm_we   <= slv_reg_wren && (wr_addr == ADDR_VQ_NORM) && (USE_PW_VQ != 0);
-      vq_norm_addr <= s_axi_wdata[6:0];
-      vq_norm_data <= s_axi_wdata[31:12];
+      // Address widened 7 -> VQ_AW bits (8 at VQ_NORM_D=256). Backward
+      // compatible: addresses 0..127 decode exactly as before.
+      vq_norm_addr <= s_axi_wdata[VQ_AW-1:0];
+      // ||v_k||^2 stays a 20-bit field. It is non-negative and at most
+      // 16384*Dm = 262144 at Dm=16, which fits 20-bit signed with room;
+      // only the SCORE needed widening, so the register map is unchanged.
+      vq_norm_data <= VQ_SCORE_W'(signed'(s_axi_wdata[31:12]));
     end
   end
 
@@ -550,6 +571,7 @@ module pw_single_oc_axis_axi #(
       s_axi_rdata[2] = out_overflow_sticky;
       s_axi_rdata[3] = out_underflow_sticky;
       s_axi_rdata[4] = start_while_busy_sticky;
+      s_axi_rdata[5] = cfg_err_sticky;
     end
   end
 
@@ -571,6 +593,7 @@ module pw_single_oc_axis_axi #(
   // PW datapath instance
   // ============================================================
   logic pw_done_out;
+  logic pw_cfg_err;
 
   pw_single_oc_axis #(
     .DATA_WIDTH(DATA_WIDTH), .ACC_WIDTH(ACC_WIDTH), .CIN_MAX(CIN_MAX),
@@ -578,7 +601,8 @@ module pw_single_oc_axis_axi #(
     .IN_FIFO_DEPTH(IN_FIFO_DEPTH), .OUT_FIFO_DEPTH(OUT_FIFO_DEPTH),
     .S_AXIS_DATA_WIDTH(S_AXIS_DATA_WIDTH),
     .N_LANES(N_LANES), .N_OC(N_OC), .M_AXIS_DATA_WIDTH(M_AXIS_DATA_WIDTH),
-    .USE_PW_VQ(USE_PW_VQ)
+    .USE_PW_VQ(USE_PW_VQ),
+    .VQ_K(VQ_K), .VQ_NORM_D(VQ_NORM_D), .VQ_SCORE_W(VQ_SCORE_W)
   ) u_pw (
     .clk(s_axi_aclk), .rst_n(s_axi_aresetn),
     .start_in(start_pulse), .done_out(pw_done_out),
@@ -590,7 +614,7 @@ module pw_single_oc_axis_axi #(
     .vq_mode    ((USE_PW_VQ != 0) ? reg_vq_ctrl[0]     : 1'b0),
     .vq_cin_load((USE_PW_VQ != 0) ? reg_vq_ctrl[23:12] : 12'd0),
     .vq_norm_we(vq_norm_we), .vq_norm_addr(vq_norm_addr),
-    .vq_norm_data(vq_norm_data),
+    .vq_norm_data(vq_norm_data), .cfg_err(pw_cfg_err),
 
     // Weight BRAM read (from core)
     .w_rd_addr(core_w_rd_addr), .w_rd_en(core_w_rd_en),
@@ -641,6 +665,7 @@ module pw_single_oc_axis_axi #(
       out_overflow_sticky     <= 1'b0;
       out_underflow_sticky    <= 1'b0;
       start_while_busy_sticky <= 1'b0;
+      cfg_err_sticky          <= 1'b0;
     end else begin
       if (clear_err_pulse) begin
         in_overflow_sticky      <= 1'b0;
@@ -648,6 +673,7 @@ module pw_single_oc_axis_axi #(
         out_overflow_sticky     <= 1'b0;
         out_underflow_sticky    <= 1'b0;
         start_while_busy_sticky <= 1'b0;
+        cfg_err_sticky          <= 1'b0;
       end else begin
         if (in_overflow)
           in_overflow_sticky <= 1'b1;
@@ -660,6 +686,10 @@ module pw_single_oc_axis_axi #(
 
         if (slv_reg_wren && (wr_addr == ADDR_CTRL) && s_axi_wstrb[0] && s_axi_wdata[0] && busy)
           start_while_busy_sticky <= 1'b1;
+        // The core refused a start because the geometry would alias. This
+        // is the flag that replaces the SIMCOPY-only $error.
+        if (pw_cfg_err)
+          cfg_err_sticky <= 1'b1;
       end
     end
   end

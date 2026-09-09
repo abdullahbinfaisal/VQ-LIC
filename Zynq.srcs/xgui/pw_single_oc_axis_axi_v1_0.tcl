@@ -17,6 +17,14 @@ proc init_gui { IPINST } {
   ipgui::add_param $IPINST -name "M_AXIS_DATA_WIDTH"
   ipgui::add_param $IPINST -name "N_OC"
 
+  # VQ geometry. Ignored unless USE_PW_VQ is set. See pw_pixel_major_core.sv:
+  #   deployed M=4,K=64,Dsub=16 -> 64 / 256 / 21
+  #   legacy   M=8,K=16,Dsub=8  -> 16 / 128 / 20
+  # VQ_SCORE_W follows Dsub, not K: it must satisfy 2^(W-1) > 48896*Dsub.
+  ipgui::add_param $IPINST -name "VQ_K"
+  ipgui::add_param $IPINST -name "VQ_NORM_D"
+  ipgui::add_param $IPINST -name "VQ_SCORE_W"
+
 }
 
 proc update_PARAM_VALUE.ACC_WIDTH { PARAM_VALUE.ACC_WIDTH } {
@@ -136,6 +144,42 @@ proc validate_PARAM_VALUE.TILE_PIXELS_MAX { PARAM_VALUE.TILE_PIXELS_MAX } {
 	return true
 }
 
+proc update_PARAM_VALUE.VQ_K { PARAM_VALUE.VQ_K } {
+	# Procedure called to update VQ_K when any of the dependent parameters in the arguments change
+}
+
+proc validate_PARAM_VALUE.VQ_K { PARAM_VALUE.VQ_K } {
+	# Procedure called to validate VQ_K
+	return true
+}
+
+proc update_PARAM_VALUE.VQ_NORM_D { PARAM_VALUE.VQ_NORM_D } {
+	# Procedure called to update VQ_NORM_D when any of the dependent parameters in the arguments change
+}
+
+proc validate_PARAM_VALUE.VQ_NORM_D { PARAM_VALUE.VQ_NORM_D } {
+	# Procedure called to validate VQ_NORM_D
+	return true
+}
+
+proc update_PARAM_VALUE.VQ_SCORE_W { PARAM_VALUE.VQ_SCORE_W } {
+	# Procedure called to update VQ_SCORE_W when any of the dependent parameters in the arguments change
+}
+
+proc validate_PARAM_VALUE.VQ_SCORE_W { PARAM_VALUE.VQ_SCORE_W } {
+	# Procedure called to validate VQ_SCORE_W
+	return true
+}
+
+proc update_PARAM_VALUE.USE_PW_VQ { PARAM_VALUE.USE_PW_VQ } {
+	# Procedure called to update USE_PW_VQ when any of the dependent parameters in the arguments change
+}
+
+proc validate_PARAM_VALUE.USE_PW_VQ { PARAM_VALUE.USE_PW_VQ } {
+	# Procedure called to validate USE_PW_VQ
+	return true
+}
+
 
 proc update_MODELPARAM_VALUE.DATA_WIDTH { MODELPARAM_VALUE.DATA_WIDTH PARAM_VALUE.DATA_WIDTH } {
 	# Procedure called to set VHDL generic/Verilog parameter value(s) based on TCL parameter value
@@ -200,5 +244,25 @@ proc update_MODELPARAM_VALUE.N_OC { MODELPARAM_VALUE.N_OC PARAM_VALUE.N_OC } {
 proc update_MODELPARAM_VALUE.COUT_MAX { MODELPARAM_VALUE.COUT_MAX PARAM_VALUE.COUT_MAX } {
 	# Procedure called to set VHDL generic/Verilog parameter value(s) based on TCL parameter value
 	set_property value [get_property value ${PARAM_VALUE.COUT_MAX}] ${MODELPARAM_VALUE.COUT_MAX}
+}
+
+proc update_MODELPARAM_VALUE.VQ_K { MODELPARAM_VALUE.VQ_K PARAM_VALUE.VQ_K } {
+	# Procedure called to set VHDL generic/Verilog parameter value(s) based on TCL parameter value
+	set_property value [get_property value ${PARAM_VALUE.VQ_K}] ${MODELPARAM_VALUE.VQ_K}
+}
+
+proc update_MODELPARAM_VALUE.VQ_NORM_D { MODELPARAM_VALUE.VQ_NORM_D PARAM_VALUE.VQ_NORM_D } {
+	# Procedure called to set VHDL generic/Verilog parameter value(s) based on TCL parameter value
+	set_property value [get_property value ${PARAM_VALUE.VQ_NORM_D}] ${MODELPARAM_VALUE.VQ_NORM_D}
+}
+
+proc update_MODELPARAM_VALUE.VQ_SCORE_W { MODELPARAM_VALUE.VQ_SCORE_W PARAM_VALUE.VQ_SCORE_W } {
+	# Procedure called to set VHDL generic/Verilog parameter value(s) based on TCL parameter value
+	set_property value [get_property value ${PARAM_VALUE.VQ_SCORE_W}] ${MODELPARAM_VALUE.VQ_SCORE_W}
+}
+
+proc update_MODELPARAM_VALUE.USE_PW_VQ { MODELPARAM_VALUE.USE_PW_VQ PARAM_VALUE.USE_PW_VQ } {
+	# Procedure called to set VHDL generic/Verilog parameter value(s) based on TCL parameter value
+	set_property value [get_property value ${PARAM_VALUE.USE_PW_VQ}] ${MODELPARAM_VALUE.USE_PW_VQ}
 }
 

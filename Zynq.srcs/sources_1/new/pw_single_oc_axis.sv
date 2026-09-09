@@ -22,7 +22,11 @@ module pw_single_oc_axis #(
   parameter int S_AXIS_DATA_WIDTH = 32,
   parameter int N_LANES           = 16,
   parameter int N_OC              = 20,
-  parameter int M_AXIS_DATA_WIDTH = N_LANES * DATA_WIDTH
+  parameter int M_AXIS_DATA_WIDTH = N_LANES * DATA_WIDTH,
+  // ---- VQ geometry pass-through (see pw_pixel_major_core.sv) ----
+  parameter int VQ_K              = 64,
+  parameter int VQ_NORM_D         = 256,
+  parameter int VQ_SCORE_W        = 21
 )(
   input  logic                         clk,
   input  logic                         rst_n,
@@ -42,8 +46,9 @@ module pw_single_oc_axis #(
   input  logic                         vq_mode,
   input  logic [11:0]                  vq_cin_load,
   input  logic                         vq_norm_we,
-  input  logic [6:0]                   vq_norm_addr,
-  input  logic signed [19:0]           vq_norm_data,
+  input  logic [$clog2(VQ_NORM_D)-1:0] vq_norm_addr,
+  input  logic signed [VQ_SCORE_W-1:0] vq_norm_data,
+  output logic                         cfg_err,
 
   // Weight BRAM read interface (from AXI wrapper BRAMs)
   output logic [$clog2((COUT_MAX/N_OC)*CIN_MAX)-1:0] w_rd_addr,
@@ -322,6 +327,7 @@ module pw_single_oc_axis #(
 
   pw_pixel_major_core #(
     .USE_PW_VQ(USE_PW_VQ),
+    .VQ_K(VQ_K), .VQ_NORM_D(VQ_NORM_D), .VQ_SCORE_W(VQ_SCORE_W),
     .DATA_WIDTH(DATA_WIDTH), .ACC_WIDTH(ACC_WIDTH), .CIN_MAX(CIN_MAX),
     .COUT_MAX(COUT_MAX), .N_LANES(N_LANES), .N_OC(N_OC)
   ) u_core (
@@ -330,7 +336,7 @@ module pw_single_oc_axis #(
     .zp_in(zp_in), .zp_out(zp_out), .relu_en(relu_en),
     .vq_mode(vq_mode), .vq_cin_load(vq_cin_load),
     .vq_norm_we(vq_norm_we), .vq_norm_addr(vq_norm_addr),
-    .vq_norm_data(vq_norm_data),
+    .vq_norm_data(vq_norm_data), .cfg_err(cfg_err),
     .w_rd_addr(w_rd_addr), .w_rd_en(w_rd_en), .w_rd_data(w_rd_data),
     .param_rd_addr(param_rd_addr), .param_rd_en(param_rd_en),
     .param_bias_data(param_bias_data), .param_mult_data(param_mult_data),

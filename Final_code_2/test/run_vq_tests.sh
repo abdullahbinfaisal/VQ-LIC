@@ -1,0 +1,95 @@
+#!/bin/bash
+# ============================================================================
+# run_vq_tests.sh -- the whole VQ verification suite, both quantiser profiles.
+#
+#   ./run_vq_tests.sh          host-side tests only (gcc)
+#   ./run_vq_tests.sh --rtl    also the xsim benches (needs Vivado on PATH or
+#                              XILINX_VIVADO set)
+#
+# PROFILES. Everything is built twice, from ONE source each time:
+#   VQPW_PROFILE=1  DEPLOYED  M=4, K=64, Dsub=16   (default)
+#   VQPW_PROFILE=0  LEGACY    M=8, K=16, Dsub=8    (regression)
+# A change that breaks the legacy profile breaks the geometry the 2026-09-05
+# board run measured, so it is worth keeping green.
+# ============================================================================
+set -u
+cd "$(dirname "$0")"
+SRC=../src
+FAIL=0
+
+run() {  # run <label> <cmd...>
+  local label="$1"; shift
+  printf '%-46s ' "$label"
+  if out=$("$@" 2>&1); then
+    echo "$out" | grep -qE "RESULT: PASS|0 checks failed|0 failures" \
+      && echo "PASS" || { echo "PASS (no verdict line)"; }
+  else
+    echo "FAIL"; echo "$out" | tail -20; FAIL=1
+  fi
+}
+
+echo "=== host-side ==="
+for prof in 1 0; do
+  tag=$([ "$prof" = 1 ] && echo DEPLOYED || echo LEGACY)
+  gcc -O2 -Wall -I$SRC -DVQPW_PROFILE=$prof \
+      -o vq_pw_golden_$prof.exe vq_pw_golden_test.c $SRC/vq_pw.c || FAIL=1
+  run "golden model, $tag" ./vq_pw_golden_$prof.exe
+
+  gcc -O2 -Wall -Istub -I$SRC -DVQPW_PROFILE=$prof \
+      -o vq_pw_pl_prog_$prof.exe vq_pw_pl_prog_test.c \
+      $SRC/vq_pw_pl.c $SRC/vq_pw.c stub/stub_defs.c || FAIL=1
+  run "driver programming, $tag" ./vq_pw_pl_prog_$prof.exe
+
+  gcc -O2 -Wall -I$SRC -DVQPW_PROFILE=$prof \
+      -o rc_geom_$prof.exe rc_geometry_test.c $SRC/range_coder.c $SRC/vq_pw.c || FAIL=1
+  run "range coder geometry, $tag" ./rc_geom_$prof.exe
+done
+
+if [ "${1:-}" = "--rtl" ]; then
+  XB="${XILINX_VIVADO:-}"
+  [ -n "$XB" ] && XB="$XB/bin" || XB="$(dirname "$(command -v xvlog 2>/dev/null)" 2>/dev/null)"
+  if [ -z "$XB" ] || [ ! -x "$XB/xvlog" ]; then
+    echo; echo "xsim not found -- set XILINX_VIVADO or put xvlog on PATH"; exit 1
+  fi
+  # ABSOLUTE: the benches are elaborated inside a temp directory, so a
+  # relative path here would not resolve there.
+  RTL=$(cd ../../Zynq.srcs/sources_1/new && pwd)
+  D=$(mktemp -d); mkdir -p "$D/vq64" "$D/vq16"
+  gcc -O2 -I$SRC -o gen64.exe gen_vq_vectors.c $SRC/vq_pw.c
+  gcc -O2 -I$SRC -DVQPW_PROFILE=0 -o gen16.exe gen_vq_vectors.c $SRC/vq_pw.c
+  GEN64=$(pwd)/gen64.exe; GEN16=$(pwd)/gen16.exe
+  ( cd "$D" && "$GEN64" 64 0 vq64 >/dev/null )
+  echo; echo "=== RTL (xsim) ==="
+  ( cd "$D"
+    "$XB/xvlog" -sv --nolog "$RTL/pw_pixel_major_core.sv" "$RTL/ppu.sv" \
+        "$RTL/pw_single_oc_axis.sv" "$RTL/pw_single_oc_axis_axi.sv" \
+        "$RTL/tb_pw_vq.sv" "$RTL/tb_pw_vq_guard.sv" "$RTL/tb_pw_axi_vq.sv" \
+        > xvlog.txt 2>&1 ) || { echo "xvlog failed"; tail -20 "$D/xvlog.txt"; exit 1; }
+  for sc in 0 1 2; do
+    ( cd "$D" && "$GEN64" 64 $sc vq64 >/dev/null \
+                && "$GEN16" 64 $sc vq16 >/dev/null )
+    for top in tb_pw_vq tb_pw_vq_legacy tb_pw_axi_vq tb_pw_axi_vq_legacy; do
+      ( cd "$D"
+        "$XB/xelab" --nolog -debug off -O2 -L xpm "$top" -s "s_$top" >/dev/null 2>&1
+        "$XB/xsim" --nolog "s_$top" -runall > "o_$top.txt" 2>&1 )
+      printf '%-46s ' "scenario $sc, $top"
+      if grep -q "RESULT: PASS" "$D/o_$top.txt"; then
+        echo "PASS  $(grep -oE 'cycles/group: mean [0-9.]+' "$D/o_$top.txt")"
+      else
+        echo "FAIL"; tail -20 "$D/o_$top.txt"; FAIL=1
+      fi
+    done
+  done
+  ( cd "$D"
+    "$XB/xelab" --nolog -debug off -O2 -L xpm tb_pw_vq_guard -s s_guard >/dev/null 2>&1
+    "$XB/xsim" --nolog s_guard -runall > o_guard.txt 2>&1 )
+  printf '%-46s ' "configuration guard"
+  grep -q "0 failures" "$D/o_guard.txt" \
+    && echo "PASS  $(grep -oE '[0-9]+ cases' "$D/o_guard.txt")" \
+    || { echo "FAIL"; tail -25 "$D/o_guard.txt"; FAIL=1; }
+  rm -rf "$D"
+fi
+
+echo
+[ $FAIL -eq 0 ] && echo "ALL PASS" || echo "SOMETHING FAILED"
+exit $FAIL

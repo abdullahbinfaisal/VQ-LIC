@@ -1046,11 +1046,26 @@
       <spirit:modelParameter spirit:dataType="int">
         <spirit:name>COUT_MAX</spirit:name>
         <spirit:displayName>Cout Max</spirit:displayName>
-        <spirit:value spirit:format="long" spirit:resolve="generated" spirit:id="MODELPARAM_VALUE.COUT_MAX">240</spirit:value>
+        <spirit:value spirit:format="long" spirit:resolve="generated" spirit:id="MODELPARAM_VALUE.COUT_MAX">256</spirit:value>
       </spirit:modelParameter>
       <spirit:modelParameter spirit:dataType="int">
         <spirit:name>USE_PW_VQ</spirit:name>
         <spirit:value spirit:format="long" spirit:resolve="generated" spirit:id="MODELPARAM_VALUE.USE_PW_VQ">0</spirit:value>
+      </spirit:modelParameter>
+      <spirit:modelParameter spirit:dataType="int">
+        <spirit:name>VQ_K</spirit:name>
+        <spirit:displayName>Vq K</spirit:displayName>
+        <spirit:value spirit:format="long" spirit:resolve="generated" spirit:id="MODELPARAM_VALUE.VQ_K">64</spirit:value>
+      </spirit:modelParameter>
+      <spirit:modelParameter spirit:dataType="int">
+        <spirit:name>VQ_NORM_D</spirit:name>
+        <spirit:displayName>Vq Norm D</spirit:displayName>
+        <spirit:value spirit:format="long" spirit:resolve="generated" spirit:id="MODELPARAM_VALUE.VQ_NORM_D">256</spirit:value>
+      </spirit:modelParameter>
+      <spirit:modelParameter spirit:dataType="int">
+        <spirit:name>VQ_SCORE_W</spirit:name>
+        <spirit:displayName>Vq Score W</spirit:displayName>
+        <spirit:value spirit:format="long" spirit:resolve="generated" spirit:id="MODELPARAM_VALUE.VQ_SCORE_W">21</spirit:value>
       </spirit:modelParameter>
     </spirit:modelParameters>
   </spirit:model>
@@ -1189,11 +1204,26 @@
     <spirit:parameter>
       <spirit:name>COUT_MAX</spirit:name>
       <spirit:displayName>Cout Max</spirit:displayName>
-      <spirit:value spirit:format="long" spirit:resolve="user" spirit:id="PARAM_VALUE.COUT_MAX">240</spirit:value>
+      <spirit:value spirit:format="long" spirit:resolve="user" spirit:id="PARAM_VALUE.COUT_MAX">256</spirit:value>
     </spirit:parameter>
     <spirit:parameter>
       <spirit:name>USE_PW_VQ</spirit:name>
       <spirit:value spirit:format="long" spirit:resolve="user" spirit:id="PARAM_VALUE.USE_PW_VQ">0</spirit:value>
+    </spirit:parameter>
+    <spirit:parameter>
+      <spirit:name>VQ_K</spirit:name>
+      <spirit:displayName>Vq K</spirit:displayName>
+      <spirit:value spirit:format="long" spirit:resolve="user" spirit:id="PARAM_VALUE.VQ_K">64</spirit:value>
+    </spirit:parameter>
+    <spirit:parameter>
+      <spirit:name>VQ_NORM_D</spirit:name>
+      <spirit:displayName>Vq Norm D</spirit:displayName>
+      <spirit:value spirit:format="long" spirit:resolve="user" spirit:id="PARAM_VALUE.VQ_NORM_D">256</spirit:value>
+    </spirit:parameter>
+    <spirit:parameter>
+      <spirit:name>VQ_SCORE_W</spirit:name>
+      <spirit:displayName>Vq Score W</spirit:displayName>
+      <spirit:value spirit:format="long" spirit:resolve="user" spirit:id="PARAM_VALUE.VQ_SCORE_W">21</spirit:value>
     </spirit:parameter>
   </spirit:parameters>
   <spirit:vendorExtensions>

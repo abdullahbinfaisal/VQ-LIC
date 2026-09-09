@@ -63,11 +63,14 @@
 //                       the previously published rate numbers stay
 //                       reproducible from this source.
 //
-// THE SYMBOL COUNT DOUBLES. 14,400 positions x 8 models = 115,200 symbols per
-// frame against 57,600 before, on a 16-symbol alphabet instead of 256. The
-// configuration that made the VQ search 8x cheaper makes the entropy stage
-// code twice as many symbols, and T_RANGE must be re-measured rather than
-// carried over. That trade is the point of measuring it.
+// THE SYMBOL COUNT FOLLOWS M, NOT K. At the LEGACY M=8/K=16 it was 14,400
+// positions x 8 models = 115,200 symbols per frame on a 16-symbol alphabet,
+// twice the 57,600 the dedicated M=4/K=256 engine produced. At the DEPLOYED
+// M=4/K=64 it is back to 14,400 x 4 = 57,600, on a 64-symbol alphabet.
+//
+// So the deployed quantiser HALVES the entropy-stage symbol count relative to
+// the legacy one. T_RANGE was measured at M=8/K=16 and does NOT carry over --
+// it must be re-measured, and it should fall.
 // ---------------------------------------------------------------------------
 #ifndef RC_GEOMETRY_PW
 #define RC_GEOMETRY_PW 1
@@ -128,26 +131,49 @@ typedef struct {
 // are read and written here so every loop below stays layout-agnostic.
 //
 // Packing (vq_pw.c): one 32-bit little-endian word per position, sub-codebook
-// m in bits [4m+3:4m]. So byte j holds model 2j in its low nibble and model
-// 2j+1 in its high nibble.
+// m in bits [KW*m + KW-1 : KW*m], KW = log2(K).
+//
+//   KW = 4 (M=8,K=16) : byte j holds model 2j low, model 2j+1 high. Fields do
+//                       not straddle bytes, so the single-byte path below is
+//                       exact -- and it is the path the measured T_RANGE was
+//                       taken on, so it is kept rather than generalised away.
+//   KW = 6 (M=4,K=64) : fields DO straddle bytes (model 1 is bits 6..11), so
+//                       the word must be assembled before shifting.
+//
+// RC_NSYM = VQPW_K = 64 <= 256, so the uint8_t symbol path still holds; the
+// alphabet grows but the per-frame symbol COUNT halves, 14,400*4 = 57,600
+// against 115,200 at K=16.
 static inline uint8_t rc_get_sym(const uint8_t *idx, int pos, int m)
 {
-#if RC_GEOMETRY_PW
+#if !RC_GEOMETRY_PW
+    return idx[(size_t)pos * RC_NMODEL + (size_t)m];
+#elif VQPW_KW == 4
     const uint8_t b = idx[(size_t)pos * 4 + (size_t)(m >> 1)];
     return (uint8_t)((m & 1) ? (b >> 4) : (b & 0x0Fu));
 #else
-    return idx[(size_t)pos * RC_NMODEL + (size_t)m];
+    const uint8_t *p = idx + (size_t)pos * 4;
+    const uint32_t w = (uint32_t)p[0]        | ((uint32_t)p[1] <<  8)
+                     | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    return (uint8_t)((w >> (VQPW_KW * m)) & VQPW_KMASK);
 #endif
 }
 
 static inline void rc_put_sym(uint8_t *idx, int pos, int m, uint8_t sym)
 {
-#if RC_GEOMETRY_PW
+#if !RC_GEOMETRY_PW
+    idx[(size_t)pos * RC_NMODEL + (size_t)m] = sym;
+#elif VQPW_KW == 4
     uint8_t *b = &idx[(size_t)pos * 4 + (size_t)(m >> 1)];
     *b = (uint8_t)((m & 1) ? ((*b & 0x0Fu) | (uint8_t)((sym & 0x0Fu) << 4))
                            : ((*b & 0xF0u) | (uint8_t)(sym & 0x0Fu)));
 #else
-    idx[(size_t)pos * RC_NMODEL + (size_t)m] = sym;
+    uint8_t *p = idx + (size_t)pos * 4;
+    uint32_t w = (uint32_t)p[0]        | ((uint32_t)p[1] <<  8)
+               | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+    w &= ~(VQPW_KMASK << (VQPW_KW * m));
+    w |= ((uint32_t)sym & VQPW_KMASK) << (VQPW_KW * m);
+    p[0] = (uint8_t)(w      ); p[1] = (uint8_t)(w >>  8);
+    p[2] = (uint8_t)(w >> 16); p[3] = (uint8_t)(w >> 24);
 #endif
 }
 

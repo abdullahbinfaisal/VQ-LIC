@@ -33,8 +33,14 @@
 #define PW_REG_OC_SEL       0x024u
 #define PW_REG_COUT_RUN     0x028u
 #define PW_REG_W_BRAM_OFF   0x02Cu
+#define PW_REG_STATUS2      0x020u   /* [5]=cfg_err, last start REFUSED  */
 #define PW_REG_VQ_CTRL      0x034u   /* [0]=vq_mode, [23:12]=vq_cin_load */
-#define PW_REG_VQ_NORM      0x038u   /* [6:0]=abs OC, [31:12]=||v_k||^2  */
+#define PW_REG_VQ_NORM      0x038u   /* [7:0]=abs OC, [31:12]=||v_k||^2  */
+
+/* Sticky bit the core raises instead of running a geometry it would alias.
+ * Read it after every start -- it is the only signal that the engine refused
+ * the run, and a refused run still pulses done. */
+#define PW_STATUS2_CFG_ERR  (1u << 5)
 #define PW_REG_W_BASE       0x100u
 
 #define LATENT_BYTES  ((uint32_t)VQPW_NGROUPS * VQPW_DIM * VQPW_LANES)  /* 921,600 */
@@ -57,8 +63,10 @@ static double s_run_ms  = -1.0;
 static unsigned long long s_t_start = 0;
 
 static vqpw_ctx_t s_ctx;
-static int8_t     s_wimg[VQPW_W_BYTES];        /* 2,048 B block-diagonal image */
-static int32_t    s_nimg[VQPW_COUT_TOTAL];     /* 128 codeword norms           */
+/* 4,096 B at M=4,K=64,Dsub=16 (no structural zeros); 2,048 B block-diagonal at
+ * the legacy M=8,K=16,Dsub=8. Both sized from vq_pw.h, not written out here. */
+static int8_t     s_wimg[VQPW_W_BYTES];
+static int32_t    s_nimg[VQPW_COUT_TOTAL];     /* 256 or 128 codeword norms */
 
 double vq_pw_pl_last_prog_ms(void) { return s_prog_ms; }
 double vq_pw_pl_last_run_ms(void)  { return s_run_ms;  }
@@ -87,6 +95,23 @@ int vq_pw_pl_init(void)
 
     // Leave VQ mode off so a convolution run is never surprised by it.
     pw_w(PW_REG_VQ_CTRL, 0u);
+
+    // The derived geometry must be self-consistent before anything is
+    // programmed. This catches a VQPW_PROFILE edit that compiled but cannot
+    // be executed -- e.g. a c_out beyond the weight batches the IP has.
+    {
+        const int rc = vqpw_check_build();
+        if (rc != 0) {
+            xil_printf("[VQPW] build geometry invalid, vqpw_check_build=%d\r\n", rc);
+            return -3;
+        }
+    }
+    xil_printf("[VQPW] M=%u K=%u Dsub=%u cin_mac=%u cout=%u batches=%u "
+               "score=%ub bits/pos=%u\r\n",
+               (unsigned)VQPW_M, (unsigned)VQPW_K, (unsigned)VQPW_DSUB,
+               (unsigned)VQPW_CIN_MAC, (unsigned)VQPW_COUT_TOTAL,
+               (unsigned)VQPW_NBATCH, (unsigned)VQPW_SCORE_BITS,
+               (unsigned)VQPW_BITS_PER_POS);
     return 0;
 }
 
@@ -115,11 +140,13 @@ int vq_pw_pl_load_codebook(const int8_t *cb, uint8_t zp)
         }
     }
 
-    // Codeword norms, absolute OC order: [6:0] = OC, [31:12] = ||v_k||^2.
-    // 20 bits signed; the width is derived in vq_pw.c, not assumed.
+    // Codeword norms, absolute OC order: [7:0] = OC, [31:12] = ||v_k||^2.
+    // The ADDRESS field widened 7 -> 8 bits so 256 norms are reachable; the
+    // DATA field is still 20 bits signed, which is enough because ||v_k||^2 is
+    // at most 16384*Dsub = 262,144 at Dsub = 16. Only the SCORE needed 21 bits.
     for (int i = 0; i < VQPW_COUT_TOTAL; i++) {
         const uint32_t n = ((uint32_t)s_nimg[i] & 0xFFFFFu) << 12;
-        pw_w(PW_REG_VQ_NORM, n | (uint32_t)(i & 0x7F));
+        pw_w(PW_REG_VQ_NORM, n | (uint32_t)(i & 0xFF));
     }
 
     s_prog_ms = ep_cycles_to_ms(ep_timer_now() - t0);
@@ -146,8 +173,8 @@ int vq_pw_pl_start(const void *latent, void *idx_out)
     // number of channels streamed -- that is vq_cin_load, which is the whole
     // 64-channel latent vector read once per group.
     pw_w(PW_REG_TILE_PIXELS, (uint32_t)VQPW_NPOS);
-    pw_w(PW_REG_CIN_RUN,     (uint32_t)VQPW_CIN_MAC);      /* 16  */
-    pw_w(PW_REG_COUT_RUN,    (uint32_t)VQPW_COUT_TOTAL);   /* 128 */
+    pw_w(PW_REG_CIN_RUN,     (uint32_t)VQPW_CIN_MAC);      /* 16       */
+    pw_w(PW_REG_COUT_RUN,    (uint32_t)VQPW_COUT_TOTAL);   /* 256 or 128 */
     pw_w(PW_REG_ZP_RELU,     0x00008080u);                 /* zp_in = zp_out = 128, relu off */
 
     // VQ mode on. This also switches the engine onto the s_axis_vq/m_axis_vq
@@ -157,6 +184,19 @@ int vq_pw_pl_start(const void *latent, void *idx_out)
     // START. This RESETS the input FIFO -- see note 1 in the header. Nothing
     // may be in flight yet.
     pw_w(PW_REG_CTRL, 0x1u);
+
+    // The core validates the geometry at start and REFUSES an aliasing one.
+    // A refused run still pulses done, so without this check the frame would
+    // come back as whatever the buffer already held. Cheap: one AXI read.
+    if (pw_r(PW_REG_STATUS2) & PW_STATUS2_CFG_ERR) {
+        xil_printf("[VQPW] engine REFUSED the geometry: cin=%u cout=%u "
+                   "cin_load=%u -- check VQ_K / VQ_NORM_D / COUT_MAX in the "
+                   "bitstream against VQPW_PROFILE\r\n",
+                   (unsigned)VQPW_CIN_MAC, (unsigned)VQPW_COUT_TOTAL,
+                   (unsigned)VQPW_CIN_LOAD);
+        pw_w(PW_REG_VQ_CTRL, 0u);
+        return -1;
+    }
 
     // Only now arm the DMA. S2MM first so the sink is ready before the source
     // produces; writing LENGTH is what actually starts each channel.

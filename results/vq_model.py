@@ -23,6 +23,13 @@ numbers MEAN:
 
 The block-diagonal packing is the only reason K < Q helps: with K=16 and
 Q=32 two sub-codebooks ride in one batch, so M=8 needs 4 batches, not 8.
+
+DEPLOYED (2026-09-09): M=4, K=64, Dsub=16. K now EXCEEDS Q, so one
+sub-codebook spans two batches, cout_total = 256 and B = 8. The per-group cost
+272 is CONFIRMED AGAINST THE RTL, not only modelled -- tb_pw_vq reports
+272.00 cycles/group, min 272, max 272, over 63 gaps. The legacy M=8/K=16 point
+reports 136, and 2*136 = 272 exactly, because both are bound by the output
+drain term c_out + delta_ppu*B, which is additive in both c_out and B.
 """
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -70,9 +77,10 @@ if __name__ == "__main__":
     print("VQ on the SHARED PW engine (L=%d, Q=%d, %.0f MHz, %d positions)"
           % (L, Q_DEFAULT, F_CLK / 1e6, NPOS))
     print()
-    print("SELECTED and OLD configurations, both on the NEW shared engine:")
-    report(8, 16, label="SELECTED  M=8  K=16")
-    report(4, 256, label="OLD       M=4  K=256")
+    print("DEPLOYED, superseded and legacy configurations on the shared engine:")
+    report(4, 64,  label="DEPLOYED  M=4  K=64")
+    report(8, 16,  label="legacy    M=8  K=16")
+    report(4, 256, label="original  M=4  K=256")
     print()
     print("Full M,K grid at 32 bits/position (M*log2(K) == 32) -- the")
     print("iso-rate family the selected point was chosen from:")

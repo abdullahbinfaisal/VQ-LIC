@@ -10,7 +10,24 @@ module pw_pixel_major_core #(
   // USE_PW_VQ: compile in the PW-hosted vector-quantisation mode. 0 = the
   // engine is exactly what it was before this feature existed (see the
   // bit-identity note at the vq_mode_r declaration below).
-  parameter int USE_PW_VQ        = 0
+  parameter int USE_PW_VQ        = 0,
+
+  // ---- VQ geometry (ignored unless USE_PW_VQ != 0) -------------------------
+  // VQ_K       codewords per sub-codebook. Power of two. The argmin runs over
+  //            exactly VQ_K consecutive output channels.
+  // VQ_NORM_D  codeword-norm ROM depth = the largest M*K this build supports,
+  //            and therefore the largest c_out VQ mode accepts. Power of two.
+  // VQ_SCORE_W signed width of ||v_k||^2 - 2*acc. See the bound derivation at
+  //            the VQ branch below; it is a function of Dm, NOT of K.
+  //
+  // Deployed  M=4, K=64, Dm=16 : VQ_K=64,  VQ_NORM_D=256, VQ_SCORE_W=21
+  // Legacy    M=8, K=16, Dm=8  : VQ_K=16,  VQ_NORM_D=128, VQ_SCORE_W=20
+  //
+  // Nothing outside the G_VQ generate block reads these, so a conv-only build
+  // is unaffected by their value.
+  parameter int VQ_K             = 64,
+  parameter int VQ_NORM_D        = 256,
+  parameter int VQ_SCORE_W       = 21
 )(
   input  logic                              clk,
   input  logic                              rst_n,
@@ -37,8 +54,13 @@ module pw_pixel_major_core #(
   // A dedicated ROM, NOT the param-BRAM bias path: see the note at the VQ
   // branch below for why the bias path is unsafe for the last OC of a batch.
   input  logic                              vq_norm_we,
-  input  logic [6:0]                        vq_norm_addr,
-  input  logic signed [19:0]                vq_norm_data,
+  input  logic [$clog2(VQ_NORM_D)-1:0]      vq_norm_addr,
+  input  logic signed [VQ_SCORE_W-1:0]      vq_norm_data,
+
+  // Sticky configuration-error flag. Set for one run whenever start_in is
+  // taken with a geometry this build cannot execute, INSTEAD of running and
+  // aliasing silently. Cleared by the next legal start. See S_IDLE.
+  output logic                              cfg_err,
 
   // Weight BRAM read interface (all N_OC banks, 1-cycle latency)
   output logic [$clog2((COUT_MAX/N_OC)*CIN_MAX)-1:0] w_rd_addr,
@@ -75,6 +97,26 @@ module pw_pixel_major_core #(
   localparam int PARAM_AW     = (COUT_MAX <= 1) ? 1 : $clog2(COUT_MAX);
   localparam int PB_WIDTH     = N_LANES * DATA_WIDTH;
 
+  // Largest c_out this build can actually execute. COUT_MAX is the param BRAM
+  // depth, but the weight BRAM holds only W_OC_BATCHES = COUT_MAX/N_OC batches
+  // and that division FLOORS: at COUT_MAX=240, N_OC=32 the real ceiling is 224,
+  // not 240. Programming cout_run in (225..240) used to alias silently; the
+  // S_IDLE guard below now refuses it.
+  localparam int COUT_HW_MAX  = (COUT_MAX / N_OC) * N_OC;
+
+  // ---- VQ derived geometry (elaboration-time; unused at USE_PW_VQ = 0) ----
+  localparam int VQ_KW   = (VQ_K      <= 1) ? 1 : $clog2(VQ_K);       // index bits
+  localparam int VQ_AW   = (VQ_NORM_D <= 1) ? 1 : $clog2(VQ_NORM_D);  // norm addr bits
+  localparam int VQ_MW   = (VQ_AW > VQ_KW) ? (VQ_AW - VQ_KW) : 1;     // sub-codebook bits
+  localparam int VQ_OCW  = (N_OC      <= 1) ? 1 : $clog2(N_OC);       // oc-in-batch bits
+  localparam int VQ_BW   = (VQ_AW > VQ_OCW) ? (VQ_AW - VQ_OCW) : 1;   // batch bits used
+  // Batches spanned by ONE sub-codebook. K <= N_OC packs whole sub-codebooks
+  // into a batch (legacy, block-diagonal); K > N_OC spreads one sub-codebook
+  // across several batches (deployed K=64 at N_OC=32 -> 2).
+  localparam int VQ_BPS  = (VQ_K > N_OC) ? (VQ_K / N_OC) : 1;
+  localparam int VQ_BPSW = (VQ_BPS <= 1) ? 1 : $clog2(VQ_BPS);
+  localparam int VQ_BPS_SH = (VQ_BPS <= 1) ? 0 : $clog2(VQ_BPS);  // shift, not width
+
   // Registered at start - removes division from critical path
   logic [31:0] tile_groups_r;
   // ============================================================
@@ -102,6 +144,21 @@ module pw_pixel_major_core #(
   // stripped. Conv mode cannot change; there is no path by which it could.
   logic                vq_mode_r;
   logic [11:0]         vq_cin_load_r;
+  // Highest sub-codebook index this RUN uses: cout_run/VQ_K - 1. Latched at
+  // start so a run with fewer sub-codebooks than the build supports still
+  // emits its word at the right moment.
+  logic [11:0]         vq_m_last_r;
+  // pb_ram READ window base in VQ mode. This USED to be w_addr_base, and at
+  // K <= N_OC the two coincide -- every batch opens a new input window. At
+  // K > N_OC they DIVERGE: the weight address must advance every batch (each
+  // batch holds different codewords) while the activation window must hold
+  // still for VQ_BPS batches (those codewords all belong to one sub-codebook,
+  // so they all read the same Dm input dimensions). One shared counter cannot
+  // do both, so VQ mode gets its own.
+  //
+  //   K=16, N_OC=32, VQ_BPS=1 : steps every batch  -> 0,16,32,...  as before
+  //   K=64, N_OC=32, VQ_BPS=2 : steps every 2nd    -> 0,0,16,16,32,32,48,48
+  logic [PB_AW-1:0]    vq_pb_base;
 
   logic [11:0] cout_batches_r;
   // PARTIAL-BATCH DRAIN (2026-08-07). Previously the drain always issued N_OC
@@ -606,7 +663,27 @@ module pw_pixel_major_core #(
   // the PPU still runs and its results are simply discarded by the output mux;
   // in conv mode this whole block loses its readers and is stripped.
   //
-  //   score_k = ||v_k||^2 - 2*acc_k        20 bits signed (derived in vq_pw.c)
+  //   score_k = ||v_k||^2 - 2*acc_k        VQ_SCORE_W bits signed
+  //
+  // SCORE DYNAMIC RANGE -- the bound is a function of Dm, not of K.
+  //   Both u = zq - 128 and v = cq - 128 lie in [-128, +127]. Per dimension
+  //       score contribution = v^2 - 2*u*v
+  //   is maximised at u = +127, v = -128:  16384 + 2*127*128 = 48896
+  //   and minimised at v = u = -128:       16384 - 2*16384   = -16384.
+  //   Over Dm dimensions, therefore
+  //       score in [ -16384*Dm , +48896*Dm ]
+  //   and a signed N-bit register needs 2^(N-1) > 48896*Dm.
+  //
+  //       Dm =  8 (legacy M=8,K=16) : max  391168 -> 2^19 = 524288  -> N = 20
+  //       Dm = 16 (deployed M=4,K=64): max  782336 -> 2^20 = 1048576 -> N = 21
+  //
+  //   Dm = 16 OVERFLOWS the old 20-bit width, which is why VQ_SCORE_W is now a
+  //   parameter. The a_vq_score_fits assertion below checks the bound on every
+  //   single compare in simulation, so a wrong VQ_SCORE_W is loud, not silent.
+  //
+  //   ||v_k||^2 itself is 0 .. 16384*Dm = 262144 at Dm=16, which still fits the
+  //   20-bit AXI norm field; only the score needed widening. The 24-bit
+  //   accumulator holds |acc| <= 16384*Dm = 262144 with 5 bits to spare.
   //
   // WHY A DEDICATED NORM ROM AND NOT THE PARAM-BRAM BIAS PATH
   //   The obvious reuse is to carry ||v_k||^2 on ppu_bias_q, which is already
@@ -615,10 +692,26 @@ module pw_pixel_major_core #(
   //   (ppu_issue_idx + 1) < ppu_drain_len, so the LAST OC of every batch is
   //   presented with the SECOND-TO-LAST OC's bias. Convolution has never
   //   noticed because this project programs bias == 0 for every channel
-  //   (surr_fill_dummy_params), but VQ would silently mis-score k = 15 of
-  //   every sub-codebook. Rather than modify the validated drain FSM, the VQ
-  //   branch carries its own 128-entry norm ROM. 128 x 20 bits is distributed
-  //   RAM; the drain FSM is untouched.
+  //   (surr_fill_dummy_params), but VQ would silently mis-score the last
+  //   codeword of every sub-codebook. Rather than modify the validated drain
+  //   FSM, the VQ branch carries its own norm ROM, VQ_NORM_D x VQ_SCORE_W bits
+  //   of distributed RAM; the drain FSM is untouched.
+  //
+  // CODEWORD / SUB-CODEBOOK INDEXING -- one expression covers both geometries.
+  //   Let abs = the ABSOLUTE output channel of the value being scored,
+  //       abs = batch * N_OC + oc.
+  //   Then, for any power-of-two K,
+  //       k = abs mod K = abs[VQ_KW-1:0]        the codeword within its sub-codebook
+  //       m = abs div K = abs[VQ_AW-1:VQ_KW]    which sub-codebook
+  //   The argmin therefore resets exactly every K issues and commits on the
+  //   last of them, at ANY K -- no separate "half" bit, no K=16 special case.
+  //
+  //   K = 16, N_OC = 32 : k = abs[3:0] = oc[3:0], m = {batch[1:0], oc[4]}
+  //                       -- character-for-character the old vq_k / vq_m.
+  //   K = 64, N_OC = 32 : k = abs[5:0] = {batch[0], oc[4:0]}, m = batch[2:1]
+  //                       -- one sub-codebook now spans TWO batches, and the
+  //                       running best survives the batch boundary because
+  //                       nothing but vq_first clears it.
   //
   // OC/BATCH SHADOWS
   //   ppu_valid_in and ppu_acc_in are REGISTERED at issue, and ppu_issue_idx
@@ -632,11 +725,11 @@ module pw_pixel_major_core #(
   // TIES: strict less-than keeps the LOWEST codeword index, matching
   // vqpw_search_sub() and the retired vq_engine.sv comparator.
   // ============================================================
-  localparam int VQ_K       = 16;
-  localparam int VQ_KW      = 4;
-  localparam int VQ_SCORE_W = 20;
-  localparam int VQ_NORM_D  = 128;
   localparam int VQ_BEATS   = N_LANES / 2;   // two 32-bit positions per beat
+  // Bits of index actually carried per position: M * VQ_KW, where the build's
+  // maximum M is VQ_NORM_D/VQ_K. K=16,M=8 -> 32 (full word); K=64,M=4 -> 24,
+  // and the top 8 bits of the 32-bit transport word are held at zero.
+  localparam int VQ_WORD_W  = VQ_KW * (VQ_NORM_D / VQ_K);
 
   logic [N_LANES*DATA_WIDTH-1:0] vq_pixel_out;
   logic                          vq_valid_out;
@@ -659,14 +752,16 @@ module pw_pixel_major_core #(
 
     (* ram_style = "distributed" *) logic signed [VQ_SCORE_W-1:0] vq_norm [0:VQ_NORM_D-1];
     always_ff @(posedge clk) if (vq_norm_we) vq_norm[vq_norm_addr] <= vq_norm_data;
-    wire [6:0] vq_norm_ra = {vq_batch_r[1:0], vq_oc_r[4:0]};
-    wire signed [VQ_SCORE_W-1:0] vq_norm_q = vq_norm[vq_norm_ra];
 
-    wire [VQ_KW-1:0] vq_k     = vq_oc_r[VQ_KW-1:0];
-    wire             vq_half  = vq_oc_r[VQ_KW];
+    // Absolute output channel = batch*N_OC + oc. N_OC is a power of two in
+    // every build this IP is used in, so the multiply is a concatenation.
+    wire [VQ_AW-1:0] vq_abs   = {vq_batch_r[VQ_BW-1:0], vq_oc_r[VQ_OCW-1:0]};
+    wire signed [VQ_SCORE_W-1:0] vq_norm_q = vq_norm[vq_abs];
+
+    wire [VQ_KW-1:0] vq_k     = vq_abs[VQ_KW-1:0];
+    wire [VQ_MW-1:0] vq_m     = vq_abs[VQ_AW-1:VQ_KW];
     wire             vq_first = (vq_k == {VQ_KW{1'b0}});
     wire             vq_lastk = (vq_k == {VQ_KW{1'b1}});
-    wire [2:0]       vq_m     = {vq_batch_r[1:0], vq_half};
     wire             vq_go    = vq_mode_r && ppu_valid_in;
 
     logic signed [VQ_SCORE_W-1:0] vq_best  [0:N_LANES-1];
@@ -683,8 +778,9 @@ module pw_pixel_major_core #(
       assign vq_take[g]  = vq_first || (vq_score[g] < vq_best[g]);
       assign vq_curk[g]  = vq_take[g] ? vq_k : vq_bestk[g];
 `ifndef SYNTHESIS
-      // The 20-bit truncation must be exact -- that is the derivation in
-      // vq_pw.c holding on real data, checked every single compare.
+      // The VQ_SCORE_W truncation must be exact -- that is the derivation
+      // above holding on real data, checked on every single compare. This is
+      // what catches a VQ_SCORE_W that is too narrow for the configured Dm.
       always_ff @(posedge clk)
         if (rst_n && vq_go)
           a_vq_score_fits: assert (sc32 === 32'(vq_score[g]))
@@ -706,12 +802,15 @@ module pw_pixel_major_core #(
           for (int i = 0; i < N_LANES; i++) begin
             if (vq_take[i]) vq_best[i] <= vq_score[i];
             vq_bestk[i] <= vq_curk[i];
-            if (vq_lastk) vq_word[i][{vq_m, 2'b00} +: VQ_KW] <= vq_curk[i];
+            // Index field m occupies [VQ_KW*m +: VQ_KW]. At K=16 that is the
+            // old nibble packing exactly; at K=64 it is four 6-bit fields.
+            if (vq_lastk)
+              vq_word[i][VQ_KW*$unsigned(vq_m) +: VQ_KW] <= vq_curk[i];
           end
-          // last codeword of the last sub-codebook of the last batch: the
-          // whole 32-bit word for every lane is complete on this edge.
-          if (vq_lastk && vq_half &&
-              ($unsigned(vq_batch_r) + 1 == $unsigned(cout_batches_r)))
+          // Last codeword of the LAST sub-codebook: every lane's word is
+          // complete on this edge. vq_m_last_r = cout_run/K - 1, latched at
+          // start, so this tracks the run's actual M rather than the build's.
+          if (vq_lastk && (vq_m == vq_m_last_r[VQ_MW-1:0]))
             vq_pending <= 1'b1;
         end
 
@@ -728,7 +827,18 @@ module pw_pixel_major_core #(
 
     // Position 2i occupies the LOW 32 bits so the S2MM writes it to the lower
     // address: little-endian, matching vqpw_encode_frame()'s idx_out[pos*4].
-    assign vq_pixel_out = {vq_word[{vq_beat, 1'b1}], vq_word[{vq_beat, 1'b0}]};
+    //
+    // TRANSPORT WORD. Always 32 bits per position, so the S2MM length, the
+    // cache ranges and the 4-beats-per-group output count are identical at
+    // every K. Only VQ_WORD_W of those bits carry index:
+    //     K=16, M=8 : 32 bits, fields at 4m      -- the word is full
+    //     K=64, M=4 : 24 bits, fields at 6m      -- bits [31:24] read as ZERO
+    // The mask makes that guarantee structural rather than a consequence of
+    // reset plus never-written, and folds to nothing when VQ_WORD_W == 32.
+    localparam logic [31:0] VQ_WORD_MASK =
+        (VQ_WORD_W >= 32) ? 32'hFFFF_FFFF : ((32'd1 << VQ_WORD_W) - 32'd1);
+    assign vq_pixel_out = {vq_word[{vq_beat, 1'b1}] & VQ_WORD_MASK,
+                           vq_word[{vq_beat, 1'b0}] & VQ_WORD_MASK};
     assign vq_valid_out = vq_emit_busy && !out_stall;
   end else begin : G_NO_VQ
     assign vq_pixel_out = '0;
@@ -751,10 +861,119 @@ module pw_pixel_major_core #(
   logic [11:0]                        oc_batch_idx;
   logic [W_AW-1:0]                    w_addr_base;
 
-  // pb_ram READ index. In VQ mode the batch's window base is w_addr_base.
+  // ------------------------------------------------------------
+  // CONFIGURATION GUARD -- evaluated CONTINUOUSLY, sampled at start.
+  //
+  // The conditions are the ones that ALIAS SILENTLY rather than fail loudly:
+  //
+  //   cout_run > COUT_HW_MAX  the weight BRAM holds COUT_MAX/N_OC batches and
+  //                           that division FLOORS, so 240/32 = 7 -> 224, not
+  //                           240. Programming 225..240 used to wrap.
+  //   cin_run  > CIN_MAX      weight / pb_ram addresses wrap
+  //   VQ: cout_run > VQ_NORM_D        the norm ROM address wraps
+  //   VQ: vq_cin_load > CIN_MAX       the pb_ram write address wraps
+  //   VQ: cout_run not a multiple of VQ_K
+  //                           a partial sub-codebook would commit an argmin
+  //                           that never saw all K candidates
+  //   VQ: windows * cin_run > vq_cin_load
+  //           the batch windows would read past the channels actually loaded.
+  //           The window count is NOT cout_run/K: it is the number of times
+  //           vq_pb_step fires, batches / VQ_BPS. At K <= N_OC every batch
+  //           opens a window; at K > N_OC only every VQ_BPS-th does. Both
+  //           deployed geometries come to 4 x 16 = 64, which is vq_cin_load.
+  //
+  // WHY REGISTERED AND NOT IN THE S_IDLE NEXT-STATE CONE. The window-fit test
+  // contains a multiply, and evaluating it in the start_in -> st path made it
+  // the critical path of the entire IP. The geometry registers are written
+  // over AXI-lite several transactions before the CTRL write that produces
+  // start_in, so a two-cycle-old decision is always the decision for the run
+  // that is about to start -- a_cfg_decision_settled asserts that rather than
+  // assuming it.
+  // ------------------------------------------------------------
+  // How many DISTINCT input windows the run opens. One window per
+  // max(N_OC, VQ_K) output channels -- at K <= N_OC a batch opens a window and
+  // covers N_OC channels; at K > N_OC a window lasts VQ_BPS batches and covers
+  // VQ_K. max(N_OC, VQ_K) is a power of two, so this is a plain shift: no
+  // divider, and no ceiling needed because the multiple-of-VQ_K test above
+  // already rejects anything that is not a whole number of sub-codebooks.
+  //   K=16, N_OC=32 : cout 128 >> 5 = 4 windows
+  //   K=64, N_OC=32 : cout 256 >> 6 = 4 windows
+  localparam int VQ_WIN_SH = $clog2((VQ_K > N_OC) ? VQ_K : N_OC);
+  localparam int VQ_WINW   = 12 - VQ_WIN_SH;
+  wire [VQ_WINW-1:0] cfg_windows = cout_run[11:VQ_WIN_SH];
+
+  // windows is at most COUT_MAX/N_OC, so this is a small multiply. Left alone
+  // Vivado infers a DSP48E1, and a combinational DSP put ~2.9 ns into this
+  // path; as LUT logic it is a few shift-adds. Both matter -- see below.
+  (* use_dsp = "no" *) wire [23:0] cfg_win_chan =
+      24'($unsigned(cfg_windows)) * 24'($unsigned(cin_run));
+
+  // Combinational form. Synthesis strips it: the only reader is the
+  // a_cfg_decision_settled assertion, which is inside `ifndef SYNTHESIS.
+  wire cfg_bad_now =
+        (tile_pixels == 0) || (cin_run == 0) || (cout_run == 0)
+     || ($unsigned(cout_run) > COUT_HW_MAX)
+     || ($unsigned(cin_run)  > CIN_MAX)
+     || ((USE_PW_VQ != 0) && vq_mode &&
+         (($unsigned(cout_run) > VQ_NORM_D)
+          || ($unsigned(vq_cin_load) > CIN_MAX)
+          || (cout_run[VQ_KW-1:0] != '0)
+          || (cfg_win_chan > 24'($unsigned(vq_cin_load)))));
+
+  // TWO STAGES, and the reason is measured rather than assumed. Timing on this
+  // IP, out-of-context, xc7a200t, 10 ns constraint:
+  //
+  //   shipped RTL, no guard                        WNS  +1.915 ns
+  //   guard in the start_in -> next-state cone      WNS  -1.019 ns  CRITICAL
+  //   guard registered, one stage, DSP multiply     WNS  -0.789 ns  CRITICAL
+  //   guard registered, one stage, LUT multiply     WNS  +0.446 ns  critical
+  //   guard registered, TWO stages (this)           see the report
+  //
+  // The guard has no throughput role whatever -- it only has to be settled by
+  // the time start_in arrives, and the geometry registers are written over
+  // AXI-lite many cycles earlier. Spending two cycles on it is free, and it
+  // keeps a safety check from eating the headroom of the datapath it protects.
+  logic        cfg_simple_r;      // everything but the window-span test
+  logic [23:0] cfg_win_chan_r;    // windows * cin_run
+  logic [11:0] cfg_load_r;        // vq_cin_load, aligned with it
+  logic        cfg_vq_r;          // VQ mode, aligned with it
+  logic        cfg_bad_r;
+
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      cfg_simple_r   <= 1'b0;
+      cfg_win_chan_r <= 24'd0;
+      cfg_load_r     <= 12'd0;
+      cfg_vq_r       <= 1'b0;
+      cfg_bad_r      <= 1'b0;
+    end else begin
+      cfg_simple_r <=
+            (tile_pixels == 0) || (cin_run == 0) || (cout_run == 0)
+         || ($unsigned(cout_run) > COUT_HW_MAX)
+         || ($unsigned(cin_run)  > CIN_MAX)
+         || ((USE_PW_VQ != 0) && vq_mode &&
+             (($unsigned(cout_run) > VQ_NORM_D)
+              || ($unsigned(vq_cin_load) > CIN_MAX)
+              || (cout_run[VQ_KW-1:0] != '0)));
+      cfg_win_chan_r <= cfg_win_chan;
+      cfg_load_r     <= vq_cin_load;
+      cfg_vq_r       <= (USE_PW_VQ != 0) && vq_mode;
+
+      cfg_bad_r <= cfg_simple_r
+                || (cfg_vq_r && (cfg_win_chan_r > 24'($unsigned(cfg_load_r))));
+    end
+  end
+
+  // pb_ram READ index. In VQ mode the batch's window base is vq_pb_base.
   wire [PB_AW-1:0] pb_rd_index = ((USE_PW_VQ != 0) && vq_mode_r)
-                               ? (w_addr_base[PB_AW-1:0] + ic_idx[PB_AW-1:0])
+                               ? (vq_pb_base + ic_idx[PB_AW-1:0])
                                : ic_idx[PB_AW-1:0];
+
+  // Does the NEXT batch open a new input window? True every batch when one
+  // batch holds whole sub-codebooks (VQ_BPS = 1), otherwise on the last batch
+  // of each sub-codebook. VQ_BPS is a power of two, so this is a bit test.
+  wire vq_pb_step = (VQ_BPS <= 1) ? 1'b1
+                  : (oc_batch_idx[VQ_BPSW-1:0] == VQ_BPSW'(VQ_BPS - 1));
 
   logic                               rd_issued;
   logic                               first_ic;
@@ -858,6 +1077,8 @@ module pw_pixel_major_core #(
       ic_idx        <= '0;
       oc_batch_idx  <= 12'd0;
       w_addr_base   <= '0;
+      vq_pb_base    <= '0;
+      cfg_err       <= 1'b0;
       w_rd_addr     <= '0;
       w_rd_en       <= 1'b0;
       rd_issued     <= 1'b0;
@@ -934,6 +1155,7 @@ module pw_pixel_major_core #(
             // ceil, not floor: with partial-batch drain N_OC may exceed cout,
             // and floor would give zero batches and emit nothing.
             cout_batches_r <= (cout_run + N_OC - 1) / N_OC;
+            vq_m_last_r    <= 12'((cout_run >> VQ_KW) - 12'd1);
             cout_run_r     <= cout_run;
             zp_in_r        <= zp_in;
             zp_out_r       <= zp_out;
@@ -948,6 +1170,7 @@ module pw_pixel_major_core #(
             ic_idx         <= '0;
             oc_batch_idx   <= 12'd0;
             w_addr_base    <= '0;
+            vq_pb_base     <= '0;
             rd_issued      <= 1'b0;
             first_ic       <= 1'b1;
             compute_buf    <= 1'b0;
@@ -959,10 +1182,49 @@ module pw_pixel_major_core #(
             // run must never inherit occupancy from an aborted predecessor.
             // Placed after the unconditional maintenance above so it wins.
             ppu_in_flight  <= 8'd0;
-            if ((tile_pixels == 0) || (cin_run == 0) || (cout_run == 0))
-              st <= S_DONE;
-            else
-              st <= S_LOAD_FIRST;
+            // ------------------------------------------------------------
+            // SYNTHESISABLE CONFIGURATION GUARD.
+            //
+            // Until now the only checks here were the three zero tests, and
+            // the cout_run > COUT_MAX check lived ONLY in
+            // pw_pixel_major_core_SIMCOPY.sv, which is not the synthesised
+            // file. An over-range geometry therefore ran, aliased its weight
+            // or norm addresses, and produced a wrong frame with nothing set
+            // to say so. Every condition below is one that ALIASES SILENTLY:
+            //
+            //   cout_run > COUT_HW_MAX  weight BRAM holds COUT_MAX/N_OC
+            //                           batches and that division floors, so
+            //                           240/32 = 7 -> 224, not 240.
+            //   cin_run  > CIN_MAX      weight/pb address wraps
+            //   VQ: cout_run > VQ_NORM_D        norm ROM address wraps
+            //   VQ: vq_cin_load > CIN_MAX       pb_ram write address wraps
+            //   VQ: cout_run not a multiple of VQ_K
+            //                           a partial sub-codebook would commit an
+            //                           argmin that never saw all K candidates
+            //   VQ: windows * cin_run > vq_cin_load
+            //                           the batch windows would run off the end
+            //                           of the loaded channels (the condition
+            //                           a_vq_window_inside_load asserts in sim).
+            //                           The window count is NOT cout_run/K --
+            //                           it is the number of times vq_pb_step
+            //                           fires, i.e. batches / VQ_BPS. At
+            //                           K <= N_OC every batch opens a window
+            //                           (VQ_BPS = 1) and the count is the batch
+            //                           count; at K > N_OC it is the number of
+            //                           sub-codebooks. Both give 4 x 16 = 64
+            //                           for the two deployed geometries.
+            //
+            // On a violation the run is REFUSED -- no beats are emitted -- and
+            // cfg_err is raised for software to read at STATUS2. A legal start
+            // clears it, so it always describes the most recent start.
+            // ------------------------------------------------------------
+            if (cfg_bad_r) begin
+              cfg_err <= 1'b1;
+              st      <= S_DONE;
+            end else begin
+              cfg_err <= 1'b0;
+              st      <= S_LOAD_FIRST;
+            end
           end
         end
 
@@ -986,6 +1248,7 @@ module pw_pixel_major_core #(
               ic_idx       <= '0;
               oc_batch_idx <= 12'd0;
               w_addr_base  <= '0;
+              vq_pb_base   <= '0;
               rd_issued    <= 1'b0;
               first_ic     <= 1'b1;
               compute_buf  <= 1'b0;  // compute reads buffer A
@@ -1127,6 +1390,10 @@ module pw_pixel_major_core #(
               // Not the last batch - start next batch immediately
               oc_batch_idx <= oc_batch_idx + 12'd1;
               w_addr_base  <= w_addr_base + cin_run;
+              // VQ activation window advances only on a sub-codebook
+              // boundary; at VQ_BPS = 1 that is every batch, i.e. exactly
+              // what w_addr_base does, so the legacy geometry is unchanged.
+              if (vq_pb_step) vq_pb_base <= vq_pb_base + cin_run[PB_AW-1:0];
               ic_idx       <= '0;
               rd_issued    <= 1'b0;
               first_ic     <= 1'b1;
@@ -1185,6 +1452,7 @@ module pw_pixel_major_core #(
               compute_buf  <= !compute_buf;
               oc_batch_idx <= 12'd0;
               w_addr_base  <= '0;
+              vq_pb_base   <= '0;
               ic_idx       <= '0;
               rd_issued    <= 1'b0;
               first_ic     <= 1'b1;
@@ -1422,11 +1690,29 @@ module pw_pixel_major_core #(
     if (rst_n) begin
       a_vq_off_when_not_compiled: assert (!((USE_PW_VQ == 0) && vq_mode))
         else $error("vq_mode asserted but USE_PW_VQ = 0");
-      if (vq_mode_r && (st != S_IDLE)) begin
-        a_vq_window_inside_load: assert ($unsigned(w_addr_base) + $unsigned(cin_run)
+      // The guard must never let an over-range geometry run. cfg_err and a
+      // non-idle FSM are mutually exclusive by construction; assert it anyway
+      // so a future edit to S_IDLE cannot quietly reopen the aliasing hole.
+      a_cfg_err_means_refused: assert (!(cfg_err && (st != S_IDLE) && (st != S_DONE)))
+        else $error("cfg_err raised but the run started anyway (st=%0d)", st);
+      // The registered guard decision must describe the geometry that is
+      // actually about to run. It would not if software wrote a geometry
+      // register in the very cycle before start_in -- impossible over AXI-lite,
+      // but asserted rather than assumed.
+      a_cfg_decision_settled: assert (!(start_in && (cfg_bad_r !== cfg_bad_now)))
+        else $error("geometry changed within 2 cycles of start_in");
+      // Exclude S_DONE: a run REFUSED by the cfg guard parks there with
+      // vq_mode_r latched and the offending geometry still on the inputs,
+      // and re-reporting what the guard already caught is just noise.
+      if (vq_mode_r && (st != S_IDLE) && (st != S_DONE) && !cfg_err) begin
+        a_vq_window_inside_load: assert ($unsigned(vq_pb_base) + $unsigned(cin_run)
                                          <= $unsigned(cin_load))
           else $error("VQ window %0d+%0d overruns the %0d channels loaded",
-                      w_addr_base, cin_run, cin_load);
+                      vq_pb_base, cin_run, cin_load);
+        a_vq_weight_inside_bram: assert ($unsigned(w_addr_base) + $unsigned(cin_run)
+                                         <= W_DEPTH)
+          else $error("VQ weight window %0d+%0d overruns W_DEPTH %0d",
+                      w_addr_base, cin_run, W_DEPTH);
         a_vq_load_fits_pb: assert ($unsigned(cin_load) <= CIN_MAX)
           else $error("vq_cin_load %0d exceeds CIN_MAX %0d", cin_load, CIN_MAX);
       end

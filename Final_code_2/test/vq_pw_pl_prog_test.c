@@ -89,7 +89,10 @@ int main(void)
                 nweight++;
             }
         } else if (a == PW_REG_VQ_NORM) {
-            const int oc = (int)(d & 0x7Fu);
+            /* the address field is EIGHT bits now (0..255), so at the
+             * deployed geometry this covers OCs the old 7-bit mask could
+             * not even express */
+            const int oc = (int)(d & 0xFFu);
             int32_t v = (int32_t)((d >> 12) & 0xFFFFFu);
             if (v & 0x80000) v -= 0x100000;          /* 20-bit sign extend */
             seen_n[oc] = v; nnorm++;
@@ -142,7 +145,7 @@ int main(void)
         else if (a == PW_REG_CTRL)      { if (i_ctrl < 0) i_ctrl = i; }
     }
     chk(saw_cin,  "CIN_RUN = 16 (the MAC window, not the streamed channels)");
-    chk(saw_cout, "COUT_RUN = 128 (8 sub-codebooks x 16 codewords)");
+    chk(saw_cout, "COUT_RUN = M*K (every codeword is an output channel)");
     chk(saw_tp,   "TILE_PIXELS = 14400 latent positions");
     chk(saw_zp,   "ZP_RELU = zp_in 128, zp_out 128, relu off");
     chk((vqval & 1u) == 1u, "VQ_CTRL sets vq_mode");

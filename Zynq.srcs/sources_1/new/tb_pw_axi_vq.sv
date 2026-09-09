@@ -24,17 +24,37 @@
 // Vectors: latent.hex / weights.hex / norms.hex / expect.hex from
 // gen_vq_vectors.c, read from the run directory by fixed name.
 // ============================================================================
-module tb_pw_axi_vq;
+// The work lives in pw_axi_vq_bench, parameterised on the quantiser geometry;
+// the tops at the bottom pick a profile. This is the only place the WIDENED
+// norm-address field is exercised through the real register map, which is the
+// path the driver uses, so both geometries must be run here and not only in
+// tb_pw_vq.
+module pw_axi_vq_bench #(
+  parameter int VQ_K       = 64,
+  parameter int VQ_NORM_D  = 256,
+  parameter int VQ_SCORE_W = 21,
+  parameter int VQ_M       = 4,
+  parameter int VQ_DSUB    = 16,
+  parameter int COUT_MAX   = 256,
+  parameter string DIR     = "vq64",
+  parameter string TAG     = "DEPLOYED M=4 K=64 Dsub=16"
+)();
 
   localparam int DATA_WIDTH = 8;
   localparam int ACC_WIDTH  = 24;
   localparam int CIN_MAX    = 240;
-  localparam int COUT_MAX   = 240;
   localparam int N_LANES    = 8;
   localparam int N_OC       = 32;
-  localparam int W_PER_BANK = 64;
   localparam int VQ_DIM     = 64;
   localparam int NG         = 64;      // groups in the vector set
+
+  // Derived exactly as vq_pw.h derives them.
+  localparam int COUT_TOTAL = VQ_M * VQ_K;
+  localparam int NBATCH     = COUT_TOTAL / N_OC;
+  localparam int SUBS_PER_B = (VQ_K < N_OC) ? (N_OC / VQ_K) : 1;
+  localparam int CIN_MAC    = VQ_DSUB * SUBS_PER_B;
+  localparam int W_PER_BANK = NBATCH * CIN_MAC;
+  localparam int VQ_AW      = $clog2(VQ_NORM_D);
 
   localparam [11:0] ADDR_CTRL        = 12'h000;
   localparam [11:0] ADDR_TILE_PIXELS = 12'h008;
@@ -67,7 +87,10 @@ module tb_pw_axi_vq;
 
   logic [63:0] latent_mem [0:VQ_DIM*1800-1];
   logic [7:0]  w_mem      [0:N_OC*W_PER_BANK-1];
-  logic [19:0] norm_mem   [0:127];
+  logic [19:0] norm_mem   [0:VQ_NORM_D-1];
+  // Faults found by the initial block (norm read-back, cfg_err). Kept apart
+  // from nbad, which an always_ff drives -- one variable, one driver kind.
+  int nbad_prog = 0;
   logic [63:0] expect_mem [0:4*1800-1];
 
   pw_single_oc_axis_axi #(
@@ -76,7 +99,8 @@ module tb_pw_axi_vq;
     .CIN_MAX(CIN_MAX), .COUT_MAX(COUT_MAX),
     .TILE_PIXELS_MAX(32768), .IN_FIFO_DEPTH(2048), .OUT_FIFO_DEPTH(4096),
     .S_AXIS_DATA_WIDTH(64), .N_LANES(N_LANES), .N_OC(N_OC),
-    .M_AXIS_DATA_WIDTH(64)
+    .M_AXIS_DATA_WIDTH(64),
+    .VQ_K(VQ_K), .VQ_NORM_D(VQ_NORM_D), .VQ_SCORE_W(VQ_SCORE_W)
   ) dut (
     .s_axi_aclk(clk), .s_axi_aresetn(rstn),
     .s_axi_awaddr(awaddr), .s_axi_awvalid(awvalid), .s_axi_awready(awready),
@@ -213,13 +237,15 @@ module tb_pw_axi_vq;
   end
 
   initial begin
-    $readmemh("latent.hex",  latent_mem);
-    $readmemh("weights.hex", w_mem);
-    $readmemh("norms.hex",   norm_mem);
-    $readmemh("expect.hex",  expect_mem);
+    $readmemh({DIR, "/latent.hex"},  latent_mem);
+    $readmemh({DIR, "/weights.hex"}, w_mem);
+    $readmemh({DIR, "/norms.hex"},   norm_mem);
+    $readmemh({DIR, "/expect.hex"},  expect_mem);
 
-    $display("\n=== PW-hosted VQ through the real AXI-lite register map ===");
-    $display("groups=%0d  expected index beats=%0d", NG, 4*NG);
+    $display("\n=== PW-hosted VQ through the real AXI-lite register map : %s ===", TAG);
+    $display("groups=%0d  expected index beats=%0d  vectors=%s", NG, 4*NG, DIR);
+    $display("K=%0d NORM_D=%0d SCORE_W=%0d cout_run=%0d w_per_bank=%0d",
+             VQ_K, VQ_NORM_D, VQ_SCORE_W, COUT_TOTAL, W_PER_BANK);
 
     awvalid = 0; wvalid = 0;
     repeat (8) @(posedge clk);
@@ -228,11 +254,11 @@ module tb_pw_axi_vq;
 
     // geometry
     wr(ADDR_TILE_PIXELS, NG*N_LANES);
-    wr(ADDR_CIN_RUN,     32'd16);      // MAC window per batch
-    wr(ADDR_COUT_RUN,    32'd128);     // 8 sub-codebooks x 16 codewords
+    wr(ADDR_CIN_RUN,     32'(CIN_MAC));      // MAC window per batch
+    wr(ADDR_COUT_RUN,    32'(COUT_TOTAL));   // M sub-codebooks x K codewords
     wr(ADDR_ZP_RELU,     32'h0000_8080);  // zp_in = zp_out = 128, relu off
 
-    // weights: bank per OC slot, 64 entries each
+    // weights: bank per OC slot, W_PER_BANK entries each
     for (int oc = 0; oc < N_OC; oc++) begin
       wr(ADDR_OC_SEL,     oc);
       wr(ADDR_W_BRAM_OFF, 32'd0);
@@ -240,9 +266,12 @@ module tb_pw_axi_vq;
         wr(ADDR_W_BASE + 12'(a*4), {24'd0, w_mem[oc*W_PER_BANK + a]});
     end
 
-    // codeword norms: [6:0] = absolute OC, [31:12] = ||v_k||^2
-    for (int i = 0; i < 128; i++)
-      wr(ADDR_VQ_NORM, {norm_mem[i], 5'd0, i[6:0]});
+    // Codeword norms: [7:0] = absolute OC, [31:12] = ||v_k||^2. The address
+    // field is EIGHT bits now, so at the deployed geometry this loop writes
+    // addresses 128..255 -- exactly the ones the old 7-bit port could not
+    // reach, and the reason this bench runs both profiles.
+    for (int i = 0; i < VQ_NORM_D; i++)
+      wr(ADDR_VQ_NORM, {norm_mem[i], 4'd0, i[7:0]});
 
     // VQ mode on: [0] = vq_mode, [23:12] = vq_cin_load
     wr(ADDR_VQ_CTRL, {8'd0, 12'd64, 11'd0, 1'b1});
@@ -257,8 +286,19 @@ module tb_pw_axi_vq;
              $signed(dut.u_pw.u_core.G_VQ.vq_norm[2]), $signed(dut.u_pw.u_core.G_VQ.vq_norm[3]),
              $signed(norm_mem[0]), $signed(norm_mem[1]),
              $signed(norm_mem[2]), $signed(norm_mem[3]));
-    $display("  NORM rom[127] = %0d   (file: %0d)",
-             $signed(dut.u_pw.u_core.G_VQ.vq_norm[127]), $signed(norm_mem[127]));
+    $display("  NORM rom[%0d] = %0d   (file: %0d)   <- highest address",
+             VQ_NORM_D-1,
+             $signed(dut.u_pw.u_core.G_VQ.vq_norm[VQ_NORM_D-1]),
+             $signed(norm_mem[VQ_NORM_D-1]));
+    begin
+      int nbadnorm = 0;
+      for (int i = 0; i < VQ_NORM_D; i++)
+        if ($signed(dut.u_pw.u_core.G_VQ.vq_norm[i])
+            !== $signed(VQ_SCORE_W'(signed'(norm_mem[i])))) nbadnorm++;
+      $display("  NORM ROM entries wrong after AXI programming: %0d / %0d",
+               nbadnorm, VQ_NORM_D);
+      if (nbadnorm != 0) nbad_prog++;
+    end
 
     wr(ADDR_CTRL, 32'h1);   // start -- this also flushes the input FIFO
     repeat (16) @(posedge clk);   // let fifo_rst deassert before streaming
@@ -281,11 +321,33 @@ module tb_pw_axi_vq;
     $display("  WEIGHT reads checked=%0d bad=%0d ; INPUT beats at core=%0d bad=%0d", wchk, wbad, icnt, ibad);
     $display("ordinary pair while vq_mode=1: s_axis_tready high %0d cyc, m_axis_tvalid high %0d cyc",
              leak_ready, leak_valid);
-    if (nout == 4*NG && nbad == 0 && nlast == 1 && leak_ready == 0 && leak_valid == 0)
+    $display("  STATUS2 cfg_err bit = %0b (must be 0)",
+             dut.cfg_err_sticky);
+    if (dut.cfg_err_sticky) nbad_prog++;
+    $display("  programming-stage faults: %0d", nbad_prog);
+    if (nout == 4*NG && nbad == 0 && nbad_prog == 0 && nlast == 1
+        && leak_ready == 0 && leak_valid == 0)
       $display("RESULT: PASS -- AXI-lite programming, VQ stream pair and mux all correct");
     else
       $display("RESULT: FAIL");
     $finish;
   end
 
+endmodule
+
+
+// DEPLOYED: M=4, K=64, Dsub=16 -> c_out 256, needs COUT_MAX 256.
+module tb_pw_axi_vq;
+  pw_axi_vq_bench #(.VQ_K(64), .VQ_NORM_D(256), .VQ_SCORE_W(21),
+                    .VQ_M(4), .VQ_DSUB(16), .COUT_MAX(256),
+                    .DIR("vq64"),
+                    .TAG("DEPLOYED M=4 K=64 Dsub=16")) u();
+endmodule
+
+// LEGACY regression: M=8, K=16, Dsub=8 at the shipped COUT_MAX of 240.
+module tb_pw_axi_vq_legacy;
+  pw_axi_vq_bench #(.VQ_K(16), .VQ_NORM_D(128), .VQ_SCORE_W(20),
+                    .VQ_M(8), .VQ_DSUB(8), .COUT_MAX(240),
+                    .DIR("vq16"),
+                    .TAG("LEGACY M=8 K=16 Dsub=8")) u();
 endmodule
