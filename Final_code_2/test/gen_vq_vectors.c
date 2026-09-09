@@ -77,6 +77,21 @@ int main(int argc, char **argv)
     } else if (scenario == 2) {
         for (int i = 0; i < VQPW_M * VQPW_K * VQPW_DSUB; i++)
             cb[i] = (int8_t)((xs() & 1) ? -128 : 127);
+    } else if (scenario == 5) {
+        /* SLOT PROBE -- the same codebook vq_pw_pl_probe_slots() loads on the
+         * board. Non-zero in dimension 0 only, a_k = -128 + 4k, which makes
+         *
+         *     score(k) = (a_k - u[0])^2 - u[0]^2
+         *
+         * so each sub-codebook is a step-4 scalar quantiser on its window's
+         * first channel and the index is a verbatim read-out of that byte.
+         * Paired with the marker latent below, the expected index NAMES the
+         * group whose beat is in the slot, so a lag shows up as an index that
+         * is low by exactly the number of groups it lags. */
+        for (int i = 0; i < VQPW_M * VQPW_K * VQPW_DSUB; i++) cb[i] = 0;
+        for (int m = 0; m < VQPW_M; m++)
+            for (int k = 0; k < VQPW_K; k++)
+                cb[((size_t)m * VQPW_K + k) * VQPW_DSUB + 0] = (int8_t)(-128 + 4 * k);
     }
     if (vqpw_init(&ctx, cb, 128) != 0) { fprintf(stderr, "init failed\n"); return 1; }
     vqpw_build_weights(&ctx, wimg);
@@ -84,7 +99,19 @@ int main(int argc, char **argv)
 
     /* ---- latent ---- */
     const size_t nbytes = (size_t)ng * VQPW_DIM * VQPW_LANES;
-    if (scenario == 4) {
+    if (scenario == 5) {
+        /* Zero point everywhere -- those dimensions meet weight 0 and cannot
+         * reach the score -- except each window's first channel, which carries
+         * a byte that identifies the group. 4*(8 + g mod 8) keeps every marker
+         * inside the ladder at both profiles (K=16 reaches only byte 62). */
+        for (size_t i = 0; i < nbytes; i++) latent[i] = 128u;
+        for (int g = 0; g < ng; g++) {
+            const uint8_t b = (uint8_t)(4 * (8 + (g & 7)));
+            for (int m = 0; m < VQPW_M; m++)
+                for (int l = 0; l < VQPW_LANES; l++)
+                    latent[((size_t)g * VQPW_DIM + m * VQPW_DSUB) * VQPW_LANES + l] = b;
+        }
+    } else if (scenario == 4) {
         for (size_t i = 0; i < nbytes; i++) latent[i] = 255u;
     } else if (scenario == 3) {
         /* Quantised and spatially smooth: a few distinct levels near the zero

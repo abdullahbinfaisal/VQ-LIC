@@ -97,9 +97,11 @@ Repointing `Final_2/vitis-comp.json` at a new XSA and rebuilding the Vitis
 until something explicitly overwrites it, so the board goes on running the
 previous bitstream and the new firmware talks to old hardware.
 
-There is no extracted `.bit` under `Final_2/` newer than 2026-07-30 -- the
-platform does not leave one lying around -- so "the app built" tells you
-nothing about what is in the fabric.
+The platform does not leave a `.bit` lying around, so "the app built" tells
+you nothing about what is in the fabric. Extracted copies under `Final_2/hw/`
+are put there BY HAND after a build; treat them as a convenience, never as
+evidence, and md5 them against `Zynq.runs/impl_1/hw_wrapper.bit` before
+believing any of them is what the PL holds.
 
 After a platform repoint, all three steps are required:
 
