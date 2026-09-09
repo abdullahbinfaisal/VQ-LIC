@@ -425,7 +425,13 @@ int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
                                       "u=+1  " };
     int worst = 0;
 
-    if (vqpw_init(&s_ctx, cb, zp) != 0) return -1;
+    /* PROGRAM THE ENGINE FIRST. vqpw_init only fills a software struct; the
+     * weights and the norm ROM reach the PL through load_codebook. Without
+     * this the self-test interrogates an engine still holding the analysis
+     * convolution's weights and an unwritten norm ROM, and every case returns
+     * the same answer regardless of input -- which is exactly how the first
+     * version reported hw[0,0,0,0] four times and meant nothing. */
+    if (vq_pw_pl_load_codebook(cb, zp) != 0) return -1;
 
     xil_printf("[VQST] sub-system self-test, one group per case\r\n");
 
@@ -452,8 +458,19 @@ int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
         dma_w(MM2S_SA,     (uint32_t)(UINTPTR)s_st_lat);
         dma_w(MM2S_LENGTH, (uint32_t)sizeof s_st_lat);
 
-        for (uint32_t i = 0; i < SPIN_LIMIT; i++)
-            if (dma_r(S2MM_DMASR) & DMASR_IDLE) break;
+        {
+            uint32_t i;
+            for (i = 0; i < SPIN_LIMIT; i++)
+                if (dma_r(S2MM_DMASR) & DMASR_IDLE) break;
+            /* Distinguish "the engine answered wrongly" from "the engine did
+             * not answer". Without this an all-zero output buffer reads as a
+             * plausible set of indices. */
+            if (i >= SPIN_LIMIT)
+                xil_printf("[VQST]   TIMEOUT: S2MM never went idle, "
+                           "S2MM_SR=0x%08x PW_STATUS=0x%08x\r\n",
+                           (unsigned)dma_r(S2MM_DMASR),
+                           (unsigned)pw_r(PW_REG_STATUS));
+        }
 
         pw_w(PW_REG_VQ_CTRL, 0u);
         dma_w(MM2S_DMACR, DMACR_RESET);
@@ -482,6 +499,15 @@ int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
                 xil_printf("m%d=%d ", m, (int)bad_m[m]);
             xil_printf("of %d  -> %s\r\n", VQPW_LANES * VQPW_M,
                        tot ? "MISMATCH" : "ok");
+            {   /* An all-zero transport word means nothing was written, not
+                 * that every sub-codebook chose codeword 0. */
+                int allz = 1;
+                for (size_t b = 0; b < sizeof s_st_hw; b++)
+                    if (s_st_hw[b] != 0u) { allz = 0; break; }
+                if (allz)
+                    xil_printf("[VQST]     output buffer is ENTIRELY ZERO -- the "
+                               "engine wrote nothing this case.\r\n");
+            }
             if (tot) {
                 xil_printf("[VQST]     hw[");
                 for (int m = 0; m < VQPW_M; m++)
