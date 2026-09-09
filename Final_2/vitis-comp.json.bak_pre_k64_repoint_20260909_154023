@@ -3,8 +3,8 @@
   "type": "PLATFORM",
   "configuration": {
     "description": "",
-    "xsa": "C:\\Users\\Fahad\\Zynq\\Final_2\\hw\\pwvq_k64.xsa",
-    "xsaPathInPlatform": "Final_2\\hw\\pwvq_k64.xsa",
+    "xsa": "C:\\Users\\Fahad\\Zynq\\Final_2\\hw\\pwvq_noc32.xsa",
+    "xsaPathInPlatform": "Final_2\\hw\\pwvq_noc32.xsa",
     "emulationXsa": "",
     "emulationXsaPathInPlatform": "",
     "isCustomFSBL": false,
