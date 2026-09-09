@@ -121,9 +121,35 @@ md5sum Zynq.runs/impl_1/hw_wrapper.bit    # what the board will run
 grep -oE 'pwvq[^\"]*\.xsa' Final_2/vitis-comp.json   # what the app compiles against
 ```
 
-The current bitstream is extracted for convenience at
-`Final_2/hw/pwvq_k64.bit` (md5 e9893daf486df604e8b10a47ea84c6c6, identical to
-`Zynq.runs/impl_1/hw_wrapper.bit` of the build that produced it).
+Do not trust a filename written down here -- it goes stale the next time the
+design is rebuilt. Derive it:
+
+```bash
+grep -oE 'pwvq[^\"]*\.xsa' Final_2/vitis-comp.json      # the XSA in force
+md5sum Zynq.runs/impl_1/hw_wrapper.bit                  # what will be programmed
+unzip -p Final_2/hw/<that>.xsa hw.hwh | grep -oE 'VQ_K" VALUE="[0-9]*"'
+```
+
+All three must agree, and the .bit inside the XSA must md5-match
+`Zynq.runs/impl_1/hw_wrapper.bit`.
+
+### There is a THIRD copy of the XSA name, and Vitis owns it
+
+```
+Final_2/vitis-comp.json          <- edit this by hand
+Final_2/export/Final_2/Final_2.xpfm   <- Vitis REGENERATES this
+```
+
+Editing the JSON does not update the export. Until the PLATFORM component is
+rebuilt in Vitis, `Final_2.xpfm` still names the previous XSA, and that is what
+the application actually compiles against. A repoint is not finished until
+
+```bash
+grep -oE 'pwvq[^\"<>]*\.xsa' Final_2/vitis-comp.json
+grep -oE 'pwvq[^\"<>]*\.xsa' Final_2/export/Final_2/Final_2.xpfm
+```
+
+print the SAME name. If they differ, the platform has not been rebuilt yet.
 
 ### Ask the hardware which bitstream it is, do not infer
 
