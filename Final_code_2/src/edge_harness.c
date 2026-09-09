@@ -1310,6 +1310,27 @@ int edge_validation_run(void)
         printf("[EDGE] USE_PW_VQ=1 -- check the synth log really bound 1.\n");
         g_pl_ok = 0;
     } else {
+        /* WHICH BITSTREAM IS ACTUALLY LOADED? Ask the hardware, before
+         * running anything that could be misread. An index mismatch alone
+         * cannot tell an old bitstream from a real RTL bug. */
+        const int guard = vq_pw_pl_probe_guard();
+        if (guard > 0) {
+            printf("[EDGE] PL identity: guard PRESENT -> bitstream is 2026-09-09"
+                   " or later. OK for M=%d K=%d.\n", VQPW_M, VQPW_K);
+        } else if (guard == 0) {
+            printf("[EDGE] *****************************************************\n");
+            printf("[EDGE] PL identity: guard ABSENT -> the loaded bitstream is\n");
+            printf("[EDGE] an OLD build (VQ_K=16, VQ_NORM_D=128, COUT_MAX=240).\n");
+            printf("[EDGE] It CANNOT run M=%d K=%d and will produce wrong indices.\n",
+                   VQPW_M, VQPW_K);
+            printf("[EDGE] The Vitis platform was not regenerated, or the FPGA\n");
+            printf("[EDGE] was not reprogrammed with pwvq_k64.bit.\n");
+            printf("[EDGE] *****************************************************\n");
+        } else {
+            printf("[EDGE] PL identity: INCONCLUSIVE (probe returned %d). The\n", guard);
+            printf("[EDGE] verdict below stands on the index comparison alone.\n");
+        }
+
         long first = -1;
         const long bad = vq_pw_pl_verify(g_pw_cb, 128, edge_latent_ptr(),
                                          g_pl_idx, g_rt, &first);

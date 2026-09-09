@@ -75,6 +75,13 @@ int  vq_pw_pl_encode_frame(const void *latent, void *idx_out);
 long vq_pw_pl_verify(const int8_t *cb, uint8_t zp, const void *latent,
                      uint8_t *pl_idx, uint8_t *sw_idx, long *first_bad);
 
+/* Is the PL currently loaded a build that has the configuration guard, i.e.
+ * 2026-09-09 or later? Programs a geometry the new engine must refuse and reads
+ * cfg_err back. Safe on an old bitstream too -- it arms the DMA so an unguarded
+ * engine completes instead of wedging. See the long note in vq_pw_pl.c.
+ *   1 = guard present (NEW), 0 = absent (OLD), <0 = inconclusive. */
+int vq_pw_pl_probe_guard(void);
+
 /* Raw STATUS2. Bit 5 is cfg_err: the core REFUSED the last start because the
  * geometry would have aliased. Zero on a pre-2026-09-09 bitstream, which has
  * no such bit -- so 0 is not proof of anything, it is only the absence of a

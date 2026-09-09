@@ -18,6 +18,10 @@
 #define S2MM_DA      0x48u
 #define S2MM_LENGTH  0x58u
 
+#define CTRL_START       0x1u
+#define CTRL_CLEAR_DONE  0x2u
+#define CTRL_CLEAR_ERR   0x4u
+
 #define DMACR_RS     (1u << 0)
 #define DMACR_RESET  (1u << 2)
 #define DMASR_HALTED (1u << 0)
@@ -75,6 +79,98 @@ static int32_t    s_nimg[VQPW_COUT_TOTAL];     /* 256 or 128 codeword norms */
  * diagnostic hint, never as proof the configuration is right; the thing that
  * proves that is vq_pw_pl_verify(). */
 uint32_t vq_pw_pl_status2(void) { return pw_r(PW_REG_STATUS2); }
+
+/* ---------------------------------------------------------------------------
+ * BITSTREAM IDENTITY PROBE
+ *
+ * Answers one question positively rather than by inference: does the PL
+ * currently loaded contain the configuration guard, i.e. is it a build from
+ * 2026-09-09 or later?
+ *
+ * WHY INFERENCE IS NOT ENOUGH. An old bitstream running the new firmware
+ * produces index mismatches, but so would a new bitstream with a genuine RTL
+ * bug, and the two look identical from software: same reload time (the driver
+ * writes the same registers either way) and the same search time (the
+ * convolution schedule depends on cout_run and N_OC, not on VQ_K, so 8 batches
+ * cost 272 cyc/group on both). cfg_err reads 0 on an old build because the bit
+ * does not exist, and 0 on a new build that accepted the geometry. Nothing
+ * observable during a normal run separates them.
+ *
+ * HOW. Deliberately program a geometry the NEW engine must refuse:
+ * cout_run = 288 needs 9 weight batches and the engine has 8, so the guard
+ * fires, the run is refused, and cfg_err latches.
+ *
+ * WHY IT ARMS THE DMA. The OLD engine has no guard, so it does not refuse --
+ * it STARTS. A started run that is never fed stalls in S_LOAD_FIRST with busy
+ * stuck high, and the register map has no soft reset to recover it (CTRL bit 2
+ * clears sticky FLAGS, not the FSM). So the probe supplies one group of input
+ * and a sink for the output, and lets the old engine finish harmlessly. One
+ * group is 64 beats in and 4 beats out, about 3 us.
+ *
+ * Returns  1 = guard present   -> NEW bitstream
+ *          0 = guard absent    -> OLD bitstream
+ *         <0 = inconclusive    -> engine not responding, verdict unsafe
+ * ------------------------------------------------------------------------- */
+int vq_pw_pl_probe_guard(void)
+{
+    /* One group: cin_load = 64 beats of 8 bytes in, N_LANES/2 = 4 beats out.
+     * Contents are irrelevant -- nothing checks them; this only has to let an
+     * unguarded engine reach S_DONE. */
+    static uint8_t probe_in [64 * 8] __attribute__((aligned(64)));
+    static uint8_t probe_out[ 4 * 8] __attribute__((aligned(64)));
+    const uint32_t OVER = (uint32_t)VQPW_PW_COUT_MAX + 32u;   /* 288: 9 batches */
+    uint32_t s2;
+
+    if (pw_r(PW_REG_STATUS) == 0xFFFFFFFFu) return -1;
+
+    memset(probe_in, 128, sizeof probe_in);          /* zp: u = 0 */
+    memset(probe_out, 0, sizeof probe_out);
+    Xil_DCacheFlushRange((UINTPTR)probe_in, sizeof probe_in);
+    Xil_DCacheInvalidateRange((UINTPTR)probe_out, sizeof probe_out);
+
+    /* Start from a clean slate so a pre-existing sticky bit cannot be read as
+     * this probe's answer. */
+    pw_w(PW_REG_CTRL, CTRL_CLEAR_DONE | CTRL_CLEAR_ERR);
+    if (pw_r(PW_REG_STATUS2) & PW_STATUS2_CFG_ERR) {
+        pw_w(PW_REG_VQ_CTRL, 0u);
+        return -2;                                    /* will not clear */
+    }
+
+    pw_w(PW_REG_TILE_PIXELS, (uint32_t)VQPW_LANES);   /* exactly one group */
+    pw_w(PW_REG_CIN_RUN,     (uint32_t)VQPW_CIN_MAC);
+    pw_w(PW_REG_COUT_RUN,    OVER);
+    pw_w(PW_REG_ZP_RELU,     0x00008080u);
+    pw_w(PW_REG_VQ_CTRL,     ((uint32_t)VQPW_CIN_LOAD << 12) | 1u);
+    pw_w(PW_REG_CTRL,        CTRL_START);
+
+    s2 = pw_r(PW_REG_STATUS2);
+
+    /* Feed the old engine so it cannot wedge. On a NEW build the run was
+     * already refused, both channels simply move their data into a stopped
+     * engine and go idle, and none of it is looked at. */
+    dma_w(S2MM_DMACR,  DMACR_RS);
+    dma_w(S2MM_DA,     (uint32_t)(UINTPTR)probe_out);
+    dma_w(S2MM_LENGTH, (uint32_t)sizeof probe_out);
+    dma_w(MM2S_DMACR,  DMACR_RS);
+    dma_w(MM2S_SA,     (uint32_t)(UINTPTR)probe_in);
+    dma_w(MM2S_LENGTH, (uint32_t)sizeof probe_in);
+
+    for (uint32_t i = 0; i < 2000000u; i++) {
+        if (dma_r(S2MM_DMASR) & DMASR_IDLE) break;
+        if (pw_r(PW_REG_STATUS) & 0x1u)     break;    /* done_sticky */
+    }
+
+    /* Leave nothing behind: VQ mode off, both channels reset, flags cleared. */
+    pw_w(PW_REG_VQ_CTRL, 0u);
+    dma_w(MM2S_DMACR, DMACR_RESET);
+    dma_w(S2MM_DMACR, DMACR_RESET);
+    for (uint32_t i = 0; i < 100000u; i++)
+        if (!(dma_r(MM2S_DMACR) & DMACR_RESET) && !(dma_r(S2MM_DMACR) & DMACR_RESET))
+            break;
+    pw_w(PW_REG_CTRL, CTRL_CLEAR_DONE | CTRL_CLEAR_ERR);
+
+    return (s2 & PW_STATUS2_CFG_ERR) ? 1 : 0;
+}
 
 double vq_pw_pl_last_prog_ms(void) { return s_prog_ms; }
 double vq_pw_pl_last_run_ms(void)  { return s_run_ms;  }

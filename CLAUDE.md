@@ -76,6 +76,41 @@ diff Zynq.srcs/sources_1/new/pw_pixel_major_core.sv Zynq.srcs/src/pw_pixel_major
 Only a FULL block-design build catches the divergence. OOC synthesis of the IP
 cannot.
 
+## Changing the bitstream: the PL keeps the LAST thing programmed
+
+Repointing `Final_2/vitis-comp.json` at a new XSA and rebuilding the Vitis
+*application* does NOT reprogram the FPGA. A Zynq PL holds its configuration
+until something explicitly overwrites it, so the board goes on running the
+previous bitstream and the new firmware talks to old hardware.
+
+There is no extracted `.bit` under `Final_2/` newer than 2026-07-30 -- the
+platform does not leave one lying around -- so "the app built" tells you
+nothing about what is in the fabric.
+
+After a platform repoint, all three steps are required:
+
+1. regenerate/rebuild the PLATFORM component (not just the app),
+2. rebuild the application,
+3. **program the FPGA** with the new bitstream.
+
+The current bitstream is extracted for convenience at
+`Final_2/hw/pwvq_k64.bit` (md5 e9893daf486df604e8b10a47ea84c6c6, identical to
+`Zynq.runs/impl_1/hw_wrapper.bit` of the build that produced it).
+
+### Ask the hardware which bitstream it is, do not infer
+
+`vq_pw_pl_probe_guard()` programs a geometry the post-2026-09-09 engine must
+refuse and reads `cfg_err` back: 1 = new build, 0 = old build. The harness
+calls it at bring-up and prints the verdict.
+
+This exists because inference does not work here. An old bitstream running the
+new firmware and a new bitstream with a real RTL bug look **identical** from
+software: same codebook reload time (the driver writes the same registers
+either way) and the same search time (the convolution schedule follows
+`cout_run` and `N_OC`, not `VQ_K`, so 8 batches cost 272 cyc/group on both).
+`cfg_err` reads 0 on an old build because the bit does not exist, and 0 on a
+new build that accepted the geometry.
+
 ## Verification entry points
 
 ```bash
