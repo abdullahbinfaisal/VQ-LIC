@@ -43,6 +43,20 @@ The user has corrected this twice. Do not substitute 2025.1 numbers, do not
 substitute a different 7-series part, and do not report a resource or timing
 figure without saying which tool and which part produced it.
 
+### There is no system Python -- use Vivado's
+
+`python`, `python3` and `py` all fail on this machine (the Windows Store stub
+intercepts them). Vivado ships one:
+
+```
+/c/SPROJ/Vivado/2020.2/tps/win64/python-3.8.3/python.exe
+```
+
+Also note: the Bash tool's heredoc collapses a DOUBLED backslash to a single one, so a script written
+through `<<'EOF'` must contain **no doubled backslashes**. Use forward slashes
+in paths, and build escape sequences as `chr(92) + 'n'` rather than writing
+them literally. Single backslashes inside C string literals survive intact.
+
 ## Target device
 
 `xc7z020clg484-1` — 220 DSP48E1 (the binding resource; the shipped design sits

@@ -1544,6 +1544,7 @@ int edge_validation_run(void)
 
         /* Attribute the fault before measuring its size. */
         (void)vq_pw_pl_selftest(g_pw_cb, 128);
+        (void)vq_pw_pl_probe_slots();
         (void)vq_pw_pl_sweep_codewords();
         /* The sweep leaves its own probe codebook loaded. */
         (void)vq_pw_pl_load_codebook(g_pw_cb, 128);

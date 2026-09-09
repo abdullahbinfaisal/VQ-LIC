@@ -37,7 +37,10 @@ module pw_axi_vq_bench #(
   parameter int VQ_DSUB    = 16,
   parameter int COUT_MAX   = 256,
   parameter string DIR     = "vq64",
-  parameter string TAG     = "DEPLOYED M=4 K=64 Dsub=16"
+  parameter string TAG     = "DEPLOYED M=4 K=64 Dsub=16",
+  // Percent of cycles the input source withholds a beat. 0 = the old
+  // continuously-valid behaviour.
+  parameter int    IN_GAP_PCT = 0
 )();
 
   localparam int DATA_WIDTH = 8;
@@ -151,9 +154,26 @@ module pw_axi_vq_bench #(
   // the weights and norms still verified. The real driver has the same
   // obligation -- start the engine, then kick the DMA.
   logic started = 1'b0;
+  // INPUT GAPS. The board feeds this port from a DMA that does not deliver a
+  // beat every cycle -- in_underflow is set on every board run -- while this
+  // bench has always held tvalid continuously. That combination, the real FIFO
+  // handshake in pw_single_oc_axis WITH a gapped source, is the one thing the
+  // suite has never exercised: tb_pw_vq drives the core directly and bypasses
+  // the FIFO, and this bench drives the FIFO but never starves it.
+  function automatic int unsigned xs32(input int unsigned x);
+    int unsigned v;
+    begin v = x; v ^= v << 13; v ^= v >> 17; v ^= v << 5; xs32 = v; end
+  endfunction
+  int unsigned gap_lfsr = 32'h2468_ACE1;
+  logic        src_hold;
+  always_ff @(posedge clk) begin
+    gap_lfsr <= xs32(gap_lfsr);
+    src_hold <= (IN_GAP_PCT > 0) && ((gap_lfsr % 100) < IN_GAP_PCT);
+  end
+
   int beat_i;
   always_comb begin
-    sv_tvalid = rstn && started && (beat_i < NG*VQ_DIM);
+    sv_tvalid = rstn && started && !src_hold && (beat_i < NG*VQ_DIM);
     sv_tdata  = latent_mem[beat_i < NG*VQ_DIM ? beat_i : 0];
     sv_tlast  = (beat_i == NG*VQ_DIM - 1);
   end
@@ -405,6 +425,14 @@ module pw_axi_vq_bench #(
 
 endmodule
 
+
+// The board's stimulus: the real register file AND a gapped input source.
+module tb_pw_axi_vq_gap;
+  pw_axi_vq_bench #(.VQ_K(64), .VQ_NORM_D(256), .VQ_SCORE_W(21),
+                    .VQ_M(4), .VQ_DSUB(16), .COUT_MAX(256),
+                    .DIR("vq64"), .IN_GAP_PCT(70),
+                    .TAG("DEPLOYED M=4 K=64, 70%% input gaps")) u();
+endmodule
 
 // DEPLOYED: M=4, K=64, Dsub=16 -> c_out 256, needs COUT_MAX 256.
 module tb_pw_axi_vq;

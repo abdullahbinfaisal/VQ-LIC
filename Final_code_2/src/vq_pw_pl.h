@@ -75,6 +75,13 @@ int  vq_pw_pl_encode_frame(const void *latent, void *idx_out);
 long vq_pw_pl_verify(const int8_t *cb, uint8_t zp, const void *latent,
                      uint8_t *pl_idx, uint8_t *sw_idx, long *first_bad);
 
+/* Read the activation buffer back verbatim. Loads a codebook that turns each
+ * sub-codebook into a step-4 scalar quantiser on its window's first channel,
+ * then runs eight groups whose marker byte names the group, so the returned
+ * index says WHICH group's beat is sitting in the slot. Returns the number of
+ * readings that were not the group's own beat; 0 means the buffer is sound. */
+int vq_pw_pl_probe_slots(void);
+
 /* Ask the engine to name each codeword in turn, by loading a codebook in which
  * exactly one codeword can win. Returns the number of (m,k) it could not name;
  * 0 means every codeword is reachable and the weight path is sound. */
