@@ -8,7 +8,16 @@
  *
  * scenario: 0 = random, 1 = tie storm (codewords duplicated in pairs, so every
  *           search has co-minimal candidates and the lowest index must win),
- *           2 = INT8 extremes (latent and codebook at the corners)
+ *           2 = INT8 extremes (latent and codebook at the corners),
+ *           3 = LOW-ENTROPY LATENT. Uniform random activations are the least
+ *           tie-prone data there is: 64 dimensions of independent noise put
+ *           the best and second-best codeword far apart, so an argmin that is
+ *           slightly wrong still lands on the right answer. A real analysis
+ *           map is nothing like that -- it is quantised, spatially smooth and
+ *           uses a small part of the INT8 range, so near-ties are common and
+ *           a one-LSB disagreement in the score changes the winner. This
+ *           draws the latent from a narrow set with spatial correlation,
+ *           which is the regime the board actually runs in.
  *
  * Files (all hex, one value per line):
  *   latent.hex   ngroups*64  x 64-bit stream beats, in the order the DMA
@@ -71,9 +80,25 @@ int main(int argc, char **argv)
 
     /* ---- latent ---- */
     const size_t nbytes = (size_t)ng * VQPW_DIM * VQPW_LANES;
-    for (size_t i = 0; i < nbytes; i++) {
-        latent[i] = (scenario == 2) ? (uint8_t)((xs() & 1) ? 255u : 0u)
-                                    : (uint8_t)(xs() & 0xFF);
+    if (scenario == 3) {
+        /* Quantised and spatially smooth: a few distinct levels near the zero
+         * point, held across neighbouring positions. Produces frequent
+         * near-ties in every sub-codebook. */
+        static const uint8_t lvl[8] = {120u,124u,126u,128u,130u,132u,136u,140u};
+        for (int g = 0; g < ng; g++)
+            for (int c = 0; c < VQPW_DIM; c++) {
+                const uint8_t base = lvl[(xs() >> 3) & 7u];
+                for (int l = 0; l < VQPW_LANES; l++) {
+                    const uint8_t jitter = (uint8_t)((xs() & 1u) ? 1u : 0u);
+                    latent[((size_t)g * VQPW_DIM + c) * VQPW_LANES + l] =
+                        (uint8_t)(base + jitter);
+                }
+            }
+    } else {
+        for (size_t i = 0; i < nbytes; i++) {
+            latent[i] = (scenario == 2) ? (uint8_t)((xs() & 1) ? 255u : 0u)
+                                        : (uint8_t)(xs() & 0xFF);
+        }
     }
     vqpw_encode_frame(&ctx, latent, idx);   /* full-frame model; we use ng groups */
 

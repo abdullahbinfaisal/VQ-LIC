@@ -37,7 +37,11 @@ module pw_vq_bench #(
   parameter int COUT_MAX   = 256,
   parameter int NG         = 64,
   parameter string DIR     = "vq64",
-  parameter string TAG     = "DEPLOYED M=4 K=64 Dsub=16"
+  parameter string TAG     = "DEPLOYED M=4 K=64 Dsub=16",
+  // Output-sink backpressure. STALL_BURST cycles of refusal every
+  // STALL_PERIOD cycles; 0 = the old free-running behaviour.
+  parameter int    STALL_BURST  = 0,
+  parameter int    STALL_PERIOD = 512
 )();
 
   localparam int DATA_WIDTH = 8;
@@ -95,6 +99,25 @@ module pw_vq_bench #(
   logic [N_LANES*DATA_WIDTH-1:0] pixel_out;
   logic                          valid_out;
   logic                          out_stall = 0;
+  // BACKPRESSURE. The board drains the VQ stream into DDR through a DMA
+  // that does not always accept a beat per cycle, and the bench was never
+  // modelling that -- out_stall was tied low for every run. STALL_PCT > 0
+  // makes it bounce, which is the only way an emit can still be in flight
+  // when the NEXT group starts committing index fields.
+  // Random per-cycle stalling only slows the whole engine down uniformly; the
+  // emit still finishes long before anything else moves. The hazard needs a
+  // LONG HOLD: the compute pipeline does not wait for the emit, so a sink that
+  // refuses for ~70 cycles lets the next group commit index fields into
+  // vq_word while a beat of the previous group is still being presented.
+  // STALL_BURST is that hold, in cycles, applied every STALL_PERIOD.
+  int unsigned stall_ctr = 0;
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin stall_ctr <= 0; out_stall <= 1'b0; end
+    else begin
+      stall_ctr <= (stall_ctr + 1) % ((STALL_PERIOD > 0) ? STALL_PERIOD : 1);
+      out_stall <= (STALL_BURST > 0) && (stall_ctr < STALL_BURST);
+    end
+  end
 
   // ---- vectors ----
   logic [63:0] latent_mem [0:VQ_DIM*1800-1];
@@ -263,6 +286,18 @@ module tb_pw_vq;
                 .VQ_M(4), .VQ_DSUB(16), .COUT_MAX(256),
                 .NG(64), .DIR("vq64"),
                 .TAG("DEPLOYED M=4 K=64 Dsub=16")) u();
+endmodule
+
+// Same geometry, but with the output sink applying backpressure. On silicon
+// the VQ stream drains into DDR through a DMA that stalls, and an emit that is
+// still in flight when the next group starts committing index fields is a
+// data hazard the free-running bench cannot reach.
+module tb_pw_vq_stall;
+  pw_vq_bench #(.VQ_K(64), .VQ_NORM_D(256), .VQ_SCORE_W(21),
+                .VQ_M(4), .VQ_DSUB(16), .COUT_MAX(256),
+                .NG(64), .DIR("vq64"),
+                .STALL_BURST(150), .STALL_PERIOD(512),
+                .TAG("DEPLOYED M=4 K=64, 150-cycle output stall bursts")) u();
 endmodule
 
 // ---------------------------------------------------------------------------

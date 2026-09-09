@@ -1038,6 +1038,75 @@ static void edge_vq_mismatch_report(const uint8_t *pl, const uint8_t *sw)
     else if (groups_full == 0 && bad_pos > 0)
         printf("[VQDIAG] VERDICT: no group is wrong in all lanes -> per-position,"
                " so NOT a whole-group input problem.\n");
+
+    /* ---- IS hw A BIT-SHIFT OF sw? ------------------------------------------
+     * The first samples all showed hw = 14 where sw = 7, and 14 is 7 << 1. A
+     * field written one bit too high would do exactly that. Test it over ALL
+     * mismatches rather than over the six that happened to print, because a
+     * constant shift and a coincidence look identical in a small sample. */
+    {
+        long shl = 0, shr = 0, other = 0;
+        for (int pos = 0; pos < VQPW_NPOS; pos++)
+            for (int m = 0; m < VQPW_M; m++) {
+                const unsigned a = vqpw_get_index(pl, pos, m);
+                const unsigned b = vqpw_get_index(sw, pos, m);
+                if (a == b) continue;
+                if (a == ((b << 1) & VQPW_KMASK))      shl++;
+                else if (a == (b >> 1))                shr++;
+                else                                   other++;
+            }
+        printf("[VQDIAG] hw == sw<<1 : %ld,  hw == sw>>1 : %ld,  neither : %ld\n",
+               shl, shr, other);
+        if (other == 0 && (shl + shr) > 0)
+            printf("[VQDIAG] EVERY mismatch is a one-bit shift -> a FIELD OFFSET,"
+                   " not a search error.\n");
+    }
+
+    /* ---- WHAT DID THE SEARCH ACTUALLY SCORE? -------------------------------
+     * The decisive question. Recompute all K scores for the offending
+     * sub-codebook in software and look at where the hardware's pick sits:
+     *
+     *   score[hw] ~= score[sw], hw ranked 2nd  -> a near-tie. The two differ
+     *       in the last bit or two of the score arithmetic, and the argmin is
+     *       genuinely ambiguous on this data.
+     *   score[hw] >> score[sw], hw ranked far  -> the hardware was not scoring
+     *       the same numbers at all: wrong activations, wrong weights, or a
+     *       wrong norm for that codeword.
+     *
+     * These need completely different fixes, and nothing short of the scores
+     * distinguishes them. */
+    {
+        vqpw_ctx_t dctx;
+        static int32_t sc[VQPW_K];
+        int8_t u[VQPW_DIM];
+        int shown = 0;
+
+        if (vqpw_init(&dctx, g_pw_cb, 128) == 0) {
+            for (int pos = 0; pos < VQPW_NPOS && shown < 8; pos++) {
+                int m_bad = -1;
+                for (int m = 0; m < VQPW_M; m++)
+                    if (vqpw_get_index(pl, pos, m) != vqpw_get_index(sw, pos, m))
+                        { m_bad = m; break; }
+                if (m_bad < 0) continue;
+
+                {
+                    const int g = pos / VQPW_LANES, l = pos % VQPW_LANES;
+                    const unsigned kh = vqpw_get_index(pl, pos, m_bad);
+                    const unsigned ks = vqpw_get_index(sw, pos, m_bad);
+                    int rank = 0;
+                    vqpw_gather((const uint8_t *)edge_latent_ptr(), g, l, 128, u);
+                    vqpw_search_sub(&dctx, u + m_bad * VQPW_DSUB, m_bad, sc);
+                    for (int k = 0; k < VQPW_K; k++)
+                        if (sc[k] < sc[kh]) rank++;
+                    printf("[VQDIAG]   pos %-6d m=%d  hw k=%-3u score %-10ld"
+                           " (rank %d of %d) | sw k=%-3u score %-10ld | diff %ld\n",
+                           pos, m_bad, kh, (long)sc[kh], rank, VQPW_K,
+                           ks, (long)sc[ks], (long)(sc[kh] - sc[ks]));
+                    shown++;
+                }
+            }
+        }
+    }
 }
 
 /* Print the hiding accounting for a pipelined pass. Outside every timed
