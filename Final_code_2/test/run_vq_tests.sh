@@ -3,8 +3,16 @@
 # run_vq_tests.sh -- the whole VQ verification suite, both quantiser profiles.
 #
 #   ./run_vq_tests.sh          host-side tests only (gcc)
-#   ./run_vq_tests.sh --rtl    also the xsim benches (needs Vivado on PATH or
-#                              XILINX_VIVADO set)
+#   ./run_vq_tests.sh --rtl    also the xsim benches
+#
+# For --rtl, point XILINX_VIVADO at a Vivado install (or put xvlog on PATH):
+#
+#   XILINX_VIVADO=/c/SPROJ/Vivado/2020.2 ./run_vq_tests.sh --rtl
+#
+# NOTE the path. The real 2020.2 install is under C:/SPROJ, NOT C:/Xilinx --
+# C:/Xilinx/Vivado/2020.2 has no bin/ and is not the install. See CLAUDE.md.
+# 2025.1 at C:/Xilinx/2025.1/Vivado also works for SIMULATION, but it has no
+# Zynq-7000 devices, so it must never supply a synthesis or timing number.
 #
 # PROFILES. Everything is built twice, from ONE source each time:
 #   VQPW_PROFILE=1  DEPLOYED  M=4, K=64, Dsub=16   (default)

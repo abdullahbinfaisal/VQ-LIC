@@ -1245,19 +1245,16 @@ cache ranges and 4-beats-per-group output count are unchanged.
 
 ## 9. Synthesis
 
-**Tool caveat, stated first.** The authoritative numbers for this project come
-from Vivado 2020.2 on xc7z020clg484-1. That build is **not runnable here**: the
-2020.2 tree has no `bin/` directory, and the 2025.1 install that does work has
-no Zynq-7000 devices (artix7 / kintex7 / spartan7 / virtex7 only). So the runs
-below are out-of-context synthesis of the PW IP alone on **xc7a200tfbg484-1**,
-the nearest available 7-series part -- same CLB, same BRAM18/36, same DSP48E1,
-same 10 ns constraint.
+**Vivado 2020.2, `xc7z020clg484-1`, out-of-context, 10 ns constraint.** These
+are the real tool and the real part, so the absolute numbers stand as well as
+the deltas.
 
-The DELTAS between configurations transfer; the ABSOLUTE numbers do not, and
-they are not the ones for the paper. A 2020.2 xc7z020 run is still required
-before any resource claim is published.
+(Tool path: `C:/SPROJ/Vivado/2020.2/bin`. `C:/Xilinx/Vivado/2020.2` holds only
+`data/`, `tps/` and `win64/` -- no `bin/` -- and is not the install. Vivado
+2025.1 is present but has no Zynq-7000 devices, so it cannot target this part
+and supplies nothing here. Recorded in `CLAUDE.md`.)
 
-Four configurations, so each change can be attributed separately:
+Four configurations, so each change is attributable separately:
 
 | | orig | base | cout | deploy |
 |---|---|---|---|---|
@@ -1267,56 +1264,62 @@ Four configurations, so each change can be attributed separately:
 
 | resource | orig | base | cout | deploy | base−orig | cout−orig | deploy−orig |
 |---|---|---|---|---|---|---|---|
-| Slice LUTs | 11,680 | 11,682 | 11,684 | 11,270 | **+2** | **+4** | **−410** |
-| LUT as Logic | 11,599 | 11,601 | 11,603 | 11,133 | +2 | +4 | −466 |
+| Slice LUTs | 13,163 | 12,700 | 12,702 | 13,046 | −463 | −461 | **−117** |
+| LUT as Logic | 13,082 | 12,619 | 12,621 | 12,909 | −463 | −461 | −173 |
 | LUT as Memory | 81 | 81 | 81 | 137 | 0 | 0 | **+56** |
-| Slice Registers | 12,571 | 12,600 | 12,598 | 12,543 | **+29** | +27 | **−28** |
+| Slice Registers | 13,809 | 13,824 | 13,824 | 13,789 | +15 | +15 | **−20** |
 | Block RAM Tile | 46 | 46 | 46 | 46 | **0** | **0** | **0** |
 | RAMB36 / RAMB18 | 28 / 36 | 28 / 36 | 28 / 36 | 28 / 36 | 0 | 0 | 0 |
-| **DSP48E1** | **274** | **274** | **274** | **274** | **0** | **0** | **0** |
-| WNS (ns) | +1.915 | +1.883 | +1.883 | **+1.522** | −0.032 | −0.032 | −0.393 |
+| **DSP48E1** | **220** | **220** | **220** | **220** | **0** | **0** | **0** |
+| WNS (ns) | +1.608 | +1.841 | +1.841 | **+1.809** | +0.233 | +0.233 | **+0.201** |
 
 Reading it:
 
-- **COUT_MAX 240 -> 256 costs +2 LUTs and nothing else.** Zero registers, zero
-  BRAM, zero DSP, zero timing. Exactly as predicted in §4: `W_AW` stays 11,
-  `PARAM_AW` stays 8, and both memories still fit one BRAM18 per bank. The
-  audit's claim that this ceiling is free was correct.
-- **DSP48E1 is unchanged at 274 in all four.** Raising COUT_MAX does not touch
-  DSP usage, and neither does the VQ change. `Q` is 32 throughout.
-- **BRAM is unchanged at 46 tiles in all four.** The norm ROM stays distributed
-  RAM (`ram_style = "distributed"`), which is where the +56 LUT-as-Memory comes
+- **DSP48E1 is 220 in all four.** The PW engine alone already saturates this
+  device's DSP column, and nothing here moves it -- not COUT_MAX, not the VQ
+  generalisation. That is the direct answer to "does raising COUT_MAX to 256
+  change DSP usage": **no**, and it could not, because `Q = N_OC = 32` and
+  `N_LANES = 8` are untouched and they are what set the MAC array size.
+- **COUT_MAX 240 -> 256 costs +2 LUTs and nothing else** (cout vs base). Zero
+  registers, zero BRAM, zero DSP, zero timing. Exactly as §4 predicted: `W_AW`
+  stays 11, `PARAM_AW` stays 8, and both memories still fit one BRAM18 per
+  bank. The audit's claim that this ceiling is free was correct.
+- **Block RAM is unchanged at 46 tiles.** The norm ROM stays distributed RAM
+  (`ram_style = "distributed"`), which is where the +56 LUT-as-Memory comes
   from: 128x20 -> 256x21 bits.
-- **The deployed configuration uses 410 FEWER LUTs than the shipped one.** Not
-  a typo and not an error budget -- the packing mux shrinks from eight 4-bit
-  fields per 32-bit word to four 6-bit fields per 24-bit word, on each of 8
-  lanes, and that saving exceeds the +56 LUTRAM the larger norm ROM costs. The
-  causal attribution is inference; the measurement is not.
-- **The guard costs 29 registers and 0.032 ns**, isolated by base−orig.
-- All four **meet** the 10 ns constraint. The deployed configuration keeps
-  **1.522 ns of slack, 15.2% of the period**, and its critical path is
+- **The deployed configuration uses 117 fewer LUTs and 20 fewer registers than
+  the shipped RTL.** The packing mux shrinks from eight 4-bit fields per 32-bit
+  word to four 6-bit fields per 24-bit word on each of 8 lanes, and that more
+  than pays for the larger norm ROM. The attribution is inference; the
+  measurement is not.
+- **Timing does not regress.** +1.608 -> +1.809 ns, i.e. 0.2 ns MORE slack than
+  the shipped RTL. The base/cout gain of +0.233 ns is on a path none of this
+  touches (`oc_batch_idx -> shadow_copy_len`), so it is netlist perturbation,
+  not an improvement to claim. The honest statement is: no regression.
+- The deployed build's critical path is
   `u_ppu/sel_shift_s2 -> u_ppu/inc3_pre_r` -- the pre-existing requantiser
   rounding path, not anything added here.
 
-### The guard had to be pipelined, and that is worth recording
+### The guard had to be pipelined, and the cost of not doing it is measured
 
 The first implementation put the geometry check directly in the
-`start_in -> next-state` cone. It worked, and it was the **critical path of the
-entire IP**:
+`start_in -> next-state` cone. Same tool, same part, deployed generics:
 
 | guard placement | WNS | critical path |
 |---|---|---|
-| none (shipped RTL) | +1.915 | `u_ppu` requantiser |
-| in the S_IDLE next-state cone | **−1.019** | `reg_cout_run -> FSM_sequential_st` |
-| registered, 1 stage, inferred DSP multiply | **−0.789** | `reg_cout_run -> cfg_bad_r` |
-| registered, 1 stage, multiply forced to LUTs | +0.446 | `reg_cin_run -> cfg_bad_r` |
-| registered, 2 stages (shipped here) | **+1.883** | `u_ppu` requantiser |
+| none (shipped RTL) | +1.608 | `oc_batch_idx -> shadow_copy_len` |
+| in the S_IDLE next-state cone | **+0.066** | `reg_cout_run -> st_reg[2]` |
+| registered, 2 stages (shipped here) | **+1.809** | `u_ppu` requantiser |
 
-Two separate causes. First, the window-fit test contains a multiply and Vivado
-inferred a **DSP48E1** for it -- roughly 2.9 ns of combinational DSP delay
-inside a control path -- fixed with `(* use_dsp = "no" *)` and by replacing the
-`ceil` divide with a plain shift by `$clog2(max(N_OC, VQ_K))`. Second, even as
-LUTs the comparison chain was long enough to bind, so it was split across two
+The in-cone version technically closes at synthesis, with 0.066 ns of the
+10 ns period left, and it is the critical path of the whole IP. That is not a
+margin worth carrying into place-and-route on a device already at 220/220 DSP.
+
+Two separate causes were fixed. First, the window-fit test contains a multiply
+and Vivado inferred a **DSP48E1** for it -- combinational DSP delay inside a
+control path -- removed with `(* use_dsp = "no" *)` and by replacing the `ceil`
+divide with a plain shift by `$clog2(max(N_OC, VQ_K))`. Second, even as LUTs
+the comparison chain was long enough to bind, so it was split across two
 registered stages.
 
 The guard has no throughput role: it only has to be settled by the time
@@ -1327,19 +1330,22 @@ headroom of the datapath it protects would not have been.
 
 ### Does it still fit xc7z020clg484-1?
 
-On the evidence here, **yes, with the same margin as the shipped build** -- but
-that is a delta argument, not a measurement on the part:
+**Yes.** On the real part and the real tool:
 
-- DSP is the binding resource on this device (the shipped design sits at
-  220/220), and **DSP usage does not change**. Not by raising COUT_MAX, not by
-  the VQ generalisation.
-- BRAM does not change.
-- LUTs go **down** by 410 in the IP, so the 34,358 (64.6%) of the shipped
-  full-design build does not grow.
-- Registers go down by 28.
-- Timing slack falls 0.393 ns out of 10 ns, from a path that is not the one
-  this change touched.
+| | deployed, this IP alone | device |
+|---|---|---|
+| Slice LUTs | 13,046 | 53,200 (24.5%) |
+| Slice Registers | 13,789 | 106,400 (13.0%) |
+| Block RAM Tile | 46 | 140 (32.9%) |
+| DSP48E1 | 220 | 220 (**100%**) |
 
-What this does NOT establish is post-route timing on the real part with the
-real floorplan at 220/220 DSP. That needs the 2020.2 xc7z020 run, and until it
-is done the fit should be described as expected rather than demonstrated.
+DSP is the binding resource and it does not move. LUTs and registers go down.
+BRAM is unchanged. Timing has 1.809 ns of slack against 10 ns, 18% of the
+period, on a path this change did not touch.
+
+One thing this still does not establish: **post-route** timing for the FULL
+design -- PW plus the DW engine, the DMAs and the interconnect -- with the real
+floorplan at 220/220 DSP. That needs `synth_design` + `place_design` +
+`route_design` on the whole block design after Vivado re-packages the IP with
+the new parameters (see §10). Out-of-context synthesis of one IP is a strong
+indicator, not a substitute.

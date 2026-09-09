@@ -731,6 +731,15 @@ module pw_pixel_major_core #(
   // and the top 8 bits of the 32-bit transport word are held at zero.
   localparam int VQ_WORD_W  = VQ_KW * (VQ_NORM_D / VQ_K);
 
+  // PPU drain-issue index and batch. Declared HERE, above the VQ generate
+  // block, because that block snoops both. They used to be declared with the
+  // rest of the PPU state further down; Vivado 2025.1's xvlog tolerates the
+  // forward reference and 2020.2's synth_design does too, but 2020.2's xvlog
+  // rejects it outright (VRFC 10-3380), so the benches would not compile on
+  // the tool that produces this project's numbers.
+  logic [$clog2(N_OC>1?N_OC+1:2)-1:0]  ppu_issue_idx;
+  logic [11:0]                         ppu_oc_batch;  // OC batch being drained
+
   logic [N_LANES*DATA_WIDTH-1:0] vq_pixel_out;
   logic                          vq_valid_out;
   wire  [N_LANES*DATA_WIDTH-1:0] ppu_pixel_bus;
@@ -1017,7 +1026,6 @@ module pw_pixel_major_core #(
   // bits holds 30 and 31, so the guard worked. That is the only reason every
   // build before N_OC=8 was correct, and why N_OC=16 is NOT a viable hedge.
   // $clog2(N_OC+1) guarantees the terminal value is representable.
-  logic [$clog2(N_OC>1?N_OC+1:2)-1:0]  ppu_issue_idx;
   logic [31:0]                        ppu_out_cnt;
 
   // ==================================================================
@@ -1057,7 +1065,6 @@ module pw_pixel_major_core #(
   // unconditionally outside the FSM so it stays correct across batch boundaries
   // and while out_stall is held. Max occupancy is N_OC + PPU depth (~9).
   logic [7:0]                         ppu_in_flight;
-  logic [11:0]                        ppu_oc_batch;  // which OC batch PPU is draining
 
   // ------------------------------------------------------------
   // Main Controller
