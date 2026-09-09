@@ -476,11 +476,29 @@ int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
 
     xil_printf("[VQST] sub-system self-test, one group per case\r\n");
 
-    for (int t = 0; t < 4; t++) {
+    /* EACH CASE TWICE.
+     *
+     * The offline replay said channel 0 of a run carries the PREVIOUS run's
+     * value: substituting it reproduced all four board answers, the two that
+     * failed and the two that passed. If that is what is happening, then
+     * running the SAME latent a second time hands channel 0 the value it was
+     * supposed to have, and the repeat must PASS.
+     *
+     *   fails then passes -> channel 0 inherits across RUNS, and the first
+     *                        group of a run is the only one exposed.
+     *   fails both times  -> the inheritance is per GROUP, which is what the
+     *                        full frame shows: 233 of 1800 groups touched, far
+     *                        more than the one group a per-run fault could
+     *                        reach.
+     *
+     * Those need different fixes, and one repeated run separates them. */
+    for (int t = 0; t < 8; t++) {
+        const int rep = t & 1;          /* 0 = first run, 1 = immediate repeat */
+        const int cs  = t >> 1;
         long bad_m[VQPW_M];
         for (int m = 0; m < VQPW_M; m++) bad_m[m] = 0;
 
-        for (size_t i = 0; i < sizeof s_st_lat; i++) s_st_lat[i] = fills[t];
+        for (size_t i = 0; i < sizeof s_st_lat; i++) s_st_lat[i] = fills[cs];
         Xil_DCacheFlushRange((UINTPTR)s_st_lat, sizeof s_st_lat);
         Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, sizeof s_st_hw);
 
@@ -518,10 +536,23 @@ int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
         dma_quiesce();
         Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, sizeof s_st_hw);
 
-        /* The reference over the same one group. vqpw_encode_frame walks whole
-         * frames, so run it on a buffer whose first group is this one; only
-         * the first 8 positions are compared. */
-        vqpw_encode_frame(&s_ctx, s_st_lat, s_st_sw);
+        /* The reference over the same ONE group.
+         *
+         * NOT vqpw_encode_frame: that walks all VQPW_NGROUPS and would read
+         * 921,600 bytes out of this 512-byte buffer. The comparison below only
+         * looks at group 0, so the overrun never changed a reported number,
+         * but it was undefined behaviour reading whatever follows in memory
+         * and had no business being here. */
+        {
+            int8_t u[VQPW_DIM];
+            for (int l = 0; l < VQPW_LANES; l++) {
+                vqpw_gather(s_st_lat, 0, l, s_ctx.zp, u);
+                for (int m = 0; m < VQPW_M; m++)
+                    vqpw_put_index(s_st_sw, l, m,
+                        (uint8_t)vqpw_search_sub(&s_ctx, u + m * VQPW_DSUB, m, 0));
+            }
+        }
+        (void)rep;
 
         for (int pos = 0; pos < VQPW_LANES; pos++)
             for (int m = 0; m < VQPW_M; m++)
@@ -532,7 +563,7 @@ int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
             long tot = 0;
             for (int m = 0; m < VQPW_M; m++) tot += bad_m[m];
             if (tot > worst) worst = (int)tot;
-            xil_printf("[VQST]   %s : ", names[t]);
+            xil_printf("[VQST]   %s %s: ", names[cs], rep ? "REPEAT" : "first ");
             for (int m = 0; m < VQPW_M; m++)
                 xil_printf("m%d=%d ", m, (int)bad_m[m]);
             xil_printf("of %d  -> %s\r\n", VQPW_LANES * VQPW_M,
@@ -560,10 +591,13 @@ int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
         }
     }
 
-    xil_printf("[VQST] READ IT AS: case 1 wrong -> the NORM ROM the engine "
-               "holds is not what was written.\r\n");
-    xil_printf("[VQST]              case 1 right, others wrong -> the MAC "
-               "(weights or activations).\r\n");
+    xil_printf("[VQST] READ IT AS: u=0 wrong -> the NORM ROM is not what was "
+               "written.\r\n");
+    xil_printf("[VQST]              u=0 right, others wrong -> the MAC.\r\n");
+    xil_printf("[VQST]              a case that FAILS then PASSES on repeat -> "
+               "channel 0 inherits across runs.\r\n");
+    xil_printf("[VQST]              a case that fails BOTH times -> it inherits "
+               "per group.\r\n");
     return worst;
 }
 
