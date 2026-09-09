@@ -453,8 +453,13 @@ int vq_pw_pl_encode_frame(const void *latent, void *idx_out)
  *
  * One group is 512 input bytes and 32 output bytes, a few microseconds each.
  * ------------------------------------------------------------------------- */
-static uint8_t s_st_lat[64 * 8]  __attribute__((aligned(64)));
-static uint8_t s_st_hw [4 * 8]   __attribute__((aligned(64)));
+/* One group of traffic, with room for two when the per-group question needs
+ * asking. Every existing case uses ONE group; only the two-group experiment
+ * below reaches past it. */
+#define ONEG_IN  ((size_t)VQPW_CIN_LOAD * VQPW_LANES)      /* 512 bytes */
+#define ONEG_OUT ((size_t)(VQPW_LANES / 2) * 8)            /*  32 bytes */
+static uint8_t s_st_lat[2 * 64 * 8] __attribute__((aligned(64)));
+static uint8_t s_st_hw [2 *  4 * 8] __attribute__((aligned(64)));
 static uint8_t s_st_sw [VQPW_IDX_BYTES];
 
 int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
@@ -498,9 +503,9 @@ int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
         long bad_m[VQPW_M];
         for (int m = 0; m < VQPW_M; m++) bad_m[m] = 0;
 
-        for (size_t i = 0; i < sizeof s_st_lat; i++) s_st_lat[i] = fills[cs];
-        Xil_DCacheFlushRange((UINTPTR)s_st_lat, sizeof s_st_lat);
-        Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, sizeof s_st_hw);
+        for (size_t i = 0; i < ONEG_IN; i++) s_st_lat[i] = fills[cs];
+        Xil_DCacheFlushRange((UINTPTR)s_st_lat, ONEG_IN);
+        Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, ONEG_OUT);
 
         dma_quiesce();
         pw_w(PW_REG_TILE_PIXELS, (uint32_t)VQPW_LANES);
@@ -513,10 +518,10 @@ int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
 
         dma_w(S2MM_DMACR,  DMACR_RS);
         dma_w(S2MM_DA,     (uint32_t)(UINTPTR)s_st_hw);
-        dma_w(S2MM_LENGTH, (uint32_t)sizeof s_st_hw);
+        dma_w(S2MM_LENGTH, (uint32_t)ONEG_OUT);
         dma_w(MM2S_DMACR,  DMACR_RS);
         dma_w(MM2S_SA,     (uint32_t)(UINTPTR)s_st_lat);
-        dma_w(MM2S_LENGTH, (uint32_t)sizeof s_st_lat);
+        dma_w(MM2S_LENGTH, (uint32_t)ONEG_IN);
 
         {
             uint32_t i;
@@ -534,7 +539,7 @@ int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
 
         pw_w(PW_REG_VQ_CTRL, 0u);
         dma_quiesce();
-        Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, sizeof s_st_hw);
+        Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, ONEG_OUT);
 
         /* The reference over the same ONE group.
          *
@@ -571,7 +576,7 @@ int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
             {   /* An all-zero transport word means nothing was written, not
                  * that every sub-codebook chose codeword 0. */
                 int allz = 1;
-                for (size_t b = 0; b < sizeof s_st_hw; b++)
+                for (size_t b = 0; b < ONEG_OUT; b++)
                     if (s_st_hw[b] != 0u) { allz = 0; break; }
                 if (allz)
                     xil_printf("[VQST]     output buffer is ENTIRELY ZERO -- the "
@@ -589,6 +594,85 @@ int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
                 xil_printf("]\r\n");
             }
         }
+    }
+
+    /* ---- PER RUN, OR PER GROUP? -------------------------------------------
+     * The repeat above confirms channel 0 inherits, but cannot say from what:
+     * with ONE group per run, "the previous group" and "the previous run" are
+     * the same thing. That was a flaw in the test, and the full frame is what
+     * exposes it -- 233 of 1800 groups touched is far more than the single
+     * group a per-run fault could reach.
+     *
+     * So ask directly: TWO groups in ONE run, different data in each, and look
+     * only at group 1.
+     *
+     *   group 1 clean                  -> only a run's first group is exposed,
+     *                                     and 233 needs another explanation.
+     *   group 1 = channel 0 from
+     *   group 0                        -> every group inherits from its
+     *                                     predecessor. That fits 233, and the
+     *                                     fix has to be per group.
+     */
+    {
+        const uint8_t A = 128u, B = 255u;   /* group 0 -> u 0 ; group 1 -> u +127 */
+        int8_t u[VQPW_DIM];
+        int bad_clean = 0, bad_stale = 0;
+
+        for (size_t i = 0; i < ONEG_IN; i++)           s_st_lat[i] = A;
+        for (size_t i = ONEG_IN; i < 2 * ONEG_IN; i++) s_st_lat[i] = B;
+        Xil_DCacheFlushRange((UINTPTR)s_st_lat, 2 * ONEG_IN);
+        Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, 2 * ONEG_OUT);
+
+        dma_quiesce();
+        pw_w(PW_REG_TILE_PIXELS, (uint32_t)(2 * VQPW_LANES));   /* TWO groups */
+        pw_w(PW_REG_CIN_RUN,     (uint32_t)VQPW_CIN_MAC);
+        pw_w(PW_REG_COUT_RUN,    (uint32_t)VQPW_COUT_TOTAL);
+        pw_w(PW_REG_ZP_RELU,     0x00008080u);
+        pw_w(PW_REG_VQ_CTRL,     ((uint32_t)VQPW_CIN_LOAD << 12) | 1u);
+        pw_w(PW_REG_CTRL,        CTRL_CLEAR_ERR);
+        pw_w(PW_REG_CTRL,        CTRL_START);
+
+        dma_w(S2MM_DMACR,  DMACR_RS);
+        dma_w(S2MM_DA,     (uint32_t)(UINTPTR)s_st_hw);
+        dma_w(S2MM_LENGTH, (uint32_t)(2 * ONEG_OUT));
+        dma_w(MM2S_DMACR,  DMACR_RS);
+        dma_w(MM2S_SA,     (uint32_t)(UINTPTR)s_st_lat);
+        dma_w(MM2S_LENGTH, (uint32_t)(2 * ONEG_IN));
+
+        for (uint32_t i = 0; i < SPIN_LIMIT; i++)
+            if (dma_r(S2MM_DMASR) & DMASR_IDLE) break;
+        pw_w(PW_REG_VQ_CTRL, 0u);
+        dma_quiesce();
+        Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, 2 * ONEG_OUT);
+
+        for (int l = 0; l < VQPW_LANES; l++) {
+            const int pos = VQPW_LANES + l;             /* group 1, lane l */
+            for (int d = 0; d < VQPW_DIM; d++) u[d] = (int8_t)((int)B - 128);
+            for (int m = 0; m < VQPW_M; m++)
+                if ((int)vqpw_get_index(s_st_hw, pos, m)
+                    != vqpw_search_sub(&s_ctx, u + m * VQPW_DSUB, m, 0)) bad_clean++;
+
+            u[0] = (int8_t)((int)A - 128);              /* channel 0 from group 0 */
+            for (int m = 0; m < VQPW_M; m++)
+                if ((int)vqpw_get_index(s_st_hw, pos, m)
+                    != vqpw_search_sub(&s_ctx, u + m * VQPW_DSUB, m, 0)) bad_stale++;
+        }
+
+        xil_printf("[VQST] two groups in one run, group0=%d group1=%d\r\n",
+                   (int)A, (int)B);
+        xil_printf("[VQST]   group 1 vs CLEAN            : %d wrong of %d\r\n",
+                   bad_clean, VQPW_LANES * VQPW_M);
+        xil_printf("[VQST]   group 1 vs CH0-FROM-GROUP-0 : %d wrong of %d\r\n",
+                   bad_stale, VQPW_LANES * VQPW_M);
+        if (bad_clean == 0)
+            xil_printf("[VQST]   -> group 1 CLEAN: only a run's first group "
+                       "inherits.\r\n");
+        else if (bad_stale == 0)
+            xil_printf("[VQST]   -> group 1 inherits channel 0 from group 0: the "
+                       "fault is PER GROUP.\r\n");
+        else
+            xil_printf("[VQST]   -> neither fits; the corruption is not channel 0 "
+                       "alone.\r\n");
     }
 
     xil_printf("[VQST] READ IT AS: u=0 wrong -> the NORM ROM is not what was "
@@ -637,8 +721,8 @@ int vq_pw_pl_sweep_codewords(void)
     xil_printf("[VQSW] codeword reachability sweep, %d codewords x %d "
                "sub-codebooks\r\n", VQPW_K, VQPW_M);
 
-    for (size_t i = 0; i < sizeof s_st_lat; i++) s_st_lat[i] = 129u;  /* u = +1 */
-    Xil_DCacheFlushRange((UINTPTR)s_st_lat, sizeof s_st_lat);
+    for (size_t i = 0; i < ONEG_IN; i++) s_st_lat[i] = 129u;  /* u = +1 */
+    Xil_DCacheFlushRange((UINTPTR)s_st_lat, ONEG_IN);
 
     for (int kt = 0; kt < VQPW_K; kt++) {
         for (size_t i = 0; i < sizeof s_sw_cb; i++) s_sw_cb[i] = 0;
@@ -648,7 +732,7 @@ int vq_pw_pl_sweep_codewords(void)
 
         if (vq_pw_pl_load_codebook(s_sw_cb, 128) != 0) return -1;
 
-        Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, sizeof s_st_hw);
+        Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, ONEG_OUT);
         dma_quiesce();
         pw_w(PW_REG_TILE_PIXELS, (uint32_t)VQPW_LANES);
         pw_w(PW_REG_CIN_RUN,     (uint32_t)VQPW_CIN_MAC);
@@ -660,17 +744,17 @@ int vq_pw_pl_sweep_codewords(void)
 
         dma_w(S2MM_DMACR,  DMACR_RS);
         dma_w(S2MM_DA,     (uint32_t)(UINTPTR)s_st_hw);
-        dma_w(S2MM_LENGTH, (uint32_t)sizeof s_st_hw);
+        dma_w(S2MM_LENGTH, (uint32_t)ONEG_OUT);
         dma_w(MM2S_DMACR,  DMACR_RS);
         dma_w(MM2S_SA,     (uint32_t)(UINTPTR)s_st_lat);
-        dma_w(MM2S_LENGTH, (uint32_t)sizeof s_st_lat);
+        dma_w(MM2S_LENGTH, (uint32_t)ONEG_IN);
 
         for (uint32_t i = 0; i < SPIN_LIMIT; i++)
             if (dma_r(S2MM_DMASR) & DMASR_IDLE) break;
 
         pw_w(PW_REG_VQ_CTRL, 0u);
         dma_quiesce();
-        Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, sizeof s_st_hw);
+        Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, ONEG_OUT);
 
         for (int m = 0; m < VQPW_M; m++) {
             const int got = (int)vqpw_get_index(s_st_hw, 0, m);
