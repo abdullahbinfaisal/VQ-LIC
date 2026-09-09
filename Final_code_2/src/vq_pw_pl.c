@@ -395,6 +395,24 @@ long vq_pw_pl_verify(const int8_t *cb, uint8_t zp, const void *latent,
     if (vq_pw_pl_load_codebook(cb, zp) != 0) return -1;
     if (vq_pw_pl_encode_frame(latent, pl_idx) != 0) return -1;
 
+    // THE TWO SIDES MUST READ THE SAME BYTES.
+    //
+    // The engine reads the latent out of DDR by DMA. vqpw_encode_frame() reads
+    // it through the CPU data cache. The latent was WRITTEN into DDR by the
+    // cascade's own S2MM, which does not go through that cache, so any line the
+    // CPU happens to hold from an earlier pass is STALE -- and stale is exactly
+    // what a comparison must not be, because the disagreement then belongs to
+    // the cache and not to the engine.
+    //
+    // A stale 32-byte line spans 4 channels x 8 lanes of ONE group, so it
+    // corrupts a whole group in all eight lanes and leaves every other group
+    // untouched: a scattered, data-dependent, roughly-1% mismatch that looks
+    // like a hardware fault and is not one.
+    //
+    // Invalidate, do not flush: the CPU has no business having written here,
+    // and flushing would push stale CPU data over good DMA data.
+    Xil_DCacheInvalidateRange((UINTPTR)latent, LATENT_BYTES);
+
     // Same context, same codebook, same latent -- this compares the engine
     // against vqpw_encode_frame(), the model the RTL bench also checks
     // against, not against a second re-derivation of it.

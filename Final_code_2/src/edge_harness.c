@@ -951,6 +951,95 @@ static int edge_one_pipelined(int frame_id, const rc_models_t *M,
 }
 
 
+/* ---------------------------------------------------------------------------
+ * WHERE ARE THE MISMATCHES?
+ *
+ * A count alone cannot distinguish faults that need completely different
+ * fixes. The shape can:
+ *
+ *   whole GROUPS wrong, all 8 lanes together, in runs
+ *       -> the activations for those groups were wrong, i.e. the input stream
+ *          starved or slipped. Look at in_underflow (STATUS2 bit 1).
+ *   every mismatch in ONE sub-codebook m
+ *       -> the mapping for that m: window base, weight bank, norm address.
+ *   every mismatch in ONE lane
+ *       -> a per-lane datapath fault.
+ *   scattered singletons, hw and sw indices both plausible
+ *       -> a near-tie: score arithmetic differing in the last bit or two.
+ *
+ * Reports each of those directly rather than leaving them to be inferred.
+ * ------------------------------------------------------------------------- */
+static void edge_vq_mismatch_report(const uint8_t *pl, const uint8_t *sw)
+{
+    long per_m[VQPW_M];
+    long per_lane[VQPW_LANES];
+    long bad_pos = 0, groups_bad = 0, groups_full = 0;
+    long runs = 0;
+    int  prev_bad_grp = -2;
+
+    for (int i = 0; i < VQPW_M; i++)     per_m[i] = 0;
+    for (int i = 0; i < VQPW_LANES; i++) per_lane[i] = 0;
+
+    for (int g = 0; g < VQPW_NGROUPS; g++) {
+        int lanes_bad = 0;
+        for (int l = 0; l < VQPW_LANES; l++) {
+            const int pos = g * VQPW_LANES + l;
+            int any = 0;
+            for (int m = 0; m < VQPW_M; m++) {
+                const uint8_t a = vqpw_get_index(pl, pos, m);
+                const uint8_t b = vqpw_get_index(sw, pos, m);
+                if (a != b) { per_m[m]++; any = 1; }
+            }
+            if (any) { bad_pos++; per_lane[l]++; lanes_bad++; }
+        }
+        if (lanes_bad) {
+            groups_bad++;
+            if (lanes_bad == VQPW_LANES) groups_full++;
+            if (g != prev_bad_grp + 1) runs++;
+            prev_bad_grp = g;
+        }
+    }
+
+    printf("[VQDIAG] positions wrong        : %ld of %d (%.3f%%)\n",
+           bad_pos, VQPW_NPOS, 100.0 * (double)bad_pos / (double)VQPW_NPOS);
+    printf("[VQDIAG] groups touched         : %ld of %d, of which ALL-8-lanes: %ld\n",
+           groups_bad, VQPW_NGROUPS, groups_full);
+    printf("[VQDIAG] contiguous group runs  : %ld\n", runs);
+    printf("[VQDIAG] per sub-codebook m     :");
+    for (int m = 0; m < VQPW_M; m++) printf(" m%d=%ld", m, per_m[m]);
+    printf("\n[VQDIAG] per lane               :");
+    for (int l = 0; l < VQPW_LANES; l++) printf(" l%d=%ld", l, per_lane[l]);
+    printf("\n");
+
+    /* The first few, in full, so the actual index values can be eyeballed. */
+    {
+        int shown = 0;
+        for (int g = 0; g < VQPW_NGROUPS && shown < 6; g++)
+            for (int l = 0; l < VQPW_LANES && shown < 6; l++) {
+                const int pos = g * VQPW_LANES + l;
+                int any = 0;
+                for (int m = 0; m < VQPW_M; m++)
+                    if (vqpw_get_index(pl, pos, m) != vqpw_get_index(sw, pos, m)) any = 1;
+                if (!any) continue;
+                printf("[VQDIAG]   pos %-6d g=%-5d l=%d  hw[", pos, g, l);
+                for (int m = 0; m < VQPW_M; m++) printf("%s%u", m ? "," : "",
+                                                        (unsigned)vqpw_get_index(pl, pos, m));
+                printf("]  sw[");
+                for (int m = 0; m < VQPW_M; m++) printf("%s%u", m ? "," : "",
+                                                        (unsigned)vqpw_get_index(sw, pos, m));
+                printf("]\n");
+                shown++;
+            }
+    }
+
+    if (groups_full == groups_bad && groups_bad > 0)
+        printf("[VQDIAG] VERDICT: every touched group is wrong in ALL 8 lanes ->"
+               " the INPUT for those groups was wrong, not the search.\n");
+    else if (groups_full == 0 && bad_pos > 0)
+        printf("[VQDIAG] VERDICT: no group is wrong in all lanes -> per-position,"
+               " so NOT a whole-group input problem.\n");
+}
+
 /* Print the hiding accounting for a pipelined pass. Outside every timed
  * bracket by construction: nothing here runs until the pass is over. */
 static void edge_bg_report(double ii_ms, int nframes, double t_range_serial)
@@ -1310,9 +1399,16 @@ int edge_validation_run(void)
         printf("[EDGE] USE_PW_VQ=1 -- check the synth log really bound 1.\n");
         g_pl_ok = 0;
     } else {
-        /* WHICH BITSTREAM IS ACTUALLY LOADED? Ask the hardware, before
-         * running anything that could be misread. An index mismatch alone
-         * cannot tell an old bitstream from a real RTL bug. */
+        /* WHICH BITSTREAM IS ACTUALLY LOADED? Ask the hardware; an index
+         * mismatch alone cannot tell an old bitstream from a real RTL bug.
+         *
+         * ORDER MATTERS. The probe deliberately provokes a refused start and
+         * then resets both DMA channels, so it is not a passive observer: run
+         * it BEFORE the comparison and it becomes a candidate cause of what
+         * the comparison finds. It runs first only when it is the cheaper
+         * question -- and it is not, once it has answered PRESENT once. So it
+         * is issued here, its verdict is held, and the comparison below is
+         * performed on an engine the probe has not touched since. */
         const int guard = vq_pw_pl_probe_guard();
         if (guard > 0) {
             printf("[EDGE] PL identity: guard PRESENT -> bitstream is 2026-09-09"
@@ -1338,9 +1434,28 @@ int edge_validation_run(void)
                bad, VQPW_IDX_BYTES, first, (bad == 0) ? "PASS" : "FAIL");
         printf("[EDGE] codebook reload %.4f ms, search %.4f ms\n",
                vq_pw_pl_last_prog_ms(), vq_pw_pl_last_run_ms());
+        {
+            const uint32_t s2 = vq_pw_pl_status2();
+            printf("[EDGE] STATUS2=0x%08x  in_ovf=%u in_udf=%u out_ovf=%u "
+                   "out_udf=%u start_busy=%u cfg_err=%u\n",
+                   (unsigned)s2, (unsigned)((s2 >> 0) & 1u), (unsigned)((s2 >> 1) & 1u),
+                   (unsigned)((s2 >> 2) & 1u), (unsigned)((s2 >> 3) & 1u),
+                   (unsigned)((s2 >> 4) & 1u), (unsigned)((s2 >> 5) & 1u));
+            if ((s2 >> 1) & 1u)
+                printf("[EDGE] INPUT UNDERFLOW during the search: the engine read the\n"
+                       "[EDGE] input FIFO empty, so some groups saw wrong activations.\n"
+                       "[EDGE] That is a STREAMING fault, not a search fault.\n");
+        }
+        if (bad != 0) edge_vq_mismatch_report(g_pl_idx, g_rt);
         if (bad != 0) {
             printf("[EDGE] ABORT: PW VQ is not reference-exact. No VQ timing will\n");
             printf("[EDGE] be reported -- a fast wrong answer is not a result.\n");
+            if (guard > 0) {
+                printf("[EDGE] The PL identity probe said PRESENT, so the bitstream\n");
+                printf("[EDGE] geometry is RIGHT and this is NOT a profile mismatch.\n");
+                printf("[EDGE] Read the [VQDIAG] lines above: they say whether the\n");
+                printf("[EDGE] fault is in the input stream or in the search itself.\n");
+            } else
             printf("[EDGE] MOST LIKELY CAUSE: firmware and bitstream disagree.\n");
             printf("[EDGE] This firmware is built for M=%d K=%d Dsub=%d, which needs\n",
                    VQPW_M, VQPW_K, VQPW_DSUB);
