@@ -75,6 +75,12 @@ int  vq_pw_pl_encode_frame(const void *latent, void *idx_out);
 long vq_pw_pl_verify(const int8_t *cb, uint8_t zp, const void *latent,
                      uint8_t *pl_idx, uint8_t *sw_idx, long *first_bad);
 
+/* One-group runs on crafted latents that remove terms from the score, so a
+ * disagreement can be attributed to the norm ROM or to the MAC rather than
+ * just to "the engine". Returns the worst per-case mismatch count, 0 = all
+ * clean, <0 if the codebook was rejected. See the long note in vq_pw_pl.c. */
+int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp);
+
 /* Is the PL currently loaded a build that has the configuration guard, i.e.
  * 2026-09-09 or later? Programs a geometry the new engine must refuse and reads
  * cfg_err back. Safe on an old bitstream too -- it arms the DMA so an unguarded

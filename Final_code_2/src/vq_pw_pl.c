@@ -386,6 +386,123 @@ int vq_pw_pl_encode_frame(const void *latent, void *idx_out)
     return -2;
 }
 
+/* ---------------------------------------------------------------------------
+ * SUB-SYSTEM SELF-TEST
+ *
+ * The board disagrees with its own RTL simulation on one specific input, and a
+ * whole-frame comparison cannot say WHICH part of the engine is wrong. These
+ * one-group runs can, because each choice of latent removes a term from
+ *
+ *     score(k) = ||v_k||^2 - 2 * (u . v_k)
+ *
+ *   u = 0      (latent 128)  the dot product vanishes for EVERY codeword, so
+ *                            score(k) = norm(k) exactly. The argmin then
+ *                            depends on the NORM ROM ALONE. If this disagrees,
+ *                            the norms the engine holds are not the norms the
+ *                            driver wrote, and the MAC is irrelevant.
+ *   u = +127   (latent 255)  the failing vector from the board, and the
+ *                            largest-magnitude input the datapath can see.
+ *   u = -128   (latent 0)    the other extreme, opposite sign.
+ *   u = +1     (latent 129)  small magnitude, so score is norm-dominated but
+ *                            the MAC still contributes.
+ *
+ * Read together these separate "the norm ROM is wrong" from "the MAC is wrong"
+ * from "only the extreme magnitudes are wrong", which is the difference
+ * between a programming fault, a datapath fault and a timing fault.
+ *
+ * One group is 512 input bytes and 32 output bytes, a few microseconds each.
+ * ------------------------------------------------------------------------- */
+static uint8_t s_st_lat[64 * 8]  __attribute__((aligned(64)));
+static uint8_t s_st_hw [4 * 8]   __attribute__((aligned(64)));
+static uint8_t s_st_sw [VQPW_IDX_BYTES];
+
+int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp)
+{
+    static const uint8_t fills[4] = { 128u, 255u, 0u, 129u };
+    static const char   *names[4] = { "u=0   (norm ROM alone)",
+                                      "u=+127 (board's failing vector)",
+                                      "u=-128",
+                                      "u=+1  " };
+    int worst = 0;
+
+    if (vqpw_init(&s_ctx, cb, zp) != 0) return -1;
+
+    xil_printf("[VQST] sub-system self-test, one group per case\r\n");
+
+    for (int t = 0; t < 4; t++) {
+        long bad_m[VQPW_M];
+        for (int m = 0; m < VQPW_M; m++) bad_m[m] = 0;
+
+        for (size_t i = 0; i < sizeof s_st_lat; i++) s_st_lat[i] = fills[t];
+        Xil_DCacheFlushRange((UINTPTR)s_st_lat, sizeof s_st_lat);
+        Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, sizeof s_st_hw);
+
+        pw_w(PW_REG_TILE_PIXELS, (uint32_t)VQPW_LANES);
+        pw_w(PW_REG_CIN_RUN,     (uint32_t)VQPW_CIN_MAC);
+        pw_w(PW_REG_COUT_RUN,    (uint32_t)VQPW_COUT_TOTAL);
+        pw_w(PW_REG_ZP_RELU,     0x00008080u);
+        pw_w(PW_REG_VQ_CTRL,     ((uint32_t)VQPW_CIN_LOAD << 12) | 1u);
+        pw_w(PW_REG_CTRL,        CTRL_CLEAR_ERR);
+        pw_w(PW_REG_CTRL,        CTRL_START);
+
+        dma_w(S2MM_DMACR,  DMACR_RS);
+        dma_w(S2MM_DA,     (uint32_t)(UINTPTR)s_st_hw);
+        dma_w(S2MM_LENGTH, (uint32_t)sizeof s_st_hw);
+        dma_w(MM2S_DMACR,  DMACR_RS);
+        dma_w(MM2S_SA,     (uint32_t)(UINTPTR)s_st_lat);
+        dma_w(MM2S_LENGTH, (uint32_t)sizeof s_st_lat);
+
+        for (uint32_t i = 0; i < SPIN_LIMIT; i++)
+            if (dma_r(S2MM_DMASR) & DMASR_IDLE) break;
+
+        pw_w(PW_REG_VQ_CTRL, 0u);
+        dma_w(MM2S_DMACR, DMACR_RESET);
+        dma_w(S2MM_DMACR, DMACR_RESET);
+        for (uint32_t i = 0; i < 100000u; i++)
+            if (!(dma_r(MM2S_DMACR) & DMACR_RESET)
+                && !(dma_r(S2MM_DMACR) & DMACR_RESET)) break;
+        Xil_DCacheInvalidateRange((UINTPTR)s_st_hw, sizeof s_st_hw);
+
+        /* The reference over the same one group. vqpw_encode_frame walks whole
+         * frames, so run it on a buffer whose first group is this one; only
+         * the first 8 positions are compared. */
+        vqpw_encode_frame(&s_ctx, s_st_lat, s_st_sw);
+
+        for (int pos = 0; pos < VQPW_LANES; pos++)
+            for (int m = 0; m < VQPW_M; m++)
+                if (vqpw_get_index(s_st_hw, pos, m)
+                    != vqpw_get_index(s_st_sw, pos, m)) bad_m[m]++;
+
+        {
+            long tot = 0;
+            for (int m = 0; m < VQPW_M; m++) tot += bad_m[m];
+            if (tot > worst) worst = (int)tot;
+            xil_printf("[VQST]   %s : ", names[t]);
+            for (int m = 0; m < VQPW_M; m++)
+                xil_printf("m%d=%d ", m, (int)bad_m[m]);
+            xil_printf("of %d  -> %s\r\n", VQPW_LANES * VQPW_M,
+                       tot ? "MISMATCH" : "ok");
+            if (tot) {
+                xil_printf("[VQST]     hw[");
+                for (int m = 0; m < VQPW_M; m++)
+                    xil_printf("%s%d", m ? "," : "",
+                               (int)vqpw_get_index(s_st_hw, 0, m));
+                xil_printf("] sw[");
+                for (int m = 0; m < VQPW_M; m++)
+                    xil_printf("%s%d", m ? "," : "",
+                               (int)vqpw_get_index(s_st_sw, 0, m));
+                xil_printf("]\r\n");
+            }
+        }
+    }
+
+    xil_printf("[VQST] READ IT AS: case 1 wrong -> the NORM ROM the engine "
+               "holds is not what was written.\r\n");
+    xil_printf("[VQST]              case 1 right, others wrong -> the MAC "
+               "(weights or activations).\r\n");
+    return worst;
+}
+
 long vq_pw_pl_verify(const int8_t *cb, uint8_t zp, const void *latent,
                      uint8_t *pl_idx, uint8_t *sw_idx, long *first_bad)
 {

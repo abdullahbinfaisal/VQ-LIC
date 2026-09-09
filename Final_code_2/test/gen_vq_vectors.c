@@ -18,6 +18,10 @@
  *           a one-LSB disagreement in the score changes the winner. This
  *           draws the latent from a narrow set with spatial correlation,
  *           which is the regime the board actually runs in.
+ *           4 = SATURATED. Every latent byte 255, so u = +127 in every
+ *           dimension. This is the exact vector the board failed on: its
+ *           [VQDIAG] reproducer printed u[m=0] = 127 x 16 and every one of the
+ *           581 mismatches was that same vector, always 7 -> 14 in m=0.
  *
  * Files (all hex, one value per line):
  *   latent.hex   ngroups*64  x 64-bit stream beats, in the order the DMA
@@ -80,7 +84,9 @@ int main(int argc, char **argv)
 
     /* ---- latent ---- */
     const size_t nbytes = (size_t)ng * VQPW_DIM * VQPW_LANES;
-    if (scenario == 3) {
+    if (scenario == 4) {
+        for (size_t i = 0; i < nbytes; i++) latent[i] = 255u;
+    } else if (scenario == 3) {
         /* Quantised and spatially smooth: a few distinct levels near the zero
          * point, held across neighbouring positions. Produces frequent
          * near-ties in every sub-codebook. */

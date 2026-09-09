@@ -1542,6 +1542,9 @@ int edge_validation_run(void)
             printf("[EDGE] verdict below stands on the index comparison alone.\n");
         }
 
+        /* Attribute the fault before measuring its size. */
+        (void)vq_pw_pl_selftest(g_pw_cb, 128);
+
         long first = -1;
         const long bad = vq_pw_pl_verify(g_pw_cb, 128, edge_latent_ptr(),
                                          g_pl_idx, g_rt, &first);
