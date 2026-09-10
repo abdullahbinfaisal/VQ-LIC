@@ -149,6 +149,65 @@ unzip -p Final_2/hw/<that>.xsa hw.hwh | grep -oE 'VQ_K" VALUE="[0-9]*"'
 All three must agree, and the .bit inside the XSA must md5-match
 `Zynq.runs/impl_1/hw_wrapper.bit`.
 
+### Rebuilding: the IP cache and ip_repo_paths, both learned the hard way
+
+A full build consumes the packaged IP COPIES under
+
+```
+Zynq.gen/sources_1/bd/hw/ipshared/<n>/sources_1/new/pw_single_oc_axis.sv
+Zynq.gen/sources_1/bd/hw/ipshared/<n>/src/pw_pixel_major_core.sv
+```
+
+not `Zynq.srcs/` directly -- `Zynq.runs/synth_1/runme.log` names these paths.
+The copies go STALE: before the 2026-09-10 build they were a pre-K64 snapshot
+(1439 lines against 1748). Editing a source and building WITHOUT forcing a
+regenerate silently reuses that snapshot and the change never reaches the
+fabric. So a rebuild must do, in order:
+
+```tcl
+update_ip_catalog -rebuild
+upgrade_ip [get_ips -filter {IS_LOCKED == 1}]   ;# stale IPs report as LOCKED
+reset_target all $bd
+generate_target all $bd
+reset_run synth_1
+```
+
+**"Stale IP file detected" is the GOOD sign** -- the IP is stale precisely
+because the edit landed. `upgrade_ip` is what makes the BD adopt it. Verify
+afterwards that the ipshared copy matches the source (line count, and grep for
+the thing you changed) BEFORE trusting the build.
+
+**Do not narrow `ip_repo_paths`.** The project needs all three:
+
+```
+C:/Users/Fahad/Zynq/Zynq.srcs
+C:/Users/Fahad/ip_repo/DW_conv_accel_1.0
+C:/Users/Fahad/ip_repo
+```
+
+Setting only `Zynq.srcs` makes `dw_fused_axi` report "IP definition not found"
+and locks the BD -- it lives in `C:/Users/Fahad/ip_repo`, OUTSIDE the project.
+Restore the property explicitly rather than reverting `Zynq.xpr`, which carries
+unrelated changes.
+
+**Build in the real project, not a scratch copy**, so
+`Zynq.runs/impl_1/hw_wrapper.bit` -- the path `launch.json` hardcodes -- is the
+thing that changes. A scratch build leaves it stale and the board runs old
+fabric against new firmware.
+
+### An RTL-only change does not need a platform repoint
+
+If a rebuild changes internal logic but not the register map, parameters or
+port list, the application is unaffected: it compiles against the same
+interface, and `launch.json` programs from `impl_1`. The platform JSON may go
+on naming an older XSA and that is FINE -- but say so out loud, because it
+otherwise looks like the stale-platform trap above. Check the parameters really
+are unchanged:
+
+```bash
+unzip -p Final_2/hw/<xsa> hw.hwh | grep -oE '(VQ_K|VQ_NORM_D|COUT_MAX)" VALUE="[0-9]*"' | sort -u
+```
+
 ### There is a THIRD copy of the XSA name, and Vitis owns it
 
 ```
