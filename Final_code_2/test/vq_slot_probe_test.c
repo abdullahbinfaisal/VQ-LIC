@@ -64,6 +64,41 @@ int main(void)
     printf("  %s\n", bad
            ? "the index does NOT track the byte -- the probe cannot be trusted"
            : "the index is a faithful read-out of the byte");
+    /* ---- the CHANNEL MAP the board probe actually uses --------------------
+     * Latent channel c carries raw byte 4c, and the ladder is placed in one
+     * dimension d, so window m reads channel m*DSUB + d and must return that
+     * channel's number. This is what makes a one-beat stream offset visible as
+     * every reading coming back exactly one low, instead of collapsing into the
+     * uniform background the way a single-marker latent does. */
+    if (VQPW_K >= VQPW_DIM) {
+        int map_bad = 0;
+        for (int d = 0; d < VQPW_DSUB; d++) {
+            for (size_t z = 0; z < sizeof cb; z++) cb[z] = 0;
+            for (int m = 0; m < VQPW_M; m++)
+                for (int k = 0; k < VQPW_K; k++)
+                    cb[((size_t)m * VQPW_K + k) * VQPW_DSUB + d] =
+                        (int8_t)(-128 + 4 * k);
+            if (vqpw_init(&ctx, cb, 128) != 0) { printf("init failed\n"); return 1; }
+
+            for (int m = 0; m < VQPW_M; m++) {
+                int8_t u[VQPW_DSUB];
+                for (int j = 0; j < VQPW_DSUB; j++)
+                    u[j] = (int8_t)(4 * (m * VQPW_DSUB + j) - 128);
+                const int want = m * VQPW_DSUB + d;
+                const int got  = vqpw_search_sub(&ctx, u, m, NULL);
+                if (got != want) {
+                    if (map_bad < 6)
+                        printf("  channel map: m=%d d=%d want %d got %d\n",
+                               m, d, want, got);
+                    map_bad++;
+                }
+            }
+        }
+        printf("  channel map mismatches : %d of %d\n",
+               map_bad, VQPW_M * VQPW_DSUB);
+        bad += map_bad;
+    }
+
     printf("RESULT: %s\n", bad ? "FAIL" : "PASS");
     return bad != 0;
 }

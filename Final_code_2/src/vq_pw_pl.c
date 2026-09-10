@@ -823,7 +823,7 @@ int vq_pw_pl_sweep_codewords(void)
  * with buffers alternating, "the previous group" and "the same buffer's last
  * contents" are the same group when there are only two.
  * ------------------------------------------------------------------------- */
-#define SLOTP_GROUPS 8
+#define SLOTP_GROUPS 2
 
 static uint8_t s_sp_lat[SLOTP_GROUPS * VQPW_CIN_LOAD * VQPW_LANES]
                         __attribute__((aligned(64)));
@@ -831,35 +831,26 @@ static uint8_t s_sp_hw [SLOTP_GROUPS * (VQPW_LANES / 2) * 8]
                         __attribute__((aligned(64)));
 static int8_t  s_sp_cb [VQPW_M * VQPW_K * VQPW_DSUB];
 
-/* One probe run of `ng` groups. Returns the number of readings that were not
- * the group's own beat. STATUS2 is cleared immediately before the start and
- * read immediately after, so in_udf below belongs to THIS run and nothing
- * else -- which matters, because the analysis convolution shares the engine
- * and its flags are sticky. */
-static int slot_run(int ng, const char *label)
+/* Read dimension `dim` of every window, for both groups, into got[group][m].
+ * The codebook is reloaded per dimension: a_k = -128 + 4k placed at that one
+ * dimension and zero everywhere else, so the sub-codebook is a step-4 scalar
+ * quantiser on channel m*DSUB + dim and the returned index is the raw byte
+ * over 4. With the latent below that index IS the channel number. */
+static int slot_read_dim(int dim, int got[SLOTP_GROUPS][VQPW_M], uint32_t *s2_out)
 {
-    const size_t in_bytes  = (size_t)ng * ONEG_IN;
-    const size_t out_bytes = (size_t)ng * ONEG_OUT;
-    uint32_t s2;
-    int lag_hist[4];
-    int other = 0, i, wrong = 0;
-    int k_first = -1, all_same = 1;
+    const size_t in_bytes  = (size_t)SLOTP_GROUPS * ONEG_IN;
+    const size_t out_bytes = (size_t)SLOTP_GROUPS * ONEG_OUT;
 
-    for (i = 0; i < 4; i++) lag_hist[i] = 0;
+    for (size_t z = 0; z < sizeof s_sp_cb; z++) s_sp_cb[z] = 0;
+    for (int m = 0; m < VQPW_M; m++)
+        for (int k = 0; k < VQPW_K; k++)
+            s_sp_cb[((size_t)m * VQPW_K + k) * VQPW_DSUB + dim] =
+                (int8_t)(-128 + 4 * k);
+    if (vq_pw_pl_load_codebook(s_sp_cb, 128) != 0) return -1;
 
-    for (size_t z = 0; z < in_bytes; z++) s_sp_lat[z] = 128u;
-    for (int g = 0; g < ng; g++) {
-        const uint8_t b = (uint8_t)(4 * (g + 8));
-        for (int m = 0; m < VQPW_M; m++)
-            for (int l = 0; l < VQPW_LANES; l++)
-                s_sp_lat[(size_t)g * ONEG_IN
-                         + (size_t)(m * VQPW_DSUB) * VQPW_LANES + l] = b;
-    }
-    Xil_DCacheFlushRange((UINTPTR)s_sp_lat, in_bytes);
     Xil_DCacheInvalidateRange((UINTPTR)s_sp_hw, out_bytes);
-
     dma_quiesce();
-    pw_w(PW_REG_TILE_PIXELS, (uint32_t)(ng * VQPW_LANES));
+    pw_w(PW_REG_TILE_PIXELS, (uint32_t)(SLOTP_GROUPS * VQPW_LANES));
     pw_w(PW_REG_CIN_RUN,     (uint32_t)VQPW_CIN_MAC);
     pw_w(PW_REG_COUT_RUN,    (uint32_t)VQPW_COUT_TOTAL);
     pw_w(PW_REG_ZP_RELU,     0x00008080u);
@@ -874,101 +865,97 @@ static int slot_run(int ng, const char *label)
     dma_w(MM2S_SA,     (uint32_t)(UINTPTR)s_sp_lat);
     dma_w(MM2S_LENGTH, (uint32_t)in_bytes);
 
-    {
-        uint32_t sp;
-        for (sp = 0; sp < SPIN_LIMIT; sp++)
-            if (dma_r(S2MM_DMASR) & DMASR_IDLE) break;
-        if (sp >= SPIN_LIMIT)
-            xil_printf("[VQSP] TIMEOUT: S2MM_SR=0x%08x PW_STATUS=0x%08x\r\n",
-                       (unsigned)dma_r(S2MM_DMASR),
-                       (unsigned)pw_r(PW_REG_STATUS));
-    }
-    s2 = pw_r(PW_REG_STATUS2);
+    for (uint32_t sp = 0; sp < SPIN_LIMIT; sp++)
+        if (dma_r(S2MM_DMASR) & DMASR_IDLE) break;
+    *s2_out = pw_r(PW_REG_STATUS2);
     pw_w(PW_REG_VQ_CTRL, 0u);
     dma_quiesce();
     Xil_DCacheInvalidateRange((UINTPTR)s_sp_hw, out_bytes);
 
-    xil_printf("[VQSP] %s: %d group(s), STATUS2=0x%08x  in_udf=%d in_ovf=%d\r\n",
-               label, ng, (unsigned)s2,
-               (int)((s2 >> 1) & 1u), (int)((s2 >> 0) & 1u));
-
-    for (int g = 0; g < ng; g++) {
-        xil_printf("[VQSP]   group %d wants k=%2d :", g, g + 8);
-        for (int m = 0; m < VQPW_M; m++) {
-            const int pos = g * VQPW_LANES;
-            const int k   = (int)vqpw_get_index(s_sp_hw, pos, m);
-            const int lag = (g + 8) - k;
-            int spread = 0;
-
-            for (int l = 1; l < VQPW_LANES; l++)
-                if ((int)vqpw_get_index(s_sp_hw, pos + l, m) != k) spread++;
-
-            xil_printf("  m%d=%2d", m, k);
-            if (spread) xil_printf("(%d/7 lanes differ)", spread);
-
-            if (k_first < 0) k_first = k; else if (k != k_first) all_same = 0;
-            if (k != g + 8) wrong++;
-            if (k == 0)                    other++;
-            else if (lag >= 0 && lag <= 3) lag_hist[lag]++;
-            else                           other++;
-        }
-        xil_printf("\r\n");
-    }
-
-    xil_printf("[VQSP]   lag histogram of %d readings: ", ng * VQPW_M);
-    for (i = 0; i < 4; i++) xil_printf("lag%d=%d ", i, lag_hist[i]);
-    xil_printf("other=%d\r\n", other);
-    (void)all_same; (void)k_first;
-    return wrong;
+    for (int g = 0; g < SLOTP_GROUPS; g++)
+        for (int m = 0; m < VQPW_M; m++)
+            got[g][m] = (int)vqpw_get_index(s_sp_hw, g * VQPW_LANES, m);
+    return 0;
 }
 
 int vq_pw_pl_probe_slots(void)
 {
-    int one, many;
+    int off_hist[3];            /* offset 0, +1 (reads one channel low), other */
+    int ch0_resid = -1, bad = 0;
+    uint32_t s2 = 0, s2_any = 0;
 
-    xil_printf("[VQSP] activation slot read-out: each sub-codebook is a step-4 "
-               "scalar quantiser\r\n");
-    xil_printf("[VQSP] on channel m*%d, so the index NAMES the group whose beat "
-               "is in the slot.\r\n", VQPW_DSUB);
+    for (int i = 0; i < 3; i++) off_hist[i] = 0;
 
-    /* Codebook: a_k = -128 + 4k in dimension 0, zero elsewhere, so
-     * score(k) = (a_k - u[0])^2 - u[0]^2 and argmin k = round(B/4) for raw
-     * byte B. Verified against the golden model in vq_slot_probe_test.c. */
-    for (size_t z = 0; z < sizeof s_sp_cb; z++) s_sp_cb[z] = 0;
-    for (int m = 0; m < VQPW_M; m++)
-        for (int k = 0; k < VQPW_K; k++)
-            s_sp_cb[((size_t)m * VQPW_K + k) * VQPW_DSUB + 0] =
-                (int8_t)(-128 + 4 * k);
+    if (VQPW_K < VQPW_DIM) {
+        xil_printf("[VQSP] skipped: the step-4 ladder needs K >= %d to name "
+                   "every channel, have %d\r\n", VQPW_DIM, VQPW_K);
+        return 0;
+    }
 
-    if (vq_pw_pl_load_codebook(s_sp_cb, 128) != 0) return -1;
+    xil_printf("[VQSP] channel map. Latent channel c = raw byte 4c, so a "
+               "step-4 quantiser on that\r\n");
+    xil_printf("[VQSP] channel returns c ITSELF. Sweeping the readout "
+               "dimension maps all %d channels.\r\n", VQPW_DIM);
+    xil_printf("[VQSP] window m, dimension d should return channel %d*m + d.\r\n",
+               VQPW_DSUB);
 
-    /* ONE group, then EIGHT, because that is the whole remaining question.
-     *
-     * A run-level fault -- the FIFO reset window at CTRL_START, which is the
-     * only thing that fits in_udf being set at all, since in_rd_en is gated on
-     * !in_empty and the flag should be unreachable -- can only ever spoil the
-     * FIRST group of a run. A group-level fault spoils all of them. The frame
-     * touched 233 groups of 1800 in a SINGLE run, so something must recur at
-     * every group boundary; these two runs say whether that is so, and whether
-     * in_udf scales with the number of groups or fires exactly once. */
-    one  = slot_run(1, "run A");
-    many = slot_run(SLOTP_GROUPS, "run B");
+    /* Channel c carries 4c in every lane of every group. u ranges -128..124,
+     * and the ladder covers exactly that, so the answer is unambiguous. Both
+     * groups carry the SAME data: the question here is the channel offset, and
+     * making the groups differ would only re-introduce the confound that the
+     * marker version had. */
+    for (int g = 0; g < SLOTP_GROUPS; g++)
+        for (int c = 0; c < VQPW_DIM; c++)
+            for (int l = 0; l < VQPW_LANES; l++)
+                s_sp_lat[(size_t)g * ONEG_IN + (size_t)c * VQPW_LANES + l] =
+                    (uint8_t)(4 * c);
+    Xil_DCacheFlushRange((UINTPTR)s_sp_lat, (size_t)SLOTP_GROUPS * ONEG_IN);
 
-    xil_printf("[VQSP] VERDICT\r\n");
-    if (one == 0 && many == 0)
-        xil_printf("[VQSP]   both clean -> the slots are right here; the fault "
-                   "needs the frame's traffic to appear.\r\n");
-    else if (many > 0 && one == 0)
-        xil_printf("[VQSP]   1 group clean, %d groups not -> the fault is at "
-                   "GROUP BOUNDARIES, not at run start.\r\n", SLOTP_GROUPS);
-    else if (one > 0)
-        xil_printf("[VQSP]   even a single group is wrong -> the fault is at "
-                   "RUN START, i.e. the CTRL_START FIFO reset window.\r\n");
-    xil_printf("[VQSP]   a group reading k=g+7 lags one group; k=g+6 lags two "
-               "(its own buffer half, never rewritten).\r\n");
-    xil_printf("[VQSP]   in_udf set on run A but not B -> once per run. Set on "
-               "both -> once per run. Scaling -> per group.\r\n");
-    return one + many;
+    for (int d = 0; d < VQPW_DSUB; d++) {
+        int got[SLOTP_GROUPS][VQPW_M];
+        if (slot_read_dim(d, got, &s2) != 0) return -1;
+        s2_any |= s2;
+
+        xil_printf("[VQSP] d=%2d  g0:", d);
+        for (int g = 0; g < SLOTP_GROUPS; g++) {
+            if (g) xil_printf("   g1:");
+            for (int m = 0; m < VQPW_M; m++) {
+                const int want = m * VQPW_DSUB + d;
+                const int off  = want - got[g][m];
+                xil_printf(" %2d", got[g][m]);
+                if (got[g][m] != want) {
+                    xil_printf("!");
+                    bad++;
+                }
+                if      (off == 0) off_hist[0]++;
+                else if (off == 1) off_hist[1]++;
+                else               off_hist[2]++;
+                if (d == 0 && m == 0 && g == 0) ch0_resid = got[g][m];
+            }
+        }
+        xil_printf("\r\n");
+    }
+
+    xil_printf("[VQSP] offsets over %d readings: exact=%d one-low=%d other=%d"
+               "   STATUS2(any)=0x%08x in_udf=%d\r\n",
+               2 * SLOTP_GROUPS * VQPW_M * VQPW_DSUB / 2,
+               off_hist[0], off_hist[1], off_hist[2],
+               (unsigned)s2_any, (int)((s2_any >> 1) & 1u));
+
+    xil_printf("[VQSP] READ IT AS\r\n");
+    xil_printf("[VQSP]   all exact -> the channel map is right and the stale "
+               "byte is NOT a stream offset.\r\n");
+    xil_printf("[VQSP]   all one-low -> the whole group is shifted by one "
+               "beat; every window is affected, not just m0.\r\n");
+    xil_printf("[VQSP]   only (m0,d0) wrong -> channel 0 alone is stale, "
+               "which is what the FRAME reports.\r\n");
+    xil_printf("[VQSP]   g0 shifted but g1 exact -> the fault is per RUN; "
+               "both shifted -> per GROUP.\r\n");
+    if (ch0_resid >= 0)
+        xil_printf("[VQSP]   channel 0 of group 0 read as channel %d "
+                   "(raw byte ~%d); anything not 0 came from the previous "
+                   "run.\r\n", ch0_resid, 4 * ch0_resid);
+    return bad;
 }
 
 long vq_pw_pl_verify(const int8_t *cb, uint8_t zp, const void *latent,
