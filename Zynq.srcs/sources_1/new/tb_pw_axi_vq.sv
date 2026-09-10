@@ -40,7 +40,23 @@ module pw_axi_vq_bench #(
   parameter string TAG     = "DEPLOYED M=4 K=64 Dsub=16",
   // Percent of cycles the input source withholds a beat. 0 = the old
   // continuously-valid behaviour.
-  parameter int    IN_GAP_PCT = 0
+  parameter int    IN_GAP_PCT = 0,
+  // A STALE BEAT PARKED ON THE BUS ACROSS START.
+  //
+  // s_axis_tready = !in_full && !fifo_rst, so the start-time flush cannot
+  // retract a beat whose tvalid is already asserted upstream: the beat simply
+  // waits out fifo_rst and is accepted the instant tready returns, AHEAD of
+  // the run's own first beat. The whole run is then offset by one -- pb_ram[i]
+  // holds channel i-1 and group g's channel 0 holds group g-1's channel 63 --
+  // and the last beat is left over for the group after.
+  //
+  // The board shows exactly that, measured channel by channel. Every bench
+  // here elaborates fresh and streams once, so a parked beat left by an
+  // EARLIER run has never been reachable -- and the conv path shares this
+  // port, so on silicon there is always an earlier run. Resetting MM2S does
+  // not help: a beat already handed to an interconnect register slice is not
+  // the DMA's to retract.
+  parameter int    PRE_BEAT    = 0
 )();
 
   localparam int DATA_WIDTH = 8;
@@ -154,6 +170,7 @@ module pw_axi_vq_bench #(
   // the weights and norms still verified. The real driver has the same
   // obligation -- start the engine, then kick the DMA.
   logic started = 1'b0;
+  always @(posedge started) $display("  [SEQ] t=%0t bench begins streaming", $time);
   // INPUT GAPS. The board feeds this port from a DMA that does not deliver a
   // beat every cycle -- in_underflow is set on every board run -- while this
   // bench has always held tvalid continuously. That combination, the real FIFO
@@ -172,14 +189,49 @@ module pw_axi_vq_bench #(
   end
 
   int beat_i;
+  // Presented from reset, i.e. BEFORE start, and held until the engine takes
+  // it. Deliberately a value the vector set never carries, so if it lands in
+  // pb_ram the mismatch report names it.
+  logic pre_pending = (PRE_BEAT != 0);
   always_comb begin
-    sv_tvalid = rstn && started && !src_hold && (beat_i < NG*VQ_DIM);
-    sv_tdata  = latent_mem[beat_i < NG*VQ_DIM ? beat_i : 0];
-    sv_tlast  = (beat_i == NG*VQ_DIM - 1);
+    if (pre_pending) begin
+      sv_tvalid = rstn;
+      sv_tdata  = 64'hDEAD_BEEF_DEAD_BEEF;
+      sv_tlast  = 1'b0;
+    end else begin
+      sv_tvalid = rstn && started && !src_hold && (beat_i < NG*VQ_DIM);
+      sv_tdata  = latent_mem[beat_i < NG*VQ_DIM ? beat_i : 0];
+      sv_tlast  = (beat_i == NG*VQ_DIM - 1);
+    end
   end
   always_ff @(posedge clk) begin
-    if (!rstn) beat_i <= 0;
-    else if (sv_tvalid && sv_tready) beat_i <= beat_i + 1;
+    if (!rstn) begin
+      beat_i <= 0;
+      pre_pending <= (PRE_BEAT != 0);
+    end else if (sv_tvalid && sv_tready) begin
+      if (pre_pending) begin
+        pre_pending <= 1'b0;
+        $display("  [PRE] stale beat accepted at t=%0t -- it was parked before start",
+                 $time);
+      end else begin
+        beat_i <= beat_i + 1;
+      end
+    end
+  end
+
+  // ---- what does the CORE actually receive, beat by beat? ----
+  // The wrapper-level handshake says a beat was accepted at the PORT; this
+  // says what reached the core across the FIFO, which is the only thing that
+  // decides pb_ram's contents.
+  int core_beat = 0;
+  always_ff @(posedge clk) begin
+    if (rstn && dut.u_pw.core_valid_in && dut.u_pw.core_consume_in) begin
+      if (core_beat < 4)
+        $display("  [CORE] beat %0d at t=%0t : %016x   (latent_mem[%0d] = %016x)",
+                 core_beat, $time, dut.u_pw.core_pixel_in,
+                 core_beat, latent_mem[core_beat]);
+      core_beat <= core_beat + 1;
+    end
   end
 
   // ---- does the weight BRAM hold what we programmed? ----
@@ -337,7 +389,9 @@ module pw_axi_vq_bench #(
       if (nbadnorm != 0) nbad_prog++;
     end
 
+    $display("  [SEQ] t=%0t about to write START", $time);
     wr(ADDR_CTRL, 32'h1);   // start -- this also flushes the input FIFO
+    $display("  [SEQ] t=%0t START written", $time);
     repeat (16) @(posedge clk);   // let fifo_rst deassert before streaming
     started = 1'b1;
 
@@ -427,6 +481,14 @@ endmodule
 
 
 // The board's stimulus: the real register file AND a gapped input source.
+// Does one beat parked across the start reproduce the board's channel map?
+module tb_pw_axi_vq_stale;
+  pw_axi_vq_bench #(.VQ_K(64), .VQ_NORM_D(256), .VQ_SCORE_W(21),
+                    .VQ_M(4), .VQ_DSUB(16), .COUT_MAX(256),
+                    .DIR("vq64"), .PRE_BEAT(1),
+                    .TAG("DEPLOYED M=4 K=64, stale beat parked across start")) u();
+endmodule
+
 module tb_pw_axi_vq_gap;
   pw_axi_vq_bench #(.VQ_K(64), .VQ_NORM_D(256), .VQ_SCORE_W(21),
                     .VQ_M(4), .VQ_DSUB(16), .COUT_MAX(256),

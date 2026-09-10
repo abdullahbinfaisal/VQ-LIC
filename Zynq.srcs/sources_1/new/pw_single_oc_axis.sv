@@ -158,6 +158,7 @@ module pw_single_oc_axis #(
 
   // ---- Input FIFO ----
   logic                    in_full, in_empty;
+  logic                    in_wr_rst_busy, in_rd_rst_busy;
   logic [CORE_DATA_W-1:0]  in_dout;
   logic                    in_wr_en, in_rd_en;
   logic [IN_WR_CNT_W-1:0] in_wr_count;
@@ -168,8 +169,43 @@ module pw_single_oc_axis #(
   logic [CORE_DATA_W-1:0]  core_pixel_in;
   logic                    core_consume_in;
 
-  assign in_wr_en      = s_axis_tvalid && s_axis_tready;
-  assign s_axis_tready = (!in_full) && (!fifo_rst);
+  // DRAIN THE BUS DURING THE FLUSH, DO NOT STALL ON IT -- fixed 2026-09-10.
+  //
+  // start_in resets the input FIFO so a run cannot inherit an aborted
+  // predecessor's beats. But a beat whose tvalid is already asserted UPSTREAM
+  // is not in the FIFO and cannot be flushed: with tready held low it simply
+  // waits out fifo_rst and is accepted the instant tready returns, AHEAD of
+  // the run's own first beat. The run is then offset by one for ever --
+  // pb_ram[i] holds channel i-1, group g's channel 0 holds group g-1's channel
+  // 63, and the last beat of each group is left over for the next -- because
+  // the load terminates on a beat COUNT and never resynchronises.
+  //
+  // MEASURED ON SILICON, channel by channel, by the driver's channel-map probe
+  // (latent channel c = raw byte 4c, so the returned index names the channel
+  // the engine actually read):
+  //
+  //     window m, dimension d          returned m*DSUB + d - 1, all 128 readings
+  //     window 0, dimension 0          returned the PREVIOUS run's data
+  //
+  // and it explains why the frame showed m0=581 with m1..m3 exactly 0: that
+  // latent is saturated, so a one-channel shift is invisible except where the
+  // data actually steps, which is the group boundary, and the group boundary
+  // falls in window 0 alone.
+  //
+  // Unreachable in simulation until tb_pw_axi_vq_stale, because every bench
+  // elaborates fresh and streams once, so no beat is ever parked across a
+  // start. On silicon there is always an earlier run -- the analysis
+  // convolution shares this very port -- and resetting MM2S does not help: a
+  // beat already handed to an interconnect register slice is not the DMA's to
+  // retract.
+  //
+  // So accept beats while the FIFO is in reset and DISCARD them: tready stays
+  // high, in_wr_en stays low. The driver's contract is start-then-kick, so
+  // nothing legitimate is on the bus at start; anything that IS there belongs
+  // to a previous run and must not survive into this one.
+  assign in_wr_en      = s_axis_tvalid && s_axis_tready && !fifo_rst
+                                       && !in_wr_rst_busy;
+  assign s_axis_tready = ((!in_full) || fifo_rst) && (!in_wr_rst_busy);
   assign core_pixel_in = in_dout;
 
   // ------------------------------------------------------------------
@@ -262,7 +298,39 @@ module pw_single_oc_axis #(
   //   in_rd_en pops precisely the word the core latches this cycle.
   // in_occ is retained above for the assertion and for waveform debug only.
   assign in_rd_en      = core_consume_in && core_valid_in;
-  assign core_valid_in = !in_empty;
+  // AND THE CORE MUST NOT READ THROUGH THE FLUSH.
+  //
+  // start_in both releases the core from S_IDLE and starts fifo_rst, on the
+  // SAME cycle. in_empty LAGS that reset -- the 2026-08-08 note below already
+  // records "Both empty and rd_data_count LAG" -- so for a few cycles the core
+  // runs while the FIFO still presents the word it held BEFORE the flush. The
+  // core takes it as channel 0, and because the load terminates on a beat
+  // COUNT and never resynchronises, the offset is permanent.
+  //
+  // MEASURED core-side by tb_pw_axi_vq_stale:
+  //   [PRE]  stale beat accepted at t=221195000       (before start)
+  //   [SEQ]  t=221295000 START written
+  //   [CORE] beat 0 at t=221305000 : deadbeefdeadbeef (latent_mem[0]=2020..)
+  //   [CORE] beat 1 at t=221505000 : 2020202020202020 (latent_mem[1]=8080..)
+  // one cycle after start, and every real beat one address late thereafter.
+  //
+  // MEASURED ON SILICON by the driver's channel-map probe, which makes the
+  // returned index name the channel the engine actually read (latent channel
+  // c = raw byte 4c): window m dimension d returned m*DSUB + d - 1 on all 128
+  // readings, and window 0 dimension 0 returned the PREVIOUS run's data.
+  //
+  // It also explains the frame reporting m0=581 with m1..m3 exactly 0: that
+  // latent is saturated, so a one-channel shift is invisible except where the
+  // data steps, and the only step is the group boundary -- which falls inside
+  // window 0 and nowhere else.
+  //
+  // Unreachable in every earlier bench because they elaborate fresh and stream
+  // once, so nothing is ever in the FIFO at start. On silicon there is always
+  // a previous run: the analysis convolution shares this very port.
+  //
+  // Trust XPM's own rst_busy rather than empty. Both outputs were previously
+  // left unconnected.
+  assign core_valid_in = !in_empty && !fifo_rst && !in_rd_rst_busy;
 
   xpm_fifo_sync #(
     .DOUT_RESET_VALUE("0"), .ECC_MODE("no_ecc"), .FIFO_MEMORY_TYPE("block"),
@@ -279,6 +347,7 @@ module pw_single_oc_axis #(
     .prog_empty(), .rd_data_count(in_rd_count),
     .data_valid(), .overflow(in_overflow), .underflow(in_underflow),
     .almost_full(), .almost_empty(), .wr_ack(),
+    .wr_rst_busy(in_wr_rst_busy), .rd_rst_busy(in_rd_rst_busy),
     .sleep(1'b0), .injectsbiterr(1'b0), .injectdbiterr(1'b0),
     .sbiterr(), .dbiterr()
   );

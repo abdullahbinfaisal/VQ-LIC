@@ -84,7 +84,11 @@ if [ "${1:-}" = "--rtl" ]; then
   for sc in 0 1 2; do
     ( cd "$D" && "$GEN64" 64 $sc vq64 >/dev/null \
                 && "$GEN16" 64 $sc vq16 >/dev/null )
-    for top in tb_pw_vq tb_pw_vq_legacy tb_pw_axi_vq tb_pw_axi_vq_legacy; do
+    # tb_pw_axi_vq_stale parks one beat on the input across the start. That
+    # models a previous run -- the analysis convolution shares this port --
+    # and it is the only bench that ever reproduced the board's one-channel
+    # offset. Without it, pw_single_oc_axis can regress silently.
+    for top in tb_pw_vq tb_pw_vq_legacy tb_pw_axi_vq tb_pw_axi_vq_legacy tb_pw_axi_vq_stale tb_pw_axi_vq_gap; do
       ( cd "$D"
         "$XB/xelab" --nolog -debug off -O2 -L xpm "$top" -s "s_$top" >/dev/null 2>&1
         "$XB/xsim" --nolog "s_$top" -runall > "o_$top.txt" 2>&1 )
