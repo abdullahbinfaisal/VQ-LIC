@@ -1428,3 +1428,344 @@ New wrapper, stale core. The two files are now back in sync, and the trap is
 recorded in `CLAUDE.md`. The lesson generalises: **out-of-context synthesis of
 an IP cannot detect that the IP is packaging different source than you edited.**
 Only a full block-design build can.
+
+# rANS entropy coder -- how it works
+
+*Written 2026-09-14. Code: `Final_code_2/src/rans.[ch]`, `rans_edge.[ch]`,
+`edge_harness.c` (commit 3978d91). Specification: `RANS_GUIDE.md` and
+`CONTEXT_CODEC.md` from the CS team. There is no Python reference in this
+repository, and byte-identical acceptance against the CS reference is still
+open (section 8).*
+
+## 1. What gets coded
+
+The PW search writes one 32-bit transport word per latent position (90 x 160 =
+14,400 positions) carrying four 6-bit hardware codes k, group g in bits
+6g..6g+5. Each group is one independent stream of n = 14,400 tokens:
+
+```
+k (0..63) --k2id[g]--> original id (0..255) --> plane g, raster order
+```
+
+The coder works on ORIGINAL ids with 256-wide tables (spec 1). The per-group
+k -> id map and the id -> slot map belong to the model export. Until that
+exists, `re_synth_maps()` uses `id = (97k + 29g + 7) mod 256` and slot = k.
+**Synthetic.**
+
+## 2. Context
+
+The context of token t is the id of its left neighbour in the same plane;
+column 0 uses the border id K = 256. `slot_of_id` maps the context id to one of
+65 stored slots (64 codes, border = slot 64). That is table addressing only --
+it selects a table and never changes a coded symbol.
+
+## 3. Tables
+
+Per group, 65 slots, each `f[256]` then `cdf[256]` as uint16, adjacent so one
+token's two lookups share cache lines. 16-bit probabilities, every f >= 1,
+every slot sums to exactly 65,536 -- enforced at boot by `rans_tables_check()`.
+`cdf[256]` (= 65,536) is never stored or read.
+
+The rows are expanded at boot from the section-3 ROM:
+
+| per group | bytes |
+|---|---|
+| 65 slots x (sym[16] + freq[16] as uint16 LE) | 3,120 |
+| marginal, 256 x uint16 LE | 512 |
+| **group** | **3,632** |
+| **ROM, 4 groups** | **14,528** |
+
+One slot (spec 3.4, `rans_reconstruct_row`):
+
+1. the 16 stored ids take their stored frequencies;
+2. escape = 65,536 - (sum of the 16);
+3. the 240 unstored ids, in ascending id order, share the escape in proportion
+   to their marginal, through `rans_quantize_to_total` (spec 3.5):
+   `f_i = max(1, floor(w_i * M / sum(w)))` in 64-bit, then the remainder is
+   settled walking the ids in descending weight (ties: ascending index) --
+   +1 per visit while short, -1 per visit on any f > 1 while over;
+4. cdf is the running sum, and the row must total 65,536.
+
+A slot with no calibration data stores the marginal's own top 16 and so
+reconstructs to the marginal exactly.
+
+On-board RAM: dense rows 4 x 65 x 512 x 2 B = 266,240 B, plus the reciprocal
+tables of section 5, 4 x 65 x 256 x 4 B = 266,240 B.
+
+The on-board tables are FITTED at boot on calibration frames 1..20
+(`re_fit_tables`, ~70 ms, outside every timed bracket): per-slot histograms,
+the marginal, top 16 by count (then marginal, then lowest id), stored mass
+`M16 = 65536 * n16 / (tot + 256)` clamped to [16, 65,024]. They are serialised
+in the section-3 layout and expanded through the same `rans_rom_expand_group`
+the real ROM will use. **Synthetic.**
+
+## 4. The coder
+
+32-bit state, `RANS_L = 2^23`, invariant `L <= x < 256 L`. Tokens are encoded
+BACKWARD (t = n-1 .. 0), one state per group, starting at L.
+
+Encoder, per token with frequency f and cumulative c:
+
+```
+x_max = 32768 * f                          (32768 = (L >> 16) << 8, derived)
+while x >= x_max: emit x & 0xFF (writing backward); x >>= 8     renormalise FIRST
+x = ((x / f) << 16) + (x mod f) + c
+```
+
+then a four-byte flush, least significant first and still written backward, so
+the stream opens with the final state big-endian. Worst case 2n + 4 bytes.
+
+Decoder (forward; `rans_decode_ctx`, used by the tests and the on-board round
+trip):
+
+```
+x = first 4 bytes, big-endian
+slot = x & 0xFFFF;  s = binary search of cdf   (never reads cdf[256])
+x = f[s] * (x >> 16) + slot - cdf[s]           update FIRST
+while x < L: x = (x << 8) | next byte
+```
+
+A valid stream is consumed exactly: the read pointer must land on its length.
+
+## 5. Divide-free encoder -- what runs on the A9
+
+The Zynq-7000 Cortex-A9 has no hardware divide. The reference encoder paid two
+`__aeabi_uidivmod` calls per token (`x / f`, and the column `t mod w`):
+16.3265 ms per frame, 283 ns per token, on the board.
+
+`rans_enc_step` takes the reciprocal path whenever `T->recip` is set
+(`rans_recip_fill` at boot):
+
+```
+sh = ceil(log2 f)             32 - clz(f - 1): one CLZ
+m  = ceil(2^(31+sh) / f)      precomputed per slot and symbol
+q  = mulhi(x, m) >> (sh - 1)  one UMULL
+x  = x + c + q * (65536 - f)  = (q << 16) + (x - q f) + c
+f = 1:  x = (x << 16) + c
+```
+
+q equals floor(x / f) for every x < 2^31 because m f - 2^(31+sh) < f <= 2^sh
+(Granlund and Montgomery 1994, theorem 4.2), and after renormalisation
+x < 32768 f < 2^31. The column is carried and counted down (one divide per
+slice, not per token), and the table descriptor is copied into locals because
+every byte written through the output buffer may alias it.
+
+Evidence that it writes the same bytes (`test/rans_recip_test.c`):
+
+- the bound holds for every f in 2..65,535;
+- every reachable quotient, at remainder 0 and at f - 1: 4,294,836,224 checks,
+  0 wrong;
+- 240 random streams byte-identical across reference one-shot, fast one-shot,
+  fast sliced, and slices alternating between the two paths -- all decode;
+- poisoned streams stop on the same token with the same error code.
+
+A9 code generation (arm-none-eabi-gcc -O3, the Vitis flags): the reciprocal loop
+contains UMULL and CLZ and no divide call.
+
+Board, MEASURED: **16.3265 -> 4.8061 ms per frame, 283 -> 83 ns per token**,
+unpack and payload assembly included. `T->recip = NULL` (or
+`re_set_fast_divide(0)`) restores the reference encoder.
+
+## 6. Container (spec 7)
+
+17-byte header, `struct <4sBBHBII`:
+
+| offset | field | value |
+|---|---|---|
+| 0 | magic | `NIC1` |
+| 4 | mode | 3 context, 0 raw |
+| 5 | G | 4 |
+| 6 | K | 256, uint16 LE |
+| 8 | prob_bits | 16 |
+| 9 | H | 720, uint32 LE |
+| 13 | W | 1280, uint32 LE |
+
+Mode 3 body: for each group, a uint32 LE length and then its stream. The writer
+checks ceil(H/8) x ceil(W/8) = n and ceil(W/8) = w. Mode 0 body: the four id
+planes concatenated, n bytes each, chosen when the mode-3 body would be
+>= n x G bytes. The fallback is the guide's, unchanged.
+
+## 7. The on-board stage
+
+One resumable job per frame, `re_job_start` / `re_job_step(budget)` /
+`re_job_finish`. Phase 1 unpacks transport into planes (4 budget units per
+position), phase 2 codes the groups in order (1 unit per token), finish builds
+the payload. Slicing is byte-identical to one-shot (`rans_edge_test`). Planes
+and work buffers are static, so only ONE job may be live.
+
+Where the work sits in the pipelined pass, frame N:
+
+| window | PS work |
+|---|---|
+| analysis DMA waits of N (`CASCADE_BG`) | pack N+1 first, then entropy of N-1, 64-token slices |
+| VQ poll loop of N | whatever entropy of N-1 is left |
+| after the search | payload assembly |
+
+The serial pass codes every frame one-shot and decodes it back to hardware k
+(`re_job_verify`). The power loop runs the pipelined schedule; before 3978d91 it
+finished the job ahead of the codebook reload, so its period was 30.83 ms
+against the pass's 26.20 ms.
+
+Board, 2026-09-11, pwvq_k64c, MEASURED: II 20.8405 ms (47.98 fps); all 57,600
+tokens coded inside the analysis waits; 0.0032 ms of entropy exposed;
+end-to-end 62.47 ms (composed from measured offsets); 42.84 mJ per frame;
+round trip 0 mismatches.
+
+## 8. Test ladder, and what is open
+
+| stage | test | proves |
+|---|---|---|
+| 0 / 1 | `rans_stage01_test.c` | guide vectors A and B byte-exact |
+| 2 | `rans_stage2_test.c` | encoder and decoder are inverses on synthetic tables -- NOT compatibility |
+| 3 | `rans_stage3_test.c` | spec 3.5 hand vectors, ROM reconstruction, header, payload, fallback -- a self-check |
+| edge | `rans_edge_test.c` | unpack + rANS + payload lossless back to k; slicing byte-identical |
+| fast | `rans_recip_test.c` | the divide-free encoder writes the reference bytes |
+
+Open:
+
+- **Stage 3 acceptance** -- byte-identical against the CS reference:
+  `rans_stage3.exe DIR` with their `rom.bin`, `slots.bin`, `idx.bin`,
+  `payload.bin`. Not run; no dump exists.
+- **The spec-1 remap reading** (ids coded 256-wide, remap = addressing) awaits
+  confirmation.
+- **The real k -> id map and ROM** from the model export replace
+  `re_synth_maps` / `re_fit_tables`. Until then payload bytes are not a rate.
+
+# VQ -- current state, and dedicated vs shared
+
+*Written 2026-09-14. Re-derive the bitstream identity before quoting it (see
+`CLAUDE.md`).*
+
+## 1. What is deployed
+
+| | |
+|---|---|
+| engine | the shared PW engine, `USE_PW_VQ=1` |
+| geometry | M=4, K=64, Dm=16; 24 bits/position; cin_mac 16, cout_run 256, 8 batches, 21-bit score |
+| bitstream | pwvq_k64c (0e93c7f, the FIFO-flush fix); `Zynq.runs/impl_1/hw_wrapper.bit` md5 `ec66d74c588ac416d186db4b4521200d` on 2026-09-14 |
+| correctness | vs `vqpw_encode_frame()` 0 mismatches of 57,600; channel map 128/128 exact; every codeword reachable; guard present |
+| codebook | in the weight BRAM the analysis overwrites, so reloaded every frame |
+
+Board, 2026-09-11, pipelined pass, MEASURED:
+
+| | ms |
+|---|---|
+| codebook reload | 0.9603 |
+| search, accelerator (272 cyc/group x 1,800) | 4.8983 |
+| search, driver bracket | 5.2770 |
+| analysis, 3 fused pairs (1.0925 of it layer programming) | 14.5902 |
+| **frame interval** | **20.8405 (47.98 fps)** |
+| DW_PW / VQ overlap violations | 0 |
+
+Board power 2.0567 W with the VQ; the VQ increment is +0.0075 +- 0.0074 W, not
+resolved, **< 14.9 mW**.
+
+Full design post-route (Vivado 2020.2, xc7z020clg484-1, `impl_1` of
+2026-09-10): LUT 33,975 (63.86%), FF 32,342 (30.40%), BRAM 82.5 (58.93%), DSP
+220/220, WNS +0.122 ns, WHS +0.018 ns. Vector-less estimate 2.506 W, of which
+the PW IP 0.391 W -- an estimate, not a measurement.
+
+The dedicated engine (`vq_pq_axi_0`, M=4, K=256, QUERY_LANES=2) left the block
+design in 62cbfbc (2026-09-04). Its IP lives at
+`C:/Users/Fahad/ip_repo/vq_pq_axi_1.0`, outside this repository, and its driver
+`vq_pl.[ch]` is untracked in `Final_code_2/src`. On silicon at K=256: 18.435 ms
+from its own cycle counter, 1,024.1 cycles per group, codebook loaded once per
+model.
+
+## 2. Resources
+
+Out-of-context synthesis, Vivado 2020.2, xc7z020clg484-1, 10 ns, 2026-09-14.
+Reports and scripts: `results/vq_dedicated_vs_shared/`.
+
+| | Slice LUT | LUT logic | LUT RAM | FF | BRAM36 | DSP | WNS (ns) |
+|---|---|---|---|---|---|---|---|
+| dedicated, K=64 | 8,312 | 8,238 | 74 | 8,561 | 9 | 0 | +4.200 |
+| dedicated, K=256 | 8,323 | 8,241 | 82 | 8,595 | 9 | 0 | +4.119 |
+| shared PW engine, VQ compiled in | 12,482 | 12,345 | 137 | 13,774 | 46 | 220 | +1.565 |
+| shared PW engine, VQ compiled out | 12,181 | 12,156 | 25 | 13,277 | 46 | 220 | +1.608 |
+| **shared VQ branch** | **+301** | **+189** | **+112** | **+497** | **0** | **0** | -0.043 |
+| **dedicated K=64 / shared branch** | **27.6x** | 43.6x | 0.66x | **17.2x** | 9 vs 0 | 0 vs 0 | |
+
+Where the difference comes from:
+
+- The dedicated datapath is QUERY_LANES x M x DSUB = 2 x 4 x 16 = 128 INT8
+  multipliers in LUTs, whatever K is; K only sets the sweep length, which is
+  why K=64 and K=256 synthesise within 11 LUTs of each other. Its 9 BRAM36 are
+  the codebook memories plus a group buffer, and they do not shrink at K=64.
+- The shared branch reuses the PW MAC array and the weight BRAM. It adds the
+  norm ROM (256 x 21 bits, distributed -- the +112 LUT RAM), the score/argmin
+  path and the index packing. Its codebook costs no BRAM because it borrows
+  the analysis weight memory, which is exactly why it is reloaded every frame.
+
+Provenance notes:
+
+- K=64 is not the IP as shipped: `vq_pq_top.sv:329` sliced a fixed 8 bits out
+  of a KW-bit index and fails to elaborate below K=256. The scratch copy takes
+  KW bits and lets the 8-bit field zero-extend (`copy_vq_k64.py`), which is
+  identical at K=256. Synthesised only -- not simulated at K=64, never on the
+  board at K=64.
+- K=256 today (8,323 LUT / 8,595 FF) sits above the record in
+  `ip_repo/.../doc/VQ_QUERYLANES_RESULTS.md` (8,074 / 8,138) on the same tool
+  and part. The IP has changed since that record; not traced further.
+- Every dedicated-engine batch lost its FIRST `synth_design` to a tool-side
+  helper failure (`couldn't read file ... No error`) before elaboration; the
+  second call in the same process always succeeded, and the PW batch was
+  unaffected. The FAILED lines in `wns_results.txt` are those, not the design.
+
+Full design, PROJECTED -- arithmetic on measured parts, not an in-context build:
+
+| | shared, post-route (measured) | dedicated, OOC arithmetic | dedicated, in-context history |
+|---|---|---|---|
+| LUT | 33,975 (63.9%) | 41,986 (78.9%) | ~39,690 (74.6%) |
+| FF | 32,342 (30.4%) | 40,406 (38.0%) | ~34,317 (32.3%) |
+| BRAM36 | 82.5 (58.9%) | 91.5 (65.4%) | 91.5 (65.4%) |
+| DSP | 220 (100%) | 220 | 220 |
+
+"OOC arithmetic" is today's post-route design minus the shared branch plus the
+dedicated K=64 engine; one extra AXI-lite interconnect port is not counted.
+"In-context history" applies the difference between the 2026-08-30 dedicated
+build (`vq_impl_util3.rpt`: 40,073 LUT / 34,329 FF / 91.5 BRAM) and the
+2026-09-04 shared build (34,358 / 32,354 / 82.5); those builds differ in more
+than the VQ. OOC counts overstate what survives in context, flip-flops most, so
+the real cost most likely lies between the two columns. The 2026-08-30
+dedicated build did route and meet timing at 220/220 DSP; today's design has
++0.122 ns of slack to absorb the extra logic.
+
+## 3. Latency and energy
+
+Shared: MEASURED. Dedicated: PROJECTED from measured parts
+(`dedicated_projection.py`). The accelerator time comes from the K=256 silicon
+law, 4K cycles per group plus 139 fill, which reproduces 18.4334 ms against the
+18.435 ms measured. Driver overhead is ASSUMED equal to the shared engine's
+0.3787 ms (no dedicated-era record). Energy is 2.0567 W x II, so the extra
+fabric's power is NOT included.
+
+| | shared (measured) | D1: dedicated, same serial order | D2: dedicated, VQ during the next analysis |
+|---|---|---|---|
+| codebook reload | 0.9603 | 0 | 0 |
+| accelerator | 4.8983 | 4.6094 | 4.6094 |
+| driver bracket | 5.2770 | 4.9881 | 4.9881 |
+| **II** | **20.8405 (47.98 fps)** | **19.5913 (51.04 fps), -6.0%** | **14.6032 (68.48 fps), -29.9%** |
+| end-to-end | 62.47 | 58.73 | 43.76 |
+| energy per frame | 42.84 mJ | 40.29 mJ | 30.03 mJ |
+
+At K=64 the dedicated search is only 5.9% faster than the shared one (256
+against 272 cycles per group). D1 gains the reload and that 5.9%. D2 gains the
+engine: the analysis becomes the only binding stage. Its CPU budget checks out
+against the measured schedule -- 13.50 ms free in the analysis wait against
+11.16 ms needed, and the VQ of N done 4.99 ms into N+1, before entropy of N
+starts at 6.44 ms.
+
+D2 is a projection until these hold on silicon:
+
+1. analysis DMA traffic (HP0/HP1) concurrent with VQ traffic (HP2) on the one
+   DDR controller -- never measured;
+2. latent ping-pong, because the VQ of N reads the latent while N+1 is analysed;
+3. an unpack variant for the dedicated IP's 8-bit index fields (32 bits per
+   position, not the deployed 24-bit transport);
+4. the K=64 variant simulated against the golden model, then run on the board.
+
+**The one-line comparison.** Sharing costs the VQ +301 LUT, +497 FF and no
+BRAM or DSP. A dedicated K=64 engine costs about 8.3k LUT, 8.6k FF and 9 BRAM36
+(27.6x the LUTs), and buys 1.25 ms of frame interval run serially -- or about
+6.2 ms if its concurrency holds on silicon.

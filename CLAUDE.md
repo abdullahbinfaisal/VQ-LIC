@@ -57,6 +57,15 @@ through `<<'EOF'` must contain **no doubled backslashes**. Use forward slashes
 in paths, and build escape sequences as `chr(92) + 'n'` rather than writing
 them literally. Single backslashes inside C string literals survive intact.
 
+**Apostrophes anywhere in a Bash command can stop it before it runs.** The
+command is pre-scanned for single-quote balance -- including the body of a
+QUOTED heredoc and characters inside double quotes. An odd count (a C comment
+saying "the guide's", a `grep -c "'"`, even `\x27` in a grep pattern) fails
+with `unexpected EOF while looking for matching '`, and NOTHING in the command
+executes, so a multi-file write can silently do nothing. Keep Bash commands
+free of apostrophes, and write source files with the Write tool instead of a
+heredoc.
+
 ## Target device
 
 `xc7z020clg484-1` — 220 DSP48E1 (the binding resource; the shipped design sits
@@ -248,7 +257,59 @@ cd Final_code_2/test && XILINX_VIVADO=/c/SPROJ/Vivado/2020.2 ./run_vq_tests.sh -
 
 Runs the VQ suite at both quantiser profiles (`VQPW_PROFILE` 1 = deployed
 M=4/K=64/Dm=16, 0 = legacy M=8/K=16/Dm=8): golden model, driver programming,
-range-coder geometry, the RTL benches and the configuration guard.
+range-coder geometry, the RTL benches and the configuration guard -- plus the
+rANS ladder (guide vectors, round trip, stage 3 self-check, edge glue, the
+divide-free encoder). All 16 host checks must pass.
+
+## rANS entropy coder -- read before touching `Final_code_2/src/rans*.c`
+
+Full description: `results/report.md`, "rANS entropy coder -- how it works".
+
+- The spec is `RANS_GUIDE.md` + `CONTEXT_CODEC.md`. There is NO Python
+  reference in this repo -- do not go looking for entropy.py or codec.py. The
+  acceptance criterion is byte-identical output against the CS team's
+  reference, and it has NOT been met: `rans_stage3.exe DIR` needs their
+  `rom.bin`, `slots.bin`, `idx.bin`, `payload.bin`. Never call the coder
+  validated against the reference.
+- Mode 3 (context) and mode 0 (raw fallback) only. Do not change the fallback.
+- Ids are coded 256-wide; `slot_of_id` is table ADDRESSING. The k -> id map and
+  the tables in `rans_edge.c` are SYNTHETIC, fitted at boot: timing is real,
+  payload bytes are not a rate.
+- The board runs the divide-free encoder (`T->recip` set). The A9 has no
+  hardware divide, so a `/` or `%` in a per-token loop is an `__aeabi_uidivmod`
+  call -- check the disassembly. The divide encoder stays as the reference
+  (`T->recip = NULL`, `re_set_fast_divide(0)`), and any encoder change must
+  keep `rans_recip_test` passing: it is what proves both write the same bytes.
+- Planes and work buffers in `rans_edge.c` are static: ONE live `re_job_t`.
+- The power loop (`edge_pipe_frame`) must run the same schedule as
+  `edge_one_pipelined`, entropy under the search included. PWRSUM prints
+  AGREE/DISAGREE for exactly this; DISAGREE means the energy figure pairs power
+  with the wrong schedule.
+
+## VQ -- current state (snapshot 2026-09-14; re-derive before quoting)
+
+- Deployed: the SHARED PW engine, M=4 K=64 Dm=16, bitstream pwvq_k64c. Codebook
+  reload 0.96 ms per frame (it shares the analysis weight BRAM), search 4.90 ms
+  accelerator / 5.28 ms driver bracket, II 20.84 ms, 42.84 mJ per frame --
+  board, 2026-09-11.
+- The dedicated engine (`vq_pq_axi`) is NOT in the block design (removed in
+  62cbfbc). Its IP is outside the repo, `C:/Users/Fahad/ip_repo/vq_pq_axi_1.0`,
+  and as shipped only elaborates at K=256 (`vq_pq_top.sv:329`).
+- Dedicated vs shared, OOC, 2020.2, xc7z020: dedicated K=64 is 8,312 LUT /
+  8,561 FF / 9 BRAM36 / 0 DSP; the shared VQ branch is +301 LUT / +497 FF /
+  0 BRAM / 0 DSP. Evidence and latency projections:
+  `results/vq_dedicated_vs_shared/` and `results/report.md`, "VQ -- current
+  state, and dedicated vs shared".
+
+### Vivado OOC batch runs: the first synth_design can die tool-side
+
+`synth_design -mode out_of_context` in a `vivado -mode batch` process has
+repeatedly failed on its FIRST call with `couldn't read file
+".../realtime/<top>.tcl": No error` (or `retarget_vhdl.tcl`,
+`unimacro_verilog.tcl`), before elaboration. The second call in the same
+process succeeded every time. It is not an RTL error: wrap each call in
+`catch`, put a duplicate configuration first, and read the log before blaming
+the design.
 
 ## Evidence discipline
 
