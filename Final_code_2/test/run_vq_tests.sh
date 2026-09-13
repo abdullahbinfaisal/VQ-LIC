@@ -61,6 +61,32 @@ for prof in 1 0; do
   run "stale-slot arbitration, $tag" ./vq_stale_arb_$prof.exe
 done
 
+# rANS bring-up, RANS_GUIDE.md section 12. Profile-independent: the coder does
+# not read vq_pw.h. Stages 0 and 1 are byte-for-byte test vectors from the
+# guide. Stage 2 is a round trip on SYNTHETIC tables -- it proves encoder and
+# decoder are inverses, NOT compatibility, and does not stand in for stage 3.
+gcc -std=c11 -O2 -Wall -Wextra -DRANS_DEBUG -I$SRC \
+    -o rans_stage01.exe rans_stage01_test.c $SRC/rans.c || FAIL=1
+run "rANS stages 0+1, test vectors A and B" ./rans_stage01.exe
+gcc -std=c11 -O2 -Wall -Wextra -DRANS_DEBUG -I$SRC \
+    -o rans_stage2.exe rans_stage2_test.c $SRC/rans.c || FAIL=1
+run "rANS stage 2, round trip, synthetic tables" ./rans_stage2.exe
+# Stage 3 SELF-CHECK only: section 3.5 hand vectors, ROM reconstruction, the
+# 17-byte header, end-to-end payload and the mode-0 fallback. Acceptance needs
+# the reference payload: ./rans_stage3.exe DIR (see the usage it prints).
+gcc -std=c11 -O2 -Wall -Wextra -DRANS_DEBUG -I$SRC \
+    -o rans_stage3.exe rans_stage3_test.c $SRC/rans.c || FAIL=1
+run "rANS stage 3 self-check, NOT acceptance" ./rans_stage3.exe
+gcc -std=c11 -O2 -Wall -Wextra -DRANS_DEBUG -I$SRC \
+    -o rans_edge.exe rans_edge_test.c $SRC/rans_edge.c $SRC/rans.c || FAIL=1
+run "rANS edge stage glue, synthetic, lossless" ./rans_edge.exe
+# The divide-free encoder the board runs must write the divide encoder bytes:
+# exactness bound for every fs, every reachable quotient at its worst
+# remainder, and whole streams in four slicing schedules.
+gcc -std=c11 -O2 -Wall -Wextra -DRANS_DEBUG -I$SRC \
+    -o rans_recip.exe rans_recip_test.c $SRC/rans.c || FAIL=1
+run "rANS divide-free encoder, byte-identical" ./rans_recip.exe
+
 if [ "${1:-}" = "--rtl" ]; then
   XB="${XILINX_VIVADO:-}"
   [ -n "$XB" ] && XB="$XB/bin" || XB="$(dirname "$(command -v xvlog 2>/dev/null)" 2>/dev/null)"

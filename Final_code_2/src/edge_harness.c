@@ -92,6 +92,8 @@
 #include "edge_pipeline.h"
 #include "vq_pq.h"
 #include "range_coder.h"
+#include "rans.h"
+#include "rans_edge.h"
 /* Always compiled in: st_mark() is a timer read and four stores, and
  * st_enable(0) makes it a no-op. */
 #include "stage_trace.h"
@@ -251,6 +253,11 @@ static ep_frame_stat_t g_stat[EDGE_NTIMED];
 static uint8_t         g_idx  [VQ_IDX_BYTES];
 static uint8_t         g_rt   [VQ_IDX_BYTES];
 static uint8_t         g_bs   [VQ_IDX_BYTES * 2 + 4096];
+/* The serial pass runs the entropy stage one-shot through its own job, so it
+ * never touches the pipelined job. g_bs must hold the worst-case rANS payload:
+ * the 17-byte header plus 4 x (length prefix + 2n+4). */
+static re_job_t        g_job1;
+typedef char eh_assert_payload_fits[(sizeof(g_bs) >= RE_PAYLOAD_CAP) ? 1 : -1];
 static uint8_t        *g_cal_idx[EDGE_NCAL];
 static uint8_t         g_cal_store[EDGE_NCAL][VQ_IDX_BYTES];
 #if EDGE_USE_PL_VQ || EDGE_USE_PW_VQ
@@ -296,10 +303,12 @@ static uint8_t        *g_idx_prev = 0;   /* complete, safe for the PS       */
  * stream is armed on the PREVIOUS frame's indices, which are complete and
  * which nothing else touches until the ping-pong swaps at end of frame.
  *
- * No timer reads in here. Two register reads per slice, 1,800 slices per
- * frame, would be a measurable tax on the thing being measured -- and an
- * unnecessary one, because rc_stream_coded() gives the same accounting for
- * free by counting symbols instead of cycles. */
+ * Timing: EDGE_BG_TIMING below reads the timer on entry and exit of every
+ * slice that has work, so the CPU time packing and entropy coding actually
+ * take -- and where they land in the analysis window -- is MEASURED rather
+ * than inferred from symbol counts. It was left out before on the grounds that
+ * the reads tax what is being measured; they land inside DMA waits that were
+ * spinning anyway, and EDGE_BG_TIMING=0 removes them to check. */
 extern void cascade_set_bg_work(void (*fn)(void));
 extern uint8_t *edge_chw_for(int parity);
 extern uint8_t *edge_gm_in_for(int parity);
@@ -311,8 +320,34 @@ extern int      edge_pack_finish(void);
 extern int      edge_pack_rows_done(void);
 extern int      edge_pack_busy(void);
 
-static rc_stream_t g_bg_rc;
+/* The entropy stage for frame n-1 as ONE resumable job: unpack the transport
+ * indices into four raster planes of original ids, rANS-code them, assemble
+ * the payload. See rans_edge.h. Replaces the range coder's rc_stream_t. */
+static re_job_t    g_job;
 static int         g_bg_armed = 0;
+
+/* ---- background CPU accounting (2026-09-11) --------------------------------
+ * The pipelined figures used to rest on symbol COUNTS alone: this hook read no
+ * timer, so how long packing and entropy coding actually ran, and where in the
+ * analysis window, was never measured. Each slice now reads the timer on entry
+ * and exit -- only while it has work, so an idle hook costs nothing. Two reads
+ * per slice at roughly 1,700 slices per frame is on the order of 0.1 ms of CPU,
+ * spent inside DMA waits that were spinning anyway. Set to 0 to compare. */
+#ifndef EDGE_BG_TIMING
+#define EDGE_BG_TIMING 1
+#endif
+static unsigned long long g_bgt_pack_cyc = 0;   /* pack CPU inside slices      */
+static unsigned long long g_bgt_ent_cyc  = 0;   /* entropy CPU inside slices   */
+static unsigned long long g_bgt_pack_t0  = 0;   /* first pack slice            */
+static unsigned long long g_bgt_pack_t1  = 0;   /* pack complete               */
+static unsigned long long g_bgt_ent_t0   = 0;   /* first entropy slice         */
+static unsigned long long g_bgt_ent_t1   = 0;   /* coding complete             */
+static void edge_bg_timing_reset(void)
+{
+    g_bgt_pack_cyc = 0; g_bgt_ent_cyc = 0;
+    g_bgt_pack_t0  = 0; g_bgt_pack_t1 = 0;
+    g_bgt_ent_t0   = 0; g_bgt_ent_t1  = 0;
+}
 
 /* Two jobs share the cascade's idle CPU, and the order between them is not
  * arbitrary. The PACK has a hard deadline: the next frame cannot start its
@@ -321,9 +356,31 @@ static int         g_bg_armed = 0;
  * one with the hard deadline first. */
 static void edge_bg_slice(void)
 {
-    if (edge_pack_busy()) { edge_pack_step(EDGE_BG_PACK_ROWS); return; }
-    if (g_bg_armed && rc_stream_step(&g_bg_rc, (unsigned long)EDGE_BG_SLICE_SYMS))
-        g_bg_armed = 0;
+    const int pk = edge_pack_busy();
+    if (!pk && !g_bg_armed) return;                 /* nothing left: no timer read */
+#if EDGE_BG_TIMING
+    const unsigned long long a = NOW();
+#endif
+    if (pk) {
+        const int fin = edge_pack_step(EDGE_BG_PACK_ROWS);
+#if EDGE_BG_TIMING
+        const unsigned long long b = NOW();
+        if (!g_bgt_pack_t0) g_bgt_pack_t0 = a;
+        g_bgt_pack_cyc += b - a;
+        if (fin) g_bgt_pack_t1 = b;
+#else
+        (void)fin;
+#endif
+        return;
+    }
+    const int done = re_job_step(&g_job, (uint32_t)EDGE_BG_SLICE_SYMS);
+    if (done) g_bg_armed = 0;
+#if EDGE_BG_TIMING
+    const unsigned long long b = NOW();
+    if (!g_bgt_ent_t0) g_bgt_ent_t0 = a;
+    g_bgt_ent_cyc += b - a;
+    if (done) g_bgt_ent_t1 = b;
+#endif
 }
 
 /* Per-frame hiding accounting, printed after the pass so no printf lands
@@ -338,6 +395,26 @@ static unsigned long g_bg_exp[EDGE_BG_MAXF];   /* left over, coded exposed  */
 static double        g_bg_exp_ms[EDGE_BG_MAXF];
 static size_t        g_bg_bytes[EDGE_BG_MAXF];
 static int           g_bg_n = 0;
+
+/* Per-frame schedule of the pipelined pass, relative to the frame start, from
+ * timestamps taken INSIDE the frame and stored outside every bracket. */
+typedef struct {
+    double an0, an1;             /* analysis wall bracket                        */
+    double pl_hw, prog;          /* of which: PL hardware windows, layer prog    */
+    double pk0, pk1, pk_cpu;     /* pack N+1: first slice, complete, CPU         */
+    double pkx0, pk_x;           /* pack N+1: exposed finish start, duration     */
+    double en0, en1;             /* entropy N-1: first slice, coding complete    */
+    double en_cpu_an, en_cpu_vq; /* entropy CPU inside analysis / under search   */
+    double rl0, rl1;             /* codebook reload                              */
+    double vq0, vq1, vq_acc;     /* VQ bracket, accelerator elapsed inside it    */
+    double fx0, fx1;             /* entropy N-1: exposed tail + payload assembly */
+    double end;                  /* frame end                                    */
+    unsigned long upos_an, sym_an, sym_vq;
+    size_t bytes;
+    int    mode;
+} ep_prec_t;
+static ep_prec_t g_prec[EDGE_BG_MAXF];
+static int       g_prec_n = 0;
 #endif
 
 static void edge_pw_synth_codebook(void)
@@ -483,7 +560,8 @@ static int edge_pipe_frame(int run_vq)
             printf("[EDGE] PWRBAD could not arm the input pack" "\n");
             return -1;
         }
-        rc_stream_start(&g_bg_rc, g_pwr_M, g_pl_idx, g_bs, sizeof g_bs);
+        edge_bg_timing_reset();
+        re_job_start(&g_job, g_pl_idx, g_bs, sizeof g_bs);
         g_bg_armed = 1;
         cascade_set_bg_work(edge_bg_slice);
     }
@@ -495,10 +573,20 @@ static int edge_pipe_frame(int run_vq)
     cascade_set_bg_work(0);
     if (g_pwr_M) {
         edge_pack_finish();                  /* hard deadline: next frame reads it */
-        if (g_bg_armed) { rc_stream_finish(&g_bg_rc); g_bg_armed = 0; }
+        /* The search below overwrites g_pl_idx. The coder reads the transport
+         * only while unpacking, so that part must be over before the search
+         * starts -- in practice it already is (#SCHED counters: 14400 of
+         * 14400 positions unpacked inside the cascade). */
+        while (g_bg_armed && re_job_unpacked(&g_job) < RE_N)
+            if (re_job_step(&g_job, (uint32_t)EDGE_BG_SLICE_SYMS)) break;
     }
 #endif
-    if (an_rc != 0) return -1;
+    if (an_rc != 0) {
+#if EDGE_PIPE_ANY
+        if (g_pwr_M) { rans_mode_t md; (void)re_job_finish(&g_job, &md); g_bg_armed = 0; }
+#endif
+        return -1;
+    }
     g_pipe_lat = edge_latent_ptr();
 
 #if EDGE_USE_PW_VQ
@@ -508,7 +596,18 @@ static int edge_pipe_frame(int run_vq)
             vq_pw_pl_cache_prep(g_pipe_lat, g_pl_idx, 0);
             if (vq_pw_pl_start(g_pipe_lat, g_pl_idx) == 0) {
                 int r; unsigned long guard = 0;
-                while ((r = vq_pw_pl_poll_done()) == 0 && ++guard < 200000000u) { }
+                /* Code while the search runs, as edge_one_pipelined() does.
+                 * Until 2026-09-11 this loop finished the entropy job BEFORE
+                 * the reload instead, so the whole search-window share was
+                 * exposed and the period ran 30.83 ms against the pass's
+                 * 26.20 -- PWRSUM would have paired power with a schedule
+                 * that is not the deployed one. */
+                while ((r = vq_pw_pl_poll_done()) == 0 && ++guard < 200000000u) {
+#if EDGE_PIPE_ANY
+                    if (g_bg_armed && re_job_step(&g_job, (uint32_t)EDGE_BG_SLICE_SYMS))
+                        g_bg_armed = 0;
+#endif
+                }
                 if (r > 0) vq_pw_pl_finish(g_pl_idx);
             }
         }
@@ -518,7 +617,15 @@ static int edge_pipe_frame(int run_vq)
 #endif
 
 #if EDGE_PIPE_ANY
-    if (g_pwr_M) { g_pwr_par ^= 1; edge_set_in_parity(g_pwr_par); }
+    if (g_pwr_M) {
+        /* ALWAYS: the exposed tail and the payload assembly are deployed
+         * work. Phase A runs no search, so all of its remainder lands here --
+         * same CPU work as phase B, and both are padded to one period. */
+        rans_mode_t md;
+        (void)re_job_finish(&g_job, &md);
+        g_bg_armed = 0;
+        g_pwr_par ^= 1; edge_set_in_parity(g_pwr_par);
+    }
 #endif
     return 0;
 }
@@ -661,6 +768,7 @@ static void edge_power_measure(const vq_pq_ctx_t *vq, const rc_models_t *M,
 #endif
     printf("PWRSUM measured frame period = %.4f ms -> %.2f fps\n",
            t_pipe, 1000.0 / t_pipe);
+    printf("PWRSUM entropy stage in this loop: rANS unpack + code + payload, SYNTHETIC tables\n");
 #if EDGE_PIPELINED_AB && EDGE_USE_PW_VQ
     /* Self-check. The pipelined pass and this loop are separate code paths
      * driving the same topology, so their periods must agree. A gap says one
@@ -782,14 +890,20 @@ static int edge_one_pipelined(int frame_id, const rc_models_t *M,
     edge_reset_accums();
     st_set_frame((uint32_t)frame_id);
     ST_BEGIN_S(ST_FRAME);
+    const unsigned long long tf0 = NOW();
+    edge_bg_timing_reset();
+    unsigned long long rl0 = 0, rl1 = 0, vq0 = 0, vq1 = 0;
+    unsigned long long k0x = 0, k1x = 0, fx0 = 0, fx1 = 0, ent_cyc_an = 0;
+    int pmode_i = -1;
 
     /* ---- arm the coder on the previous frame's indices ------------------
      * g_idx_prev is 0 on the first frame of a pass: there is no previous
      * frame, so that one frame legitimately codes nothing. It is excluded
      * from the reported mean rather than averaged in as a fast frame. */
     const int have_prev = (g_idx_prev != 0);
+    (void)M;                 /* the rANS tables live in rans_edge.c */
     if (have_prev) {
-        rc_stream_start(&g_bg_rc, M, g_idx_prev, g_bs, sizeof g_bs);
+        re_job_start(&g_job, g_idx_prev, g_bs, sizeof g_bs);
         g_bg_armed = 1;
     }
 
@@ -823,7 +937,9 @@ static int edge_one_pipelined(int frame_id, const rc_models_t *M,
     cascade_set_bg_work(0);
     if (an_rc != 0) { g_bg_armed = 0; return -1; }
 
-    const unsigned long syms_an  = have_prev ? rc_stream_coded(&g_bg_rc) : 0ul;
+    const unsigned long syms_an  = have_prev ? (unsigned long)re_job_coded(&g_job) : 0ul;
+    const unsigned long upos_an  = have_prev ? (unsigned long)re_job_unpacked(&g_job) : 0ul;
+    ent_cyc_an = g_bgt_ent_cyc;
     const int           rows_an  = pack_ahead ? edge_pack_rows_done() : 0;
     unsigned long       syms_srch = 0ul;
 
@@ -837,18 +953,23 @@ static int edge_one_pipelined(int frame_id, const rc_models_t *M,
         ST_BEGIN_S(ST_PACK);
         const unsigned long long k0 = NOW();
         edge_pack_finish();
-        pack_exposed_ms = MS(k0, NOW());
+        k1x = NOW();
+        k0x = k0;
+        pack_exposed_ms = MS(k0, k1x);
         ST_END_S(ST_PACK);
     }
 
     if (g_pl_ok) {
         /* ---- codebook reload: overlaps nothing, by construction --------- */
         ST_BEGIN_S(ST_VQ_PROG);
+        rl0 = NOW();
         const int cb_ok = vq_pw_pl_load_codebook(g_pw_cb, 128);
+        rl1 = NOW();
         ST_END_S(ST_VQ_PROG);
 
         if (cb_ok == 0) {
             ST_BEGIN_S(ST_VQ_RUN);
+            vq0 = NOW();
             vq_pw_pl_cache_prep(edge_latent_ptr(), g_idx_cur, 0);
             const int started = (vq_pw_pl_start(edge_latent_ptr(), g_idx_cur) == 0);
 
@@ -864,16 +985,26 @@ static int edge_one_pipelined(int frame_id, const rc_models_t *M,
             if (started) {
                 while (r == 0 && ++guard < 200000000u) {
                     if (g_bg_armed) {
-                        if (rc_stream_step(&g_bg_rc, (unsigned long)EDGE_BG_SLICE_SYMS))
-                            g_bg_armed = 0;
+#if EDGE_BG_TIMING
+                        const unsigned long long a = NOW();
+#endif
+                        const int done = re_job_step(&g_job, (uint32_t)EDGE_BG_SLICE_SYMS);
+                        if (done) g_bg_armed = 0;
+#if EDGE_BG_TIMING
+                        const unsigned long long b = NOW();
+                        if (!g_bgt_ent_t0) g_bgt_ent_t0 = a;
+                        g_bgt_ent_cyc += b - a;
+                        if (done) g_bgt_ent_t1 = b;
+#endif
                     }
                     r = vq_pw_pl_poll_done();
                 }
                 if (r > 0) vq_pw_pl_finish(g_idx_cur);
             }
+            vq1 = NOW();
             ST_END_S(ST_VQ_RUN);
 
-            syms_srch = have_prev ? (rc_stream_coded(&g_bg_rc) - syms_an) : 0ul;
+            syms_srch = have_prev ? ((unsigned long)re_job_coded(&g_job) - syms_an) : 0ul;
 
             st->t_vq_pw_prog  = vq_pw_pl_last_prog_ms();
             st->t_vq_pl_block = vq_pw_pl_last_run_ms();
@@ -897,10 +1028,13 @@ static int edge_one_pipelined(int frame_id, const rc_models_t *M,
     if (have_prev) {
         ST_BEGIN_S(ST_RANGE);
         const unsigned long long r0 = NOW();
-        const size_t nb = rc_stream_finish(&g_bg_rc);
+        rans_mode_t pmode = RANS_MODE_RAW;
+        const size_t nb = re_job_finish(&g_job, &pmode);
         const unsigned long long r1 = NOW();
         ST_END_S(ST_RANGE);
         g_bg_armed = 0;
+        fx0 = r0; fx1 = r1;
+        pmode_i = (int)pmode;
 
         st->t_range     = MS(r0, r1);
         st->range_bytes = nb;
@@ -933,6 +1067,29 @@ static int edge_one_pipelined(int frame_id, const rc_models_t *M,
     edge_read_accums(&pack, &prog, &cache, &pl, &total);
     st->t_pack = pack; st->t_prog = prog; st->t_cache = cache;
     st->t_host = total;
+
+    /* the frame schedule, from timestamps taken inside the brackets above */
+    if (have_prev && pack_ahead && g_pl_ok && vq1 != 0u && g_prec_n < EDGE_BG_MAXF) {
+        ep_prec_t *R = &g_prec[g_prec_n++];
+        R->an0 = MS(tf0, t0);    R->an1 = MS(tf0, t_an);
+        R->pl_hw = pl;           R->prog = prog;
+        R->pk0 = g_bgt_pack_t0 ? MS(tf0, g_bgt_pack_t0) : -1.0;
+        R->pk1 = g_bgt_pack_t1 ? MS(tf0, g_bgt_pack_t1) : -1.0;
+        R->pk_cpu = ep_cycles_to_ms(g_bgt_pack_cyc);
+        R->pkx0 = MS(tf0, k0x);  R->pk_x = MS(k0x, k1x);
+        R->en0 = g_bgt_ent_t0 ? MS(tf0, g_bgt_ent_t0) : -1.0;
+        R->en1 = g_bgt_ent_t1 ? MS(tf0, g_bgt_ent_t1) : -1.0;
+        R->en_cpu_an = ep_cycles_to_ms(ent_cyc_an);
+        R->en_cpu_vq = ep_cycles_to_ms(g_bgt_ent_cyc - ent_cyc_an);
+        R->rl0 = MS(tf0, rl0);   R->rl1 = MS(tf0, rl1);
+        R->vq0 = MS(tf0, vq0);   R->vq1 = MS(tf0, vq1);
+        R->vq_acc = vq_pw_pl_last_run_ms();
+        R->fx0 = MS(tf0, fx0);   R->fx1 = MS(tf0, fx1);
+        R->end = MS(tf0, t1);
+        R->upos_an = upos_an;    R->sym_an = syms_an;    R->sym_vq = syms_srch;
+        R->bytes = st->range_bytes;
+        R->mode  = pmode_i;
+    }
     /* RATE. VQPW_IDX_BYTES is the TRANSPORT size -- always 4 bytes per latent
      * position, at every K, so the S2MM length and the cache ranges never
      * change. It is NOT the rate. Only VQPW_BITS_PER_POS = M*log2(K) of those
@@ -1205,6 +1362,138 @@ static void edge_bg_report(double ii_ms, int nframes, double t_range_serial)
     printf("#PIPE,NOTE,II is wall time over the pass divided by frames; it is\n");
     printf("#PIPE,NOTE,not a sum of stages and does not assume they are disjoint\n");
 }
+
+/* ---- measured schedule, overlaps and end-to-end latency (2026-09-11) --------
+ * Means over the pipelined pass of the per-frame records in g_prec, with the
+ * serial pass in S for the no-overlap comparison. Printed outside every timed
+ * bracket.
+ *
+ *   MEASURED  bracket timestamps, background-slice CPU time, the cascade's own
+ *             accumulators, II_frame.
+ *   COMPOSED  end-to-end latency. Frame N is packed during iteration N-1,
+ *             analysed and searched in N, entropy-coded and assembled in N+1;
+ *             the figure sums measured offsets across those three iterations
+ *             and EXCLUDES the synthetic input generation this harness runs
+ *             between iterations, which stands in for a camera.
+ * ------------------------------------------------------------------------- */
+static void edge_schedule_report(double ii, const ep_frame_stat_t *S, int ns)
+{
+    const int n = g_prec_n;
+    if (n <= 0 || ii <= 0.0) { printf("#SCHED,NOTE,no pipelined frames recorded\n"); return; }
+
+    double an0 = 0, an1 = 0, hw = 0, prog = 0, pk0 = 0, pk1 = 0, pkc = 0, pkx0 = 0, pkx = 0;
+    double en0 = 0, en1 = 0, ena = 0, env = 0, rl0 = 0, rl1 = 0, vq0 = 0, vq1 = 0, vqa = 0;
+    double fx0 = 0, fx1 = 0, end = 0, by = 0, ua = 0, sa = 0, sv = 0;
+    int npk0 = 0, npk1 = 0, nen0 = 0, nen1 = 0, nraw = 0;
+    for (int i = 0; i < n; i++) {
+        const ep_prec_t *R = &g_prec[i];
+        an0 += R->an0; an1 += R->an1; hw += R->pl_hw; prog += R->prog;
+        if (R->pk0 >= 0.0) { pk0 += R->pk0; npk0++; }
+        if (R->pk1 >= 0.0) { pk1 += R->pk1; npk1++; }
+        pkc += R->pk_cpu; pkx0 += R->pkx0; pkx += R->pk_x;
+        if (R->en0 >= 0.0) { en0 += R->en0; nen0++; }
+        if (R->en1 >= 0.0) { en1 += R->en1; nen1++; }
+        ena += R->en_cpu_an; env += R->en_cpu_vq;
+        rl0 += R->rl0; rl1 += R->rl1; vq0 += R->vq0; vq1 += R->vq1; vqa += R->vq_acc;
+        fx0 += R->fx0; fx1 += R->fx1; end += R->end; by += (double)R->bytes;
+        ua += (double)R->upos_an; sa += (double)R->sym_an; sv += (double)R->sym_vq;
+        if (R->mode == 0) nraw++;
+    }
+    const double d = (double)n;
+    an0 /= d; an1 /= d; hw /= d; prog /= d; pkc /= d; pkx0 /= d; pkx /= d;
+    ena /= d; env /= d; rl0 /= d; rl1 /= d; vq0 /= d; vq1 /= d; vqa /= d;
+    fx0 /= d; fx1 /= d; end /= d; by /= d; ua /= d; sa /= d; sv /= d;
+    pk0 = npk0 ? pk0 / npk0 : -1.0;
+    pk1 = npk1 ? pk1 / npk1 : -1.0;
+    en0 = nen0 ? en0 / nen0 : -1.0;
+    en1 = nen1 ? en1 / nen1 : -1.0;
+
+    const double an   = an1 - an0;
+    const double rl   = rl1 - rl0;
+    const double vq   = vq1 - vq0;
+    const double fx   = fx1 - fx0;
+    const double pack = pkc + pkx;
+    const double ent  = ena + env + fx;
+    const double hid  = pkc + ena + env;
+    const double expo = an + pkx + rl + vq + fx;
+    const double ssum = an + rl + vq + pack + ent;
+
+    double s_host = 0, s_pack = 0, s_rl = 0, s_vq = 0, s_ent = 0;
+    for (int i = 0; i < ns; i++) {
+        s_host += S[i].t_host; s_pack += S[i].t_pack;
+        s_rl += S[i].t_vq_pw_prog; s_vq += S[i].t_vq_pl; s_ent += S[i].t_range;
+    }
+    if (ns > 0) {
+        const double dn = (double)ns;
+        s_host /= dn; s_pack /= dn; s_rl /= dn; s_vq /= dn; s_ent /= dn;
+    }
+    const double s_frame  = s_host + s_rl + s_vq + s_ent;
+    const double lat_in   = (pk0 >= 0.0) ? ii - pk0 : ii;
+    const double lat_proc = (ii - an0) + fx1;
+    const double lat_e2e  = lat_in + ii + fx1;
+
+    printf("\n#SCHED,===== pipelined schedule with the rANS entropy stage, %d frames =====\n", n);
+    printf("#SCHED,NOTE,origin = frame start (ST_FRAME begin); means over the pass; MEASURED on this board\n");
+    printf("#SCHED,NOTE,entropy tables and the k->id map are SYNTHETIC; payload size is not a rate\n");
+    printf("#SCHED,task,frame,start_ms,end_ms,duration_ms,resource\n");
+    printf("#SCHED,PL analysis (3 fused DW->PW pairs),N,%.4f,%.4f,%.4f,PL + PS\n", an0, an1, an);
+    printf("#SCHED,  of which PL hardware windows,N,,,%.4f,PL\n", hw);
+    printf("#SCHED,  of which layer programming,N,,,%.4f,PS\n", prog);
+    printf("#SCHED,input packing in DMA waits (envelope; duration = CPU),N+1,%.4f,%.4f,%.4f,PS\n", pk0, pk1, pkc);
+    printf("#SCHED,input packing exposed finish,N+1,%.4f,%.4f,%.4f,PS\n", pkx0, pkx0 + pkx, pkx);
+    printf("#SCHED,entropy unpack+rANS in DMA waits (envelope; duration = CPU),N-1,%.4f,%.4f,%.4f,PS\n", en0, en1, ena);
+    printf("#SCHED,codebook reload,N,%.4f,%.4f,%.4f,PS to PL weight BRAM\n", rl0, rl1, rl);
+    printf("#SCHED,PL VQ search (driver bracket),N,%.4f,%.4f,%.4f,PL + PS\n", vq0, vq1, vq);
+    printf("#SCHED,  of which accelerator elapsed,N,,,%.4f,PL\n", vqa);
+    printf("#SCHED,  entropy coded under the search (CPU),N-1,,,%.4f,PS\n", env);
+    printf("#SCHED,entropy exposed tail + payload assembly,N-1,%.4f,%.4f,%.4f,PS\n", fx0, fx1, fx);
+    printf("#SCHED,frame end,N,,%.4f,,\n", end);
+    printf("#SCHED,II_frame (wall; input generation excluded),N,0.0000,%.4f,%.4f,\n", ii, ii);
+    printf("#SCHED,NOTE,an envelope end of -1 means that work did not finish in the background\n");
+    printf("#SCHED,counters,unpacked_positions_in_analysis,%.0f,of,%u,symbols_coded_in_analysis,%.0f,under_search,%.0f,of,%u\n",
+           ua, (unsigned)RE_N, sa, sv, (unsigned)(RANS_G * RE_N));
+
+    printf("\n#STAGE,stage,total_ms,exposed_ms,hidden_ms,serial_pass_ms\n");
+    printf("#STAGE,PL analysis,%.4f,%.4f,0.0000,%.4f\n", an, an, s_host - s_pack);
+    printf("#STAGE,PL VQ search,%.4f,%.4f,0.0000,%.4f\n", vq, vq, s_vq);
+    printf("#STAGE,codebook reload,%.4f,%.4f,0.0000,%.4f\n", rl, rl, s_rl);
+    printf("#STAGE,input packing,%.4f,%.4f,%.4f,%.4f\n", pack, pkx, pkc, s_pack);
+    printf("#STAGE,entropy coding (unpack + rANS + payload),%.4f,%.4f,%.4f,%.4f\n", ent, fx, ena + env, s_ent);
+
+    printf("\n#OVL,overlap,ms,note\n");
+    printf("#OVL,PL analysis x PL VQ,0.0000,one engine -- see #STEXCL\n");
+    printf("#OVL,codebook reload x any task,0.0000,background unregistered and pack finished first\n");
+    printf("#OVL,input packing x PL analysis,%.4f,%.1f%% of packing\n",
+           pkc, pack > 0.0 ? 100.0 * pkc / pack : 0.0);
+    printf("#OVL,entropy x PL analysis,%.4f,%.1f%% of entropy\n",
+           ena, ent > 0.0 ? 100.0 * ena / ent : 0.0);
+    printf("#OVL,entropy x PL VQ search,%.4f,%.1f%% of entropy\n",
+           env, ent > 0.0 ? 100.0 * env / ent : 0.0);
+    printf("#OVL,PS work hidden under PL waits,%.4f,%.1f%% of all PS stage work\n",
+           hid, (pack + ent) > 0.0 ? 100.0 * hid / (pack + ent) : 0.0);
+    printf("#OVL,analysis-window PS idle used,%.4f,%.1f%% of analysis minus layer programming\n",
+           pkc + ena, (an - prog) > 0.0 ? 100.0 * (pkc + ena) / (an - prog) : 0.0);
+    printf("#OVL,search-window PS idle used,%.4f,%.1f%% of the search bracket\n",
+           env, vq > 0.0 ? 100.0 * env / vq : 0.0);
+    printf("#OVL,stage costs if serialised,%.4f,\n", ssum);
+    printf("#OVL,II_frame,%.4f,\n", ii);
+    printf("#OVL,saved by overlap,%.4f,serialised minus II\n", ssum - ii);
+    printf("#OVL,unattributed,%.4f,II minus the exposed brackets\n", ii - expo);
+
+    printf("\n#LAT,quantity,ms,definition\n");
+    printf("#LAT,frame initiation interval,%.4f,wall per frame -> %.2f fps\n", ii, 1000.0 / ii);
+    printf("#LAT,serial frame without overlap,%.4f,serial pass: T_HOST + reload + VQ + entropy one-shot\n", s_frame);
+    printf("#LAT,overlap saving,%.4f,%.1f%% of the serial frame\n",
+           s_frame - ii, s_frame > 0.0 ? 100.0 * (s_frame - ii) / s_frame : 0.0);
+    printf("#LAT,input ready -> analysis start,%.4f,packing of N starts %.4f ms into iteration N-1\n", lat_in, pk0);
+    printf("#LAT,analysis start -> payload ready,%.4f,payload of N complete %.4f ms into iteration N+1\n", lat_proc, fx1);
+    printf("#LAT,end-to-end input -> payload,%.4f,COMPOSED from measured offsets over 3 iterations\n", lat_e2e);
+    printf("#LAT,NOTE,frame N is packed in N-1; analysed and searched in N; entropy-coded in N+1\n");
+    printf("#LAT,NOTE,excludes the synthetic input generation the harness runs between frames\n");
+    printf("#LAT,NOTE,energy per frame is PWRSUM below: board power x the power-loop period\n");
+    printf("#PAY,payload_bytes_mean,%.1f,bpp,%.5f,mode3_frames,%d,mode0_frames,%d,SYNTHETIC tables\n",
+           by, by * 8.0 / ((double)EP_W * (double)EP_H), n - nraw, nraw);
+}
 #endif /* EDGE_PIPE_ANY */
 
 static int edge_one(int frame_id, const vq_pq_ctx_t *vq, const rc_models_t *M,
@@ -1311,7 +1600,10 @@ static int edge_one(int frame_id, const vq_pq_ctx_t *vq, const rc_models_t *M,
 #if RC_GEOMETRY_PW
             ST_BEGIN_S(ST_RANGE);
             const unsigned long long r0 = NOW();
-            const size_t rn = rc_encode_frame(M, g_pl_idx, g_bs, sizeof g_bs);
+            rans_mode_t smode = RANS_MODE_RAW;
+            re_job_start(&g_job1, g_pl_idx, g_bs, sizeof g_bs);
+            const size_t rn = re_job_finish(&g_job1, &smode);   /* unpack + rANS + payload */
+            (void)smode;
             /* Feed the shared nb, or the reporting block below overwrites
              * every one of these fields with the legacy path's skipped
              * values -- which is what made the CSV read range_bytes=0 and
@@ -1383,7 +1675,13 @@ static int edge_one(int frame_id, const vq_pq_ctx_t *vq, const rc_models_t *M,
     st->range_bytes = nb;
     st->range_bits  = (double)nb * 8.0;
     st->range_bpp   = st->range_bits / ((double)EP_W * (double)EP_H);
+    /* K=64 transport carries 24 index bits per position, not 8 per byte */
+#if RC_GEOMETRY_PW && EDGE_USE_PW_VQ
+    st->fixed_bpp   = ((double)VQPW_BITS_PER_POS * (double)VQPW_NPOS)
+                    / ((double)EP_W * (double)EP_H);
+#else
     st->fixed_bpp   = ((double)VQ_IDX_BYTES * 8.0) / ((double)EP_W * (double)EP_H);
+#endif
     st->t_edge_sum  = st->t_host + st->t_vq + st->t_range;
 
     // everything below is OUTSIDE all timed regions
@@ -1405,11 +1703,21 @@ static int edge_one(int frame_id, const vq_pq_ctx_t *vq, const rc_models_t *M,
      * zero-length stream and diffing it is not a failing round trip, it is
      * an absent one: leave rc_mismatch at -1 so the summary says so. */
     if (do_roundtrip && nb > 0) {
+#if RC_GEOMETRY_PW && EDGE_USE_PW_VQ
+        /* rANS: decode every stream of the payload with the test decoder, map
+         * the ids back to hardware k and compare with the transport indices
+         * the search produced. 0 = the whole entropy stage is lossless here. */
+        long first = -1;
+        const long bad = re_job_verify(&g_job1, rc_src, &first);
+        (void)rc_len;
+        st->rc_mismatch = bad; st->rc_first_bad = first;
+#else
         rc_decode_frame(M, g_bs, nb, g_rt);
         long bad = 0, first = -1;
         for (long i = 0; i < rc_len; i++)
             if (g_rt[i] != rc_src[i]) { if (first < 0) first = i; bad++; }
         st->rc_mismatch = bad; st->rc_first_bad = first;
+#endif
     }
     return 0;
 }
@@ -1439,6 +1747,9 @@ int edge_validation_run(void)
            VQPW_CIN_MAC, VQPW_COUT_TOTAL, VQPW_NBATCH, VQPW_SCORE_BITS);
     printf("#GEOM,entropy,models,%d,alphabet,%d,symbols_per_frame,%lu\n",
            RC_NMODEL, RC_NSYM, (unsigned long)RC_NSYM_PER_FRAME);
+    printf("#GEOM,entropy,coder,rANS,mode,3,fallback,0,prob_bits,%u,table_width,%u,"
+           "ctx_slots,%u,tables,SYNTHETIC\n",
+           (unsigned)RANS_PROB_BITS, (unsigned)RANS_K_NOMINAL, (unsigned)RANS_NCTX_SLOTS);
     printf("#GEOM,rate,index_bpp,%.5f,idx_bytes_per_frame,%d\n",
            ((double)VQPW_BITS_PER_POS * (double)VQPW_NPOS)
              / ((double)EP_W * (double)EP_H),
@@ -1639,16 +1950,45 @@ int edge_validation_run(void)
         }
     }
 #endif
+    #if RC_GEOMETRY_PW && EDGE_USE_PW_VQ
+    /* ---- rANS context tables, SYNTHETIC ---------------------------------
+     * The shipped ROM (CONTEXT_CODEC.md 3) and the k -> original id map do not
+     * exist yet, so both are synthesised: a fixed k -> id permutation per
+     * group, and top-16 context tables FITTED on these calibration indices,
+     * serialised in the spec-3 layout and expanded through the same boot path
+     * the real ROM will take. Boot-time work, NOT part of T_RANGE. */
+    rc_model_uniform(&M);                   /* legacy range-coder model: unused */
+    {
+        re_fit_report_t fr;
+        re_synth_maps();
+        const int frc = re_fit_tables((const uint8_t *const *)g_cal_idx, EDGE_NCAL, &fr);
+        t_model_build = fr.fit_ms;
+        printf("[EDGE] rANS context tables fitted in %.4f ms (NOT counted in T_RANGE), rc=%d\n",
+               fr.fit_ms, frc);
+        printf("[EDGE] ROM %u B (spec 3 layout), dense tables in RAM %u B\n",
+               (unsigned)RANS_ROM_BYTES,
+               (unsigned)(RANS_G * RANS_NCTX_SLOTS * RANS_ROW_ENTRIES * 2u));
+        printf("[EDGE] populated context slots per group: %u %u %u %u of %u\n",
+               (unsigned)fr.populated[0], (unsigned)fr.populated[1],
+               (unsigned)fr.populated[2], (unsigned)fr.populated[3],
+               (unsigned)RANS_NCTX_SLOTS);
+        printf("[EDGE] SYNTHETIC k->id map and tables: timing is real, payload size is not a rate\n");
+        if (frc != 0) {
+            printf("[EDGE] ABORT: context tables failed the section-8 contract.\n");
+            edge_set_quiet(0);
+            return -1;
+        }
+    }
+#else
     ep_build_model(&M, (const uint8_t *const *)g_cal_idx, EDGE_NCAL, &t_model_build);
     double Hm[RC_NMODEL];
     rc_model_entropy(&M, Hm);
     printf("[EDGE] model built in %.4f ms (NOT counted in T_RANGE)\n", t_model_build);
-    /* RC_NMODEL is 8 under RC_GEOMETRY_PW, so the fixed four-value print
-     * hid half the models -- including the fact that they were identical. */
     printf("[EDGE] model entropy per codebook (%d models of %d symbols):",
            RC_NMODEL, RC_NSYM);
     for (int m = 0; m < RC_NMODEL; m++) printf(" %.4f", Hm[m]);
     printf(" bits/sym\n");
+#endif
 
     /* ON-TARGET VERIFICATION of the restructured NEON search (2026-08-26).
      * search_sub now keeps the running minimum in NEON registers. Confirm on the
@@ -2069,6 +2409,7 @@ int edge_validation_run(void)
 
         st_reset();
         g_bg_n     = 0;
+        g_prec_n   = 0;
         g_bg_armed = 0;
         g_idx_cur  = 0;      /* fresh ping-pong; frame 1 of the pass has no */
         g_idx_prev = 0;      /* predecessor and therefore codes nothing     */
@@ -2157,6 +2498,7 @@ int edge_validation_run(void)
             if (np > 0) {
                 g_pipe_ii_ms = ii_frame;
                 edge_bg_report(ii_frame, np, rs);
+                edge_schedule_report(ii_frame, g_stat, n);
                 printf("#PIPE,II_frame_ms,%.4f,II_wall_ms,%.4f,input_prep_ms,%.4f\n",
                        ii_frame, ii_wall, ii_wall - ii_frame);
                 printf("#PIPE,NOTE,II_frame excludes synthetic input generation;\n");

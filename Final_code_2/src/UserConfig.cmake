@@ -37,7 +37,9 @@ set(USER_COMPILE_SOURCES
 "vq_pw_pl.c"       # PW-hosted VQ driver -- the live path
 "stage_trace.c"    # absolute-timestamped stage boundaries
 "pwr_log.c"        # PMBus sampling for energy per frame
-"range_coder.c"
+"range_coder.c"     # kept for rc_frame_entropy reporting only
+"rans.c"            # rANS coder core: RANS_GUIDE.md, CONTEXT_CODEC.md
+"rans_edge.c"       # entropy stage: unpack, synthetic tables, resumable job
 "edge_pipeline.c"
 "edge_harness.c"
 "oos_validation.c" # referenced by main.c under RUN_OOS_VALIDATION but never
