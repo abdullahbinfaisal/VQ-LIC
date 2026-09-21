@@ -1,0 +1,28 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# model weights and context tables -- downloaded, not committed (see README)
+Compressor/weights/
+*.pt
+*.pth
+*.npz
+
+# evaluation corpora
+Compressor/data/
+
+# run artifacts
+Compressor/results/
+runs/
+nic_runs/
+*.jsonl
+previews/
+*.tmp
+
+.ipynb_checkpoints/
+.vscode/
+.idea/
+.DS_Store

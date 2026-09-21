@@ -1,0 +1,14 @@
+# The repo is authored on Windows and run on Linux. Without this, git's
+# core.autocrlf can commit CRLF into the shell scripts, and bash on the cloud box
+# then fails with the deeply unhelpful `/usr/bin/env: 'bash\r': No such file or
+# directory`.
+*.sh   text eol=lf
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.json text eol=lf
+
+*.png  binary
+*.jpg  binary
+*.pt   binary
+*.pth  binary

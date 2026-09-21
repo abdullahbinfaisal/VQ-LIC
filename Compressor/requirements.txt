@@ -1,0 +1,33 @@
+# Install torch/torchvision separately for your CUDA build, e.g.
+#   pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
+torch>=2.1
+torchvision>=0.16
+
+pytorch-msssim>=1.0.0
+numpy>=1.24
+Pillow>=10.0
+
+# Loss curves (vqlic/plots.py). Imported lazily and behind a try/except: without
+# it a run still trains, logs and writes previews, it just prints a note instead
+# of a PNG. Previews use Pillow, not matplotlib, on purpose.
+matplotlib>=3.7
+
+# --- comparison curves only -------------------------------------------------
+# Needed by scripts/eval_learned.py and scripts/eval_classical.py, which measure
+# the baselines our numbers are plotted against. The codec itself does not use
+# them, so they are commented out: install them only if you are reproducing the
+# comparison.
+#
+#   compressai>=1.2      Balle2018 / Minnen2018 anchors and their checkpoints
+#   lpips>=0.1.4         perceptual metric, scored on each reconstruction
+#   brisque>=0.0.16      no-reference perceptual metric
+#
+# BPG and MozJPEG are external binaries, not pip packages. eval_classical.py
+# finds them through VQLIC_BPGENC / VQLIC_BPGDEC, falling back to PATH.
+
+# Deliberately NOT required:
+#   scikit-image - PSNR is computed in numpy (identical to psnr_sk on uint8)
+#   opencv       - Pillow covers every image op here
+#   tqdm         - progress is printed as structured log lines, also captured to
+#                  <out-dir>/<name>_log.jsonl, which is what you want in a cloud
+#                  log stream
