@@ -17,6 +17,26 @@ same pointwise engine, and an rANS entropy stage on the Cortex-A9.
 > byte-identical output against the reference implementation. See
 > [Status and caveats](#status-and-caveats).
 
+## Normative spec
+
+This folder is the hardware implementation of the encode side: the
+convolutional encoder, the codebook assignment, and the context-conditioned rANS
+coder. It is written against the bitstream spec in `Compressor/`, which is
+normative:
+
+- [../Compressor/CONTEXT_CODEC.md](../Compressor/CONTEXT_CODEC.md) — what is
+  coded, the context definition, the table format, the payload container, and
+  the conformance requirements.
+- [../Compressor/RANS_GUIDE.md](../Compressor/RANS_GUIDE.md) — the coder itself:
+  constants, encoder, decoder, the width and overflow audit, Cortex-A9 notes.
+- [../Compressor/CONTEXT_CODEC_FAQ.md](../Compressor/CONTEXT_CODEC_FAQ.md)
+
+A stream produced here must decode with `Compressor/scripts/codec.py --decode`
+to the same indices, bit for bit. The encoder and the decoder derive the context
+id independently — the encoder from the bulk form, the decoder incrementally —
+and nothing in the stream flags a disagreement, so that round trip is the check
+that matters. **It has not been run yet**; see below.
+
 ## Repository layout
 
 | Path | Contents |
@@ -100,9 +120,9 @@ change to the encoder.
 - **Weights are synthetic.** No accelerator output has been compared against a
   software reference.
 - **The rANS coder is not validated against the reference.** The spec is
-  `RANS_GUIDE.md` + `CONTEXT_CODEC.md`, both external and not in this repo.
-  Byte-identical output against the
-  reference is the acceptance test and has not been met.
+  `RANS_GUIDE.md` + `CONTEXT_CODEC.md` in `../Compressor/`. A bit-exact
+  round trip through `codec.py --decode` is the acceptance test and has not
+  been run.
   `rans_stage3_test` needs the reference's `rom.bin`, `slots.bin`, `idx.bin` and
   `payload.bin`, which are not in this repo. The k→id map and context tables in
   `rans_edge.c` are fitted at boot. Timings measured with them are real, but the
