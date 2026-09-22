@@ -1,0 +1,6 @@
+### RESULT ded_k256 FAILED: ERROR: [Common 17-69] Command failed: Vivado Synthesis failed
+### RESULT ded_k64 WNS=4.200 DSPcells=0
+### RESULT ded_k64 FAILED: ERROR: [Common 17-69] Command failed: Vivado Synthesis failed
+### RESULT ded_k256 WNS=4.119 DSPcells=0
+### RESULT pw_vq0 WNS=1.608
+### RESULT pw_vq1 WNS=1.565

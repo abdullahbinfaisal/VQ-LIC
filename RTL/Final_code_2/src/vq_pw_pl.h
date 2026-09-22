@@ -1,0 +1,113 @@
+#ifndef VQ_PW_PL_H
+#define VQ_PW_PL_H
+/* ============================================================================
+ * vq_pw_pl.h -- driver for VQ running on the SHARED pointwise engine.
+ *
+ * Replaces vq_pl.c, which drove the dedicated vq_pq_axi_0 block at
+ * 0x43C20000. That block was deleted from the design when VQ moved onto the
+ * PW engine (commit 62cbfbc); axi_dma_2 now feeds pw_single_oc_axis_axi_0's
+ * s_axis_vq and drains its m_axis_vq.
+ *
+ * CONFIGURATION (see vq_pw.h, VQPW_PROFILE):
+ *   DEPLOYED  M = 4, K = 64, Dsub = 16. K exceeds Q = 32, so ONE sub-codebook
+ *             spans TWO output-channel batches and eight batches cover all
+ *             four. c_out = 256, which needs COUT_MAX = 256 in the bitstream
+ *             (240 floors to 7 batches = 224 and the engine refuses).
+ *             24 bits per latent position, in a 32-bit transport word.
+ *   LEGACY    M = 8, K = 16, Dsub = 8. One batch holds TWO sub-codebooks,
+ *             c_out = 128, 32 bits per position. Kept as a regression mode.
+ *
+ * ------------------------------------------------------------------------
+ * THREE THINGS THAT ARE NOT OBVIOUS FROM THE REGISTER MAP
+ * ------------------------------------------------------------------------
+ * 1. START BEFORE THE DMA. Writing CTRL bit 0 resets the engine's input FIFO
+ *    (pw_single_oc_axis.sv:88, deliberate -- a run must not inherit beats
+ *    from an aborted predecessor). Anything the DMA has already pushed is
+ *    flushed. Kicking MM2S first costs you the beats in flight and the search
+ *    then runs on a latent shifted by however many were buffered, while every
+ *    programmed register still reads back correct. Verified in
+ *    tb_pw_axi_vq.sv: 9 beats lost that way, and every output wrong.
+ *
+ * 2. THE WEIGHT BRAM IS SHARED WITH CONVOLUTION. The codebook occupies the
+ *    same per-OC weight banks the analysis transform uses, so it CANNOT be
+ *    loaded once per model -- the next convolution overwrites it, and the
+ *    next VQ overwrites the convolution's. vq_pw_pl_load_codebook() therefore
+ *    runs once per frame, and its cost is reported separately by
+ *    vq_pw_pl_last_prog_ms(). That reload is a real price of sharing the
+ *    engine and belongs in any latency accounting.
+ *
+ * 3. VQ MODE MUST BE CLEARED. The mode bit also selects which AXIS pair the
+ *    engine talks on. Leaving it set sends the next convolution's output to
+ *    axi_dma_2 and starves it of input from the DW engine.
+ *    vq_pw_pl_finish() clears it.
+ * ==========================================================================*/
+
+#include <stdint.h>
+#include "vq_pw.h"
+
+#define VQ_PW_PL_BASE       0x43C10000u   /* pw_single_oc_axis_axi_0        */
+#define VQ_PW_PL_DMA_BASE   0x40420000u   /* axi_dma_2, MM2S in / S2MM out  */
+
+/* Probe the engine and reset both DMA channels. 0 on success. */
+int  vq_pw_pl_init(void);
+
+/* Build the block-diagonal weight image and the codeword-norm table from
+ * `cb` (pre-centred int8, M*K*Dsub) and program both over AXI-lite.
+ * MUST be called before every frame -- see note 2 above. 0 on success,
+ * <0 if vqpw_init() rejects the zero point. */
+int  vq_pw_pl_load_codebook(const int8_t *cb, uint8_t zp);
+
+/* Cache maintenance split out so it can be timed separately from the
+ * accelerator, exactly as vq_pl.c did. */
+void vq_pw_pl_cache_prep(const void *latent, void *idx_out, int flush_latent);
+
+/* Non-blocking. start() programs geometry, enters VQ mode, starts the engine
+ * and only THEN kicks the DMA. */
+int  vq_pw_pl_start(const void *latent, void *idx_out);
+int  vq_pw_pl_poll_done(void);     /* 1 done, 0 busy, <0 error */
+void vq_pw_pl_finish(void *idx_out);
+
+/* Blocking: cache_prep + start + spin + finish. */
+int  vq_pw_pl_encode_frame(const void *latent, void *idx_out);
+
+/* Compare the engine against vqpw_encode_frame() on the same latent.
+ * Returns the mismatch count, or <0 on a hardware fault. */
+long vq_pw_pl_verify(const int8_t *cb, uint8_t zp, const void *latent,
+                     uint8_t *pl_idx, uint8_t *sw_idx, long *first_bad);
+
+/* Read the activation buffer back verbatim. Loads a codebook that turns each
+ * sub-codebook into a step-4 scalar quantiser on its window's first channel,
+ * then runs eight groups whose marker byte names the group, so the returned
+ * index says WHICH group's beat is sitting in the slot. Returns the number of
+ * readings that were not the group's own beat; 0 means the buffer is sound. */
+int vq_pw_pl_probe_slots(void);
+
+/* Ask the engine to name each codeword in turn, by loading a codebook in which
+ * exactly one codeword can win. Returns the number of (m,k) it could not name;
+ * 0 means every codeword is reachable and the weight path is sound. */
+int vq_pw_pl_sweep_codewords(void);
+
+/* One-group runs on crafted latents that remove terms from the score, so a
+ * disagreement can be attributed to the norm ROM or to the MAC rather than
+ * just to "the engine". Returns the worst per-case mismatch count, 0 = all
+ * clean, <0 if the codebook was rejected. See the long note in vq_pw_pl.c. */
+int vq_pw_pl_selftest(const int8_t *cb, uint8_t zp);
+
+/* Is the PL currently loaded a build that has the configuration guard, i.e.
+ * 2026-09-09 or later? Programs a geometry the new engine must refuse and reads
+ * cfg_err back. Safe on an old bitstream too -- it arms the DMA so an unguarded
+ * engine completes instead of wedging. See the long note in vq_pw_pl.c.
+ *   1 = guard present (NEW), 0 = absent (OLD), <0 = inconclusive. */
+int vq_pw_pl_probe_guard(void);
+
+/* Raw STATUS2. Bit 5 is cfg_err: the core REFUSED the last start because the
+ * geometry would have aliased. Zero on a pre-2026-09-09 bitstream, which has
+ * no such bit -- so 0 is not proof of anything, it is only the absence of a
+ * complaint. See the note in vq_pw_pl.c. */
+uint32_t vq_pw_pl_status2(void);
+
+/* Timing of the most recent frame, milliseconds. */
+double vq_pw_pl_last_prog_ms(void);   /* codebook + geometry reload        */
+double vq_pw_pl_last_run_ms(void);    /* start -> DMA idle, accelerator    */
+
+#endif /* VQ_PW_PL_H */

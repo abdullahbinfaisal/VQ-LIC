@@ -1,0 +1,194 @@
+==============================================================================
+PixelPacker on Zynq-7020 -- board dump, 2026-09-05 run 3
+xc7z020clg484-1, PL 100 MHz, 1280x720, PQ M=8 K=16, 0.5000 bpp fixed
+==============================================================================
+SYNTHETIC input and SYNTHETIC codebook: no trained weights exist, so
+this is a timing and power result and NOT a rate or distortion one.
+Correctness gates all clean: 0 VQ mismatches of 57,600, 0 range
+round-trip mismatches of 4,608,000, 0 engine-exclusion violations.
+
+==============================================================================
+1. PER-STAGE LATENCY, UNOVERLAPPED
+==============================================================================
+One frame, every stage run to completion before the next begins.
+1280x720 input, C* = 16-48-64, PQ M=8 K=16, PL at 100 MHz.
+
+  stage                               ms       sd   share  unit provenance
+------------------------------------------------------------------------------
+  ANALYSIS TRANSFORM
+    input pack (group-major)      5.0712   0.0024   17.2%  CPU  MEASURED
+    descriptor + weight prog      1.0936   0.0001    3.7%  CPU  MEASURED
+    cache maintenance             0.0005   0.0000    0.0%  CPU  MEASURED
+    DW->PW cascade (3 pairs)     13.4820   0.0002   45.7%  PL   MEASURED
+  VECTOR QUANTISATION
+    codebook reload               0.4834   0.0002    1.6%  CPU  MEASURED
+    search, accelerator only      2.4505        -          PL   MEASURED
+    search, driver bracket        2.6402   0.0001    9.0%  PL   MEASURED
+  ENTROPY CODING
+    range coder, 115200 sym       6.7181   0.0054   22.8%  CPU  MEASURED
+------------------------------------------------------------------------------
+  FRAME TOTAL                    29.4885           100.0%        -> 33.91 fps
+
+  per DW->PW pair (SILICON, PL cycle counters):
+    pair   HxW            Cout    PL cycles         ms cyc/group
+           360x640          16       519919     5.1992      18.1
+           180x320          48       470288     4.7029      65.3
+           90x160           64       357989     3.5799     198.9
+
+  Resource split: PL busy 16.3039 ms, CPU busy 13.3663 ms.
+  The PW engine is one resource. The cascade and the search both need
+  it, so they can never overlap -- asserted every run, 0 violations.
+
+  NOT PART OF THE FRAME, listed because they appear in the log:
+    NEON PQ search                426.4452 ms   software VQ reference, checked every frame
+    entropy model build            27.4594 ms   once per run, not per frame
+    input generation               71.3258 ms   synthetic frame generator, stands in for
+                                                a camera. Excluded from every II below.
+
+==============================================================================
+2. PER-STAGE LATENCY IN THE OVERLAPPED MULTI-FRAME SEQUENCE
+==============================================================================
+Steady state, 40 consecutive frames. Each frame's cascade DMA wait
+carries the NEXT frame's input pack and the PREVIOUS frame's entropy
+coding, both sliced and driven from the cascade's poll loops.
+
+  stage                            cost ms     in II  where it runs
+------------------------------------------------------------------------------
+  descriptor + weight prog          1.0936    1.0936  exposed: writes the engine regs
+  DW->PW cascade                   13.4937   13.4937  exposed: the PL itself
+  codebook reload                   0.4834    0.4834  exposed: writes the weight BRAM
+  VQ search (driver bracket)        2.8219    2.8219  exposed: the PL itself
+  input pack, for frame n+1         5.0712    0.0007  HIDDEN in the cascade wait
+  entropy coding, of frame n-1      6.7181    0.0006  HIDDEN in the cascade wait
+------------------------------------------------------------------------------
+                                             17.8939  sum of the column
+                                             17.9024  MEASURED, wall time / frames
+  residual                                    0.0085  frame bookkeeping outside every stage
+
+  INTERVAL PER FRAME  17.9024 ms  ->  55.86 fps   MEASURED
+
+  What went into the hiding window
+------------------------------------------------------------------------------
+  cascade DMA wait, per frame          13.4820 ms
+  CPU work placed in it                11.7893 ms  (87% full)
+    input pack     43.0% of it            5.0712 ms  720 of 720 rows
+    entropy        57.0% of it            6.7181 ms  115174.4 of 115200 symbols
+  spilled to the VQ search window                  25.6 symbols (0.02%)
+  left exposed                          0.0005 ms  pack 0.0002 + flush 0.0003
+  headroom left in the window           1.6927 ms
+
+  Steady-state timeline of frame n, ms from frame start
+------------------------------------------------------------------------------
+        0                                                    17.9 ms
+        |----------------------------------------------------------|
+  PL        #############################################  cascade, DW->PW x3
+  PL                                                       #########  VQ search
+  CPU   pppp  prog: descriptors + weights
+  CPU                                                    rr  reload: codebook
+  CPU       .............................................  pack(n+1) then entropy(n-1),
+                                                                 sliced into the cascade DMA wait
+
+        # = the PW engine, and it is the only strictly serial
+        resource. p and r write its registers and weight BRAM while
+        it is idle. The dotted span is CPU work for OTHER frames.
+
+  Three frames are in flight: n is on the engine, n+1 is being packed,
+  n-1 is being entropy coded. Frame n's own pack happened during frame
+  n-1, and its own entropy coding will happen during frame n+1.
+
+  Topologies measured on this board
+------------------------------------------------------------------------------
+  serial                   29.4885 ms   33.91 fps   every stage back to back
+  entropy hidden           22.9135 ms   43.64 fps   run 2
+  entropy + pack hidden    17.9024 ms   55.86 fps   run 3, deployed
+  floor                    16.3039 ms   61.34 fps   PW engine busy time
+  serial -> deployed: 1.647x
+  1.5985 ms above the floor, and all of it is accounted for:
+     1.0936  descriptor + weight programming, writes the engine regs
+     0.4834  codebook reload, writes the weight BRAM
+     0.0117  cascade slowdown from the background work
+     0.0005  pack and flush remainders left exposed
+     0.0093  frame bookkeeping outside every stage bracket
+  The first two are irreducible with this engine: both configure the
+  thing they would have to overlap.
+
+  Cost of the overlap, measured:
+    cascade      13.4820 -> 13.4937 ms  (+0.0117, +0.09%)
+      slice-granular DMA-completion detection plus 5.5 MB of CPU DDR
+      traffic inside the transfers it hides in. 12 microseconds.
+    VQ driver    2.6402 -> 2.8219 ms  (+0.1817, cache state)
+      The accelerator itself is unchanged at 2.4505 ms.
+
+==============================================================================
+3. POWER AND ENERGY PER FRAME
+==============================================================================
+Duty-matched interleaved A/B over the PMBus rails. A and B alternate
+frame by frame and both pad to the same period, so thermal drift and
+duty differences cancel instead of being absorbed into the delta.
+656 scans per phase, 4,896 frames per phase.
+
+  rail       group      A (W)     B (W)      delta
+------------------------------------------------------------------------------
+  VCCINT     PL        0.2325    0.2322    -0.0003
+  VCCPINT    PS        0.3591    0.3595    +0.0004
+  VCCAUX     PL        0.0283    0.0292    +0.0009
+  VCCPAUX    PS        0.1111    0.1158    +0.0047
+  VCCADJ     MISC      0.0406    0.0363    -0.0043
+  VCC1V5PS   DDR       0.4737    0.4747    +0.0010
+  VCC_MIO    PS        0.0111    0.0110    -0.0001
+  VCCBRAM    PL        0.0088    0.0075    -0.0013
+  VCC3V3     MISC      0.7480    0.7450    -0.0030
+  VCC2V5     MISC      0.0210    0.0247    +0.0037
+------------------------------------------------------------------------------
+             PL        0.2696    0.2689    -0.0007    13.2% of board
+             PS        0.4813    0.4863    +0.0050    23.9% of board
+             DDR       0.4737    0.4747    +0.0010    23.3% of board
+             MISC      0.8096    0.8060    -0.0036    39.6% of board
+------------------------------------------------------------------------------
+  TOTAL                2.0342    2.0359    +0.0017
+             +- 0.0052   +- 0.0051   +- 0.0073
+
+  The VQ delta is +0.0017 W against a 2 SE bound of 0.0146: NOT RESOLVED.
+  Quote it as an UPPER BOUND -- the VQ costs less than 14.6 mW -- and
+  not as zero. Three runs gave -0.0046, +0.0048 and +0.0017 W, all
+  inside 2 SE. The sign is noise, and three draws show that better
+  than any single one.
+
+  MISC is 0.8060 W, 40% of the board, and is almost all VCC3V3
+  (0.7450 W) -- USB, PHY, LEDs, board housekeeping. The SoC rails that
+  the accelerator actually moves are PL + PS + DDR = 1.2299 W.
+
+  energy per frame                             II ms         W        mJ
+------------------------------------------------------------------------------
+  power loop as run (run-2 topology)         22.9631    2.0359     46.75   MEASURED
+  deployed pipeline                          17.9024    2.0359     36.45   DERIVED
+  serial, no overlap                         29.4885    2.0359     60.04   DERIVED
+  SoC rails only, deployed                   17.9024    1.2299     22.02   DERIVED
+------------------------------------------------------------------------------
+
+  *** THE POWER ROWS ABOVE ARE PENDING RE-MEASUREMENT ***
+  They measure the run-2 topology, because edge_power_measure()
+  drove its own loop and that loop packed inside the cascade and
+  never entropy-coded. The A/B DELTA survives -- both phases ran
+  the same loop, only the VQ differed -- so the < 14.6 mW bound
+  stands. The ABSOLUTE W does not, and neither does any mJ below.
+  The loop was pointed at the deployed topology on 2026-09-06 and
+  now cross-checks its own period against the pipelined pass.
+  Re-run to replace every number in this section.
+
+  THE CAVEAT ON THE DERIVED ROWS, and it is not small.
+  edge_power_measure() drives its own loop, and that loop still packs
+  inside the cascade and never entropy-codes -- it is the run-2
+  topology, 22.9631 ms. So the mean power above was taken while the CPU
+  SPINS through the DMA waits that the deployed path now fills with
+  work. Same work per frame in a 39% shorter frame, so the energy
+  direction is right; the magnitude is not measured, because a busier
+  CPU during those waits will draw more than a spinning one.
+  Pointing the A/B at the deployed loop is the fix. It has not been
+  done, so 46.75 mJ is the number to quote and 36.45 mJ is an estimate.
+
+  regulator OUTPUT power: excludes conversion losses and the unmonitored 5 V USB rail. NOT 12 V input power.
+
+==============================================================================
+Regenerate: python results/dump.py   Source: results/board_measured.py
+==============================================================================

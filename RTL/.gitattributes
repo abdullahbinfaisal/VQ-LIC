@@ -1,0 +1,22 @@
+# Store text as LF; check out native endings.
+* text=auto
+
+# Shell scripts must stay LF or bash on Linux/WSL rejects them.
+*.sh  text eol=lf
+
+# Binary
+*.png binary
+*.jpg binary
+*.pdf binary
+*.xsa binary
+*.bit binary
+*.dcp binary
+
+# Vivado-generated block design and IP configuration: collapse in diffs,
+# keep out of GitHub's language statistics.
+Zynq.srcs/sources_1/bd/**   linguist-generated=true
+*.xci                       linguist-generated=true
+*.bd                        linguist-generated=true
+*.bda                       linguist-generated=true
+Zynq.xpr                    linguist-generated=true
+*.rpt                       linguist-generated=true
