@@ -1,0 +1,1748 @@
+`timescale 1ns/1ps
+
+module pw_pixel_major_core #(
+  parameter int DATA_WIDTH      = 8,
+  parameter int ACC_WIDTH       = 32,
+  parameter int CIN_MAX         = 240,
+  parameter int COUT_MAX        = 240,
+  parameter int N_LANES         = 8,
+  parameter int N_OC            = 5,
+  // USE_PW_VQ: compile in the PW-hosted vector-quantisation mode. 0 = the
+  // engine is exactly what it was before this feature existed (see the
+  // bit-identity note at the vq_mode_r declaration below).
+  parameter int USE_PW_VQ        = 0,
+
+  // ---- VQ geometry (ignored unless USE_PW_VQ != 0) -------------------------
+  // VQ_K       codewords per sub-codebook. Power of two. The argmin runs over
+  //            exactly VQ_K consecutive output channels.
+  // VQ_NORM_D  codeword-norm ROM depth = the largest M*K this build supports,
+  //            and therefore the largest c_out VQ mode accepts. Power of two.
+  // VQ_SCORE_W signed width of ||v_k||^2 - 2*acc. See the bound derivation at
+  //            the VQ branch below; it is a function of Dm, NOT of K.
+  //
+  // Deployed  M=4, K=64, Dm=16 : VQ_K=64,  VQ_NORM_D=256, VQ_SCORE_W=21
+  // Legacy    M=8, K=16, Dm=8  : VQ_K=16,  VQ_NORM_D=128, VQ_SCORE_W=20
+  //
+  // Nothing outside the G_VQ generate block reads these, so a conv-only build
+  // is unaffected by their value.
+  parameter int VQ_K             = 64,
+  parameter int VQ_NORM_D        = 256,
+  parameter int VQ_SCORE_W       = 21
+)(
+  input  logic                              clk,
+  input  logic                              rst_n,
+
+  input  logic                              start_in,
+  output logic                              done_out,
+
+  input  logic [31:0]                       tile_pixels,
+  input  logic [11:0]                       cin_run,
+  input  logic [11:0]                       cout_run,    // total output channels
+
+  input  logic [7:0]                        zp_in,
+  input  logic [7:0]                        zp_out,
+  input  logic                              relu_en,
+
+  // ---- VQ mode (USE_PW_VQ only; tie low otherwise) ----
+  // vq_mode      : 1 = nearest-codeword search, 0 = ordinary convolution
+  // vq_cin_load  : channels STREAMED per group (64 = the full latent vector).
+  //                cin_run keeps its ordinary meaning of MAC length and weight
+  //                stride, which in VQ mode is 16 = 2 sub-codebooks x DSUB.
+  input  logic                              vq_mode,
+  input  logic [11:0]                       vq_cin_load,
+  // Codeword-norm ROM write port. ||v_k||^2 for absolute OC vq_norm_addr.
+  // A dedicated ROM, NOT the param-BRAM bias path: see the note at the VQ
+  // branch below for why the bias path is unsafe for the last OC of a batch.
+  input  logic                              vq_norm_we,
+  input  logic [$clog2(VQ_NORM_D)-1:0]      vq_norm_addr,
+  input  logic signed [VQ_SCORE_W-1:0]      vq_norm_data,
+
+  // Configuration-error reporting. Both describe the same event; they differ
+  // in how long they last, and both are needed.
+  //
+  //   cfg_err      LEVEL. "the last start was refused." Holds until the next
+  //                start this engine ACCEPTS. Convenient to read at leisure.
+  //   cfg_err_stb  STROBE. One cycle per refused start.
+  //
+  // A latching flag must be built from the STROBE. Built from the level it
+  // cannot be cleared -- the level is still high, so it sets straight back --
+  // and built from the level's rising EDGE it misses a second refusal that
+  // follows a first with no accepted start in between. Both of those were
+  // observed; see the sticky-bit check in tb_pw_axi_vq.sv.
+  output logic                              cfg_err,
+  output logic                              cfg_err_stb,
+
+  // Weight BRAM read interface (all N_OC banks, 1-cycle latency)
+  output logic [$clog2((COUT_MAX/N_OC)*CIN_MAX)-1:0] w_rd_addr,
+  output logic                              w_rd_en,
+  input  logic signed [DATA_WIDTH-1:0]      w_rd_data  [0:N_OC-1],
+
+  // Param BRAM read interface (bias/mult/shift, 1-cycle latency)
+  output logic [$clog2(COUT_MAX)-1:0]       param_rd_addr,
+  output logic                              param_rd_en,
+  input  logic signed [31:0]                param_bias_data,
+  input  logic [31:0]                       param_mult_data,
+  input  logic [7:0]                        param_shift_data,
+
+  // Pixel input from input FIFO
+  input  logic                              valid_in,
+  input  logic [N_LANES*DATA_WIDTH-1:0]     pixel_in,
+  output logic                              consume_in,
+
+  // Pixel output to output FIFO
+  output logic [N_LANES*DATA_WIDTH-1:0]     pixel_out,
+  output logic                              valid_out,
+
+  // Backpressure from output FIFO
+  input  logic                              out_stall
+);
+
+  // ------------------------------------------------------------
+  // Constants
+  // ------------------------------------------------------------
+  localparam int LANE_SHIFT   = $clog2(N_LANES);
+  localparam int W_DEPTH      = (COUT_MAX / N_OC) * CIN_MAX;
+  localparam int W_AW         = (W_DEPTH <= 1) ? 1 : $clog2(W_DEPTH);
+  localparam int PB_AW        = (CIN_MAX <= 1) ? 1 : $clog2(CIN_MAX);
+  localparam int PARAM_AW     = (COUT_MAX <= 1) ? 1 : $clog2(COUT_MAX);
+  localparam int PB_WIDTH     = N_LANES * DATA_WIDTH;
+
+  // Largest c_out this build can actually execute. COUT_MAX is the param BRAM
+  // depth, but the weight BRAM holds only W_OC_BATCHES = COUT_MAX/N_OC batches
+  // and that division FLOORS: at COUT_MAX=240, N_OC=32 the real ceiling is 224,
+  // not 240. Programming cout_run in (225..240) used to alias silently; the
+  // S_IDLE guard below now refuses it.
+  localparam int COUT_HW_MAX  = (COUT_MAX / N_OC) * N_OC;
+
+  // ---- VQ derived geometry (elaboration-time; unused at USE_PW_VQ = 0) ----
+  localparam int VQ_KW   = (VQ_K      <= 1) ? 1 : $clog2(VQ_K);       // index bits
+  localparam int VQ_AW   = (VQ_NORM_D <= 1) ? 1 : $clog2(VQ_NORM_D);  // norm addr bits
+  localparam int VQ_MW   = (VQ_AW > VQ_KW) ? (VQ_AW - VQ_KW) : 1;     // sub-codebook bits
+  localparam int VQ_OCW  = (N_OC      <= 1) ? 1 : $clog2(N_OC);       // oc-in-batch bits
+  localparam int VQ_BW   = (VQ_AW > VQ_OCW) ? (VQ_AW - VQ_OCW) : 1;   // batch bits used
+  // Batches spanned by ONE sub-codebook. K <= N_OC packs whole sub-codebooks
+  // into a batch (legacy, block-diagonal); K > N_OC spreads one sub-codebook
+  // across several batches (deployed K=64 at N_OC=32 -> 2).
+  localparam int VQ_BPS  = (VQ_K > N_OC) ? (VQ_K / N_OC) : 1;
+  localparam int VQ_BPSW = (VQ_BPS <= 1) ? 1 : $clog2(VQ_BPS);
+  localparam int VQ_BPS_SH = (VQ_BPS <= 1) ? 0 : $clog2(VQ_BPS);  // shift, not width
+
+  // Registered at start - removes division from critical path
+  logic [31:0] tile_groups_r;
+  // ============================================================
+  // VQ MODE  (see Final_code_2/src/vq_pw.h for the full mapping)
+  //
+  // The PW MAC already computes SUM_ic (uint8 act - uint8 zp_in) * int8 w.
+  // With the codebook stored PRE-CENTRED as v = cq - 128 that is exactly the
+  // dot product the nearest-codeword search needs, so the MAC, the DSP
+  // packing, the accumulators, the shadow copy and the drain FSM are ALL
+  // untouched. Only two things differ in VQ mode:
+  //
+  //   1. cin_load = 64  -- the stream still delivers the whole latent vector
+  //      for the group (one contiguous DDR read), while cin_run = 16 remains
+  //      the per-batch MAC length.
+  //   2. the pb_ram READ window starts at w_addr_base instead of 0.
+  //      w_addr_base already resets to 0 at every group boundary and advances
+  //      by cin_run per OC batch, so in VQ mode it ALREADY equals
+  //      16 * oc_batch_idx -- the exact window base each batch needs. No new
+  //      counter, no multiplier, no extra state.
+  //
+  // BIT-IDENTITY WITH ORDINARY CONVOLUTION: USE_PW_VQ is an elaboration-time
+  // constant. At USE_PW_VQ = 0 both ternaries below fold to their else-arms,
+  // which are character-for-character the expressions that were in the RTL
+  // before this feature, and vq_mode_r/vq_cin_load_r lose all readers and are
+  // stripped. Conv mode cannot change; there is no path by which it could.
+  logic                vq_mode_r;
+  logic [11:0]         vq_cin_load_r;
+  // Highest sub-codebook index this RUN uses: cout_run/VQ_K - 1. Latched at
+  // start so a run with fewer sub-codebooks than the build supports still
+  // emits its word at the right moment.
+  logic [11:0]         vq_m_last_r;
+  // pb_ram READ window base in VQ mode. This USED to be w_addr_base, and at
+  // K <= N_OC the two coincide -- every batch opens a new input window. At
+  // K > N_OC they DIVERGE: the weight address must advance every batch (each
+  // batch holds different codewords) while the activation window must hold
+  // still for VQ_BPS batches (those codewords all belong to one sub-codebook,
+  // so they all read the same Dm input dimensions). One shared counter cannot
+  // do both, so VQ mode gets its own.
+  //
+  //   K=16, N_OC=32, VQ_BPS=1 : steps every batch  -> 0,16,32,...  as before
+  //   K=64, N_OC=32, VQ_BPS=2 : steps every 2nd    -> 0,0,16,16,32,32,48,48
+  logic [PB_AW-1:0]    vq_pb_base;
+
+  logic [11:0] cout_batches_r;
+  // PARTIAL-BATCH DRAIN (2026-08-07). Previously the drain always issued N_OC
+  // beats, so a layer whose cout is not a multiple of N_OC paid for padding
+  // channels that were computed and discarded. Block 0 (cout=16) at N_OC=32
+  // measured 42.02 cyc/group against 26.02 at N_OC=16 -- exactly the 16 extra
+  // drain cycles. Draining only the valid channels removes that penalty and
+  // decouples the choice of N_OC from the layer's cout.
+  logic [11:0] cout_run_r;
+  logic [11:0] ppu_drain_len;   // valid output channels in the batch being drained
+  // The acc->shadow copy must be bounded the same way. Bounding only the drain
+  // is not enough: the copy runs N_OC cycles and S_COMPUTE/S_WAIT_PPU both gate
+  // on !shadow_copying, so an unbounded copy just becomes the new limiter
+  // (measured: cyc/group stayed at 42.01 with the drain bounded but the copy not).
+  logic [11:0] shadow_copy_len;
+  // Copy now moves TWO OCs per cycle (even/odd shadow halves), so it runs for
+  // ceil(shadow_copy_len / 2) cycles. This is the term that was 46% of
+  // per-group time and fully exposed in S_WAIT_PPU.
+  wire  [11:0] copy_pairs = ($unsigned(shadow_copy_len) + 12'd1) >> 1;
+  logic [7:0]  zp_in_r;
+  logic [7:0]  zp_out_r;
+  logic        relu_en_r;
+  // Per-lane replicated zp_in copies - each drives only N_OC DSP pre-adders
+  // (not max_fanout attribute which Vivado may ignore on arrays; explicit replication is guaranteed)
+  (* dont_touch = "true" *) logic [7:0] zp_in_lane [0:N_LANES-1];
+  generate
+    for (genvar g = 0; g < N_LANES; g++) begin : G_ZP_REPLICATE
+      always_ff @(posedge clk or negedge rst_n)
+        if (!rst_n) zp_in_lane[g] <= '0;
+        else if (start_in) zp_in_lane[g] <= zp_in;
+    end
+  endgenerate
+
+  // ------------------------------------------------------------
+  // FSM types
+  // ------------------------------------------------------------
+  // Main FSM
+  typedef enum logic [2:0] {
+    S_IDLE       = 3'd0,
+    S_LOAD_FIRST = 3'd1,   // load very first pixel group into buffer A
+    S_COMPUTE    = 3'd2,   // MAC accumulation (Cin cycles per batch)
+    S_BATCH_DONE = 3'd3,   // batch complete - trigger PPU, setup next
+    S_WAIT_PPU   = 3'd4,   // wait for last PPU drain + group transition
+    S_DONE       = 3'd5
+  } state_t;
+  state_t st;
+
+  // PPU background sub-FSM
+  typedef enum logic [1:0] {
+    P_IDLE       = 2'd0,
+    P_PARAM_WAIT = 2'd1,   // 1-cycle wait for param BRAM read latency
+    P_DRAIN      = 2'd2    // feed shadow_acc to PPU, count outputs
+  } ppu_st_t;
+  ppu_st_t ppu_st;
+
+  // Load background sub-FSM
+  typedef enum logic [1:0] {
+    L_IDLE    = 2'd0,
+    L_LOADING = 2'd1,      // loading next group from input FIFO
+    L_READY   = 2'd2       // next group fully loaded
+  } load_st_t;
+  load_st_t load_st;
+
+  // ------------------------------------------------------------
+  // Double Pixel Buffer BRAMs (A and B)
+  //   Compute reads from active buffer (compute_buf)
+  //   Load writes to inactive buffer (!compute_buf)
+  // ------------------------------------------------------------
+  logic compute_buf;   // 0 = buffer A active, 1 = buffer B active
+
+  // Buffer A ports
+  logic [PB_AW-1:0]   pb_a_wr_addr, pb_a_rd_addr;
+  logic                pb_a_wr_en,   pb_a_rd_en;
+  logic [PB_WIDTH-1:0] pb_a_wr_data, pb_a_rd_data;
+
+  // Buffer B ports
+  logic [PB_AW-1:0]   pb_b_wr_addr, pb_b_rd_addr;
+  logic                pb_b_wr_en,   pb_b_rd_en;
+  logic [PB_WIDTH-1:0] pb_b_wr_data, pb_b_rd_data;
+
+  xpm_memory_sdpram #(
+    .ADDR_WIDTH_A        (PB_AW),
+    .ADDR_WIDTH_B        (PB_AW),
+    .AUTO_SLEEP_TIME     (0),
+    .BYTE_WRITE_WIDTH_A  (PB_WIDTH),
+    .CLOCKING_MODE       ("common_clock"),
+    .ECC_MODE            ("no_ecc"),
+    .MEMORY_INIT_FILE    ("none"),
+    .MEMORY_INIT_PARAM   ("0"),
+    .MEMORY_OPTIMIZATION ("true"),
+    .MEMORY_PRIMITIVE    ("auto"),
+    .MEMORY_SIZE         (CIN_MAX * PB_WIDTH),
+    .MESSAGE_CONTROL     (0),
+    .READ_DATA_WIDTH_B   (PB_WIDTH),
+    .READ_LATENCY_B      (1),
+    .READ_RESET_VALUE_B  ("0"),
+    .RST_MODE_A          ("SYNC"),
+    .RST_MODE_B          ("SYNC"),
+    .SIM_ASSERT_CHK      (0),
+    .USE_MEM_INIT        (0),
+    .WAKEUP_TIME         ("disable_sleep"),
+    .WRITE_DATA_WIDTH_A  (PB_WIDTH),
+    .WRITE_MODE_B        ("read_first")
+  ) u_pixel_buf_a (
+    .clka  (clk), .ena (1'b1), .wea (pb_a_wr_en),
+    .addra (pb_a_wr_addr), .dina (pb_a_wr_data),
+    .injectsbiterra(1'b0), .injectdbiterra(1'b0),
+    .clkb  (clk), .enb (pb_a_rd_en), .rstb (1'b0), .regceb (1'b1),
+    .addrb (pb_a_rd_addr), .doutb (pb_a_rd_data),
+    .sbiterrb(), .dbiterrb(), .sleep(1'b0)
+  );
+
+  xpm_memory_sdpram #(
+    .ADDR_WIDTH_A        (PB_AW),
+    .ADDR_WIDTH_B        (PB_AW),
+    .AUTO_SLEEP_TIME     (0),
+    .BYTE_WRITE_WIDTH_A  (PB_WIDTH),
+    .CLOCKING_MODE       ("common_clock"),
+    .ECC_MODE            ("no_ecc"),
+    .MEMORY_INIT_FILE    ("none"),
+    .MEMORY_INIT_PARAM   ("0"),
+    .MEMORY_OPTIMIZATION ("true"),
+    .MEMORY_PRIMITIVE    ("auto"),
+    .MEMORY_SIZE         (CIN_MAX * PB_WIDTH),
+    .MESSAGE_CONTROL     (0),
+    .READ_DATA_WIDTH_B   (PB_WIDTH),
+    .READ_LATENCY_B      (1),
+    .READ_RESET_VALUE_B  ("0"),
+    .RST_MODE_A          ("SYNC"),
+    .RST_MODE_B          ("SYNC"),
+    .SIM_ASSERT_CHK      (0),
+    .USE_MEM_INIT        (0),
+    .WAKEUP_TIME         ("disable_sleep"),
+    .WRITE_DATA_WIDTH_A  (PB_WIDTH),
+    .WRITE_MODE_B        ("read_first")
+  ) u_pixel_buf_b (
+    .clka  (clk), .ena (1'b1), .wea (pb_b_wr_en),
+    .addra (pb_b_wr_addr), .dina (pb_b_wr_data),
+    .injectsbiterra(1'b0), .injectdbiterra(1'b0),
+    .clkb  (clk), .enb (pb_b_rd_en), .rstb (1'b0), .regceb (1'b1),
+    .addrb (pb_b_rd_addr), .doutb (pb_b_rd_data),
+    .sbiterrb(), .dbiterrb(), .sleep(1'b0)
+  );
+
+  // Compute-side read data mux: select active buffer
+  wire [PB_WIDTH-1:0] pb_rd_data = compute_buf ? pb_b_rd_data : pb_a_rd_data;
+
+  // ------------------------------------------------------------
+  // Accumulators: N_OC � N_LANES
+  // shadow_acc replaced by BRAM to eliminate 10,240 FFs
+  // ------------------------------------------------------------
+  // DECLARATION INITIALISER (2026-09-03) -- same rationale as ppu.sv's, see the
+  // long note there. acc has no reset (deliberately, to stay out of the async
+  // reset fanout cone), so SIMULATION started it X and that X reached every
+  // output, which is why this core has never had a data check. Xilinx honours
+  // SV declaration initialisers as the flop INIT attribute, i.e. the power-up
+  // state the silicon already had. Synthesisable, changes NOTHING on hardware,
+  // and lets tb_pw_vq.sv actually check data.
+  logic signed [ACC_WIDTH-1:0] acc [0:N_OC-1][0:N_LANES-1] = '{default:'0};
+
+  // Shadow BRAM: depth=N_OC, width=N_LANES*ACC_WIDTH
+  //
+  // DOUBLE BUFFERING WAS TRIED AND REVERTED (2026-07-30). It fits for free --
+  // width sets the BRAM primitive count, and depth 16->32 of 512 costs nothing
+  // -- but it does not help, because the copy and the drain ALREADY overlap by
+  // chasing: P_PARAM_WAIT costs 1 cycle, then P_DRAIN reads index 0 (written
+  // first) advancing 1/cycle behind a copy also advancing 1/cycle, so the drain
+  // never catches up and there was no stall to remove. Measured in sim
+  // (2880 groups): baseline 77.0 cyc/grp at cin=16/2 batches, double-buffered
+  // 76.0 -- and 88.0 if S_BATCH_DONE additionally waits for the copy, which
+  // BREAKS the chase. The real overhead is elsewhere; see S_WAIT_PPU.
+  // ------------------------------------------------------------------
+  // SPLIT SHADOW: EVEN / ODD OUTPUT-CHANNEL BANKS (2026-08-09)
+  //
+  // WHY. Measured phase residency showed S_WAIT_PPU is 46% of per-group time on
+  // blocks 2/3 and is PURE waiting on this copy, which overlaps compute 0.00
+  // cycles for single-batch groups. The copy ran one OC per cycle, so it cost
+  // Q_last cycles per group and every one of them was exposed.
+  //
+  // Splitting the store into even-OC and odd-OC halves lets the copy write TWO
+  // OCs per cycle, halving it to ceil(Q_last/2). The DRAIN still consumes one OC
+  // per cycle -- it alternates halves -- so the output rate is unchanged.
+  //
+  // Deliberately NOT the alternative (double-buffering acc): that would put a
+  // mux on the accumulator feedback, which is the first_ic -> DSP OPMODE
+  // critical path, on a design closing at WNS +0.119 ns. This touches only the
+  // copy-write and drain-read paths and cannot affect that path.
+  //
+  // Both halves share ONE address bus: for issue j the drain wants OC j, which
+  // lives at index j>>1 in half (j&1). Since j and j+1 share the same j>>1 when
+  // j is even, addressing both halves identically and selecting the output by
+  // parity costs nothing and keeps the existing pre-read structure intact.
+  // ------------------------------------------------------------------
+  localparam int SA_IDX_W  = (N_OC > 1) ? $clog2(N_OC) : 1;
+  // per-half index: N_OC/2 entries per bank
+  localparam int SA_HIDX_W = (N_OC > 2) ? $clog2(N_OC/2) : 1;
+  localparam int SA_DEPTH  = 2 * ((N_OC > 2) ? (N_OC/2) : 1);   // per half
+  localparam int SA_AW     = SA_HIDX_W + 1;                     // {bank, halfidx}
+  localparam int SA_DW     = N_LANES * ACC_WIDTH;
+
+  // shadow_copy_idx now counts HALF-PAIRS: cycle i copies OC 2i and OC 2i+1
+  logic [SA_HIDX_W-1:0] shadow_copy_idx;
+  logic              sha_wr_bank, sha_rd_bank;
+  logic              sha_copy_bank_r;   // bank THIS copy targets, latched at trig
+  logic              shadow_copying;
+  logic              shadow_copy_trig;  // 1-cycle pulse from main FSM -> shadow block
+
+  // ==================================================================
+  // SHADOW WRITE PORT -- rewritten 2026-09-03. Two defects lived here,
+  // both found by tb_pw_axis_conv.sv, the first data check this datapath
+  // has ever had.
+  //
+  // DEFECT W1 (data/address skew). sha_wr_addr was REGISTERED from
+  //   shadow_copy_idx while sha_wr_data_e/o were COMBINATIONAL from the
+  //   same counter, so by the cycle the address reached the BRAM the
+  //   counter had already advanced: the copy stored accumulator pair i+1
+  //   at half-index i, and pair 0 wrapped onto the LAST index. Observed
+  //   directly -- acc[0][0] = 6 was written at half-index 15.
+  //
+  // DEFECT W2 (bank). The copy addressed sha_wr_bank, but S_BATCH_DONE
+  //   flips that register in the very cycle it hands the just-filled bank
+  //   to the drain, and the flip always landed before the copy's first
+  //   write. The copy therefore wrote the bank the drain was NOT reading:
+  //   batch 0 drained an untouched bank (all zeros, every output byte
+  //   equal to zp_out) and every later batch drained its predecessor.
+  //
+  // Fix for both: drive address, data and BOTH enables combinationally
+  // from ONE index in ONE cycle, and target the bank latched at the
+  // trigger -- the PRE-flip sha_wr_bank, which is exactly the value
+  // sha_rd_bank takes in the same cycle. Beginning on the trigger cycle
+  // also places each pair in the BRAM one cycle before the drain can ask
+  // for it, which is what makes the copy/drain chase safe WITHOUT adding
+  // a cycle to the batch schedule.
+  // ==================================================================
+  wire                 copy_now      = shadow_copy_trig | shadow_copying;
+  wire [SA_HIDX_W-1:0] copy_idx_now  = shadow_copy_trig ? '0 : shadow_copy_idx;
+  wire                 copy_bank_now = shadow_copy_trig ? sha_wr_bank : sha_copy_bank_r;
+
+  wire [SA_AW-1:0]  sha_wr_addr = {copy_bank_now, copy_idx_now};
+  wire [SA_DW-1:0]  sha_wr_data_e, sha_wr_data_o;
+  wire              sha_wr_en_e = copy_now;
+  // The odd write is suppressed on a ragged final pair, i.e. when Q_last is
+  // odd and OC 2i+1 does not exist.
+  wire              sha_wr_en_o = copy_now &&
+                        (({copy_idx_now, 1'b1}) < $unsigned(shadow_copy_len));
+
+  // Read port. Address and enable are COMBINATIONAL and assigned further
+  // down, where ppu_issue_idx is in scope; see DEFECT R1 there.
+  wire [SA_AW-1:0]  sha_rd_addr;
+  wire              sha_rd_en;
+  logic [SA_DW-1:0]  sha_rd_data_e, sha_rd_data_o;
+  logic              sha_rd_parity;      // registered: which half issue j wants
+  logic [SA_DW-1:0]  sha_rd_data;        // muxed, drives ppu_acc_in as before
+
+  assign sha_rd_data = sha_rd_parity ? sha_rd_data_o : sha_rd_data_e;
+
+  // ==================================================================
+  // DEFECT W3 (the copy raced the next batch's accumulator) -- fixed
+  // 2026-09-03.
+  //
+  // The copy walks acc two output channels per cycle, so it needs
+  // ceil(Q/2) cycles -- 16 for Q = 32. But S_BATCH_DONE launches the NEXT
+  // batch's compute immediately, and that batch's first accumulate lands
+  // on acc about 7 cycles later with first_ic set, overwriting EVERY
+  // channel at once. Everything the copy had not yet read was therefore
+  // taken from the successor's partial sums, not from the batch being
+  // drained. Measured with cout=48: output channels 0..13 (pairs 0..6,
+  // copied before the clobber) were exact and 14..31 were the next
+  // batch's in-flight state. Single-batch shapes were immune only
+  // because S_WAIT_PPU holds the group boundary on !shadow_copying, which
+  // is why cout <= N_OC passed and every real multi-batch layer did not.
+  //
+  // The snapshot makes the copy atomic: acc is captured whole in ONE
+  // cycle at the trigger, and the copy dribbles THAT into the BRAM. The
+  // trigger cycle itself still writes pair 0 straight from acc, because
+  // sha_snap only becomes valid the cycle after -- acc is still the
+  // drained batch's final value at that point, so the two agree.
+  //
+  // Costs N_OC*N_LANES*ACC_WIDTH flip-flops and no cycles.
+  // ==================================================================
+  logic signed [ACC_WIDTH-1:0] sha_snap [0:N_OC-1][0:N_LANES-1] = '{default:'0};
+  always_ff @(posedge clk) begin
+    if (shadow_copy_trig)
+      for (int oci = 0; oci < N_OC; oci++)
+        for (int li = 0; li < N_LANES; li++)
+          sha_snap[oci][li] <= acc[oci][li];
+  end
+
+  genvar _g;
+  generate
+    for (_g = 0; _g < N_LANES; _g++) begin : G_SHA_PACK
+      assign sha_wr_data_e[_g*ACC_WIDTH +: ACC_WIDTH] =
+               shadow_copy_trig ? acc[{copy_idx_now, 1'b0}][_g]
+                                : sha_snap[{copy_idx_now, 1'b0}][_g];   // OC 2i
+      assign sha_wr_data_o[_g*ACC_WIDTH +: ACC_WIDTH] =
+               shadow_copy_trig ? acc[{copy_idx_now, 1'b1}][_g]
+                                : sha_snap[{copy_idx_now, 1'b1}][_g];   // OC 2i+1
+    end
+  endgenerate
+
+  xpm_memory_sdpram #(
+    .ADDR_WIDTH_A        (SA_AW),
+    .ADDR_WIDTH_B        (SA_AW),
+    .AUTO_SLEEP_TIME     (0),
+    .BYTE_WRITE_WIDTH_A  (SA_DW),
+    .CLOCKING_MODE       ("common_clock"),
+    .ECC_MODE            ("no_ecc"),
+    .MEMORY_INIT_FILE    ("none"),
+    .MEMORY_INIT_PARAM   ("0"),
+    .MEMORY_OPTIMIZATION ("true"),
+    .MEMORY_PRIMITIVE    ("block"),
+    .MEMORY_SIZE         (SA_DEPTH * SA_DW),
+    .MESSAGE_CONTROL     (0),
+    .READ_DATA_WIDTH_B   (SA_DW),
+    .READ_LATENCY_B      (1),
+    .READ_RESET_VALUE_B  ("0"),
+    .RST_MODE_A          ("SYNC"),
+    .RST_MODE_B          ("SYNC"),
+    .SIM_ASSERT_CHK      (0),
+    .USE_MEM_INIT        (0),
+    .WAKEUP_TIME         ("disable_sleep"),
+    .WRITE_DATA_WIDTH_A  (SA_DW),
+    .WRITE_MODE_B        ("no_change")
+  ) u_shadow_bram_e (
+    .clka  (clk), .ena (1'b1), .wea (sha_wr_en_e),
+    .addra (sha_wr_addr), .dina (sha_wr_data_e),
+    .injectsbiterra(1'b0), .injectdbiterra(1'b0),
+    .clkb  (clk), .enb (sha_rd_en), .rstb (1'b0), .regceb (1'b1),
+    .addrb (sha_rd_addr), .doutb (sha_rd_data_e),
+    .sbiterrb(), .dbiterrb(), .sleep(1'b0)
+  );
+
+  // ODD half — identical geometry, same address bus, own write enable so a
+  // ragged final pair (odd Q_last) can write the even OC without the odd one.
+  xpm_memory_sdpram #(
+    .ADDR_WIDTH_A        (SA_AW),
+    .ADDR_WIDTH_B        (SA_AW),
+    .AUTO_SLEEP_TIME     (0),
+    .BYTE_WRITE_WIDTH_A  (SA_DW),
+    .CLOCKING_MODE       ("common_clock"),
+    .ECC_MODE            ("no_ecc"),
+    .MEMORY_INIT_FILE    ("none"),
+    .MEMORY_INIT_PARAM   ("0"),
+    .MEMORY_OPTIMIZATION ("true"),
+    .MEMORY_PRIMITIVE    ("block"),
+    .MEMORY_SIZE         (SA_DEPTH * SA_DW),
+    .MESSAGE_CONTROL     (0),
+    .READ_DATA_WIDTH_B   (SA_DW),
+    .READ_LATENCY_B      (1),
+    .READ_RESET_VALUE_B  ("0"),
+    .RST_MODE_A          ("SYNC"),
+    .RST_MODE_B          ("SYNC"),
+    .SIM_ASSERT_CHK      (0),
+    .USE_MEM_INIT        (0),
+    .WAKEUP_TIME         ("disable_sleep"),
+    .WRITE_DATA_WIDTH_A  (SA_DW),
+    .WRITE_MODE_B        ("no_change")
+  ) u_shadow_bram_o (
+    .clka  (clk), .ena (1'b1), .wea (sha_wr_en_o),
+    .addra (sha_wr_addr), .dina (sha_wr_data_o),
+    .injectsbiterra(1'b0), .injectdbiterra(1'b0),
+    .clkb  (clk), .enb (sha_rd_en), .rstb (1'b0), .regceb (1'b1),
+    .addrb (sha_rd_addr), .doutb (sha_rd_data_o),
+    .sbiterrb(), .dbiterrb(), .sleep(1'b0)
+  );
+
+  // ------------------------------------------------------------
+  // ------------------------------------------------------------
+  // MAC pipeline (4-stage: BRAM read ? pixel reg ? multiply reg ? accumulate)
+  //   Stage 1: BRAM read issue
+  //   Stage 2: Register BRAM output (pb_pixel_r and w_rd_data_r)
+  //   Stage 3: subtract + multiply ? prod_reg
+  //   Stage 4: accumulate from prod_reg
+  // ------------------------------------------------------------
+  // Channels STREAMED per group. Ordinary convolution loads exactly the
+  // channels it MACs; VQ mode loads all 64 and MACs a 16-wide window of them.
+  wire [11:0] cin_load = ((USE_PW_VQ != 0) && vq_mode_r) ? vq_cin_load_r : cin_run;
+
+  logic signed [DATA_WIDTH-1:0] w_rd_data_r   [0:N_OC-1] = '{default:'0}; // Fixes 1-cycle weight alignment bug
+  logic signed [DATA_WIDTH-1:0] w_rd_data_rr  [0:N_OC-1] = '{default:'0}; // stage-2.5 registered weights for DSP path
+  logic signed [24:0]           a_packed_r    [0:(N_LANES/2)-1] = '{default:'0}; // stage-2.5 registered packed activations
+  logic signed [32:0] p_packed_reg [0:N_OC-1][0:(N_LANES/2)-1]; // Dual-MAC packed product register
+  logic                         mul_valid;  // p_packed_reg contains valid data
+  logic [DATA_WIDTH-1:0]        pb_pixel_r [0:N_LANES-1] = '{default:'0};  // registered BRAM output (raw)
+  // ==================================================================
+  // DEFECT M1 (pipeline one stage short of the BRAM latency) -- fixed
+  // 2026-09-03.
+  //
+  // rd_issued is high during the cycle a pixel-buffer / weight read is
+  // ISSUED; with READ_LATENCY_B = 1 that read's data only appears the
+  // NEXT cycle. The stage-2 capture was gated on rd_issued itself, so it
+  // ran one cycle early: the first capture of every batch took whatever
+  // the buses held BEFORE the first read completed, and the capture
+  // window closed one cycle before the LAST channel's data arrived. Net
+  // effect per batch: one stale product accumulated (with first_ic set,
+  // so it was not even masked) and channel cin-1 never multiplied at all.
+  // Measured: with cin=16 the accumulator reached -5 where the reference
+  // was 1, the difference being exactly a[15]*w[15] = 6, and the leading
+  // product came from the previous batch's operands.
+  //
+  // rd_issued_q is that missing stage. The capture chain now tracks the
+  // data, not the address. This adds ONE cycle of MAC pipeline latency
+  // per batch, which lengthens S_COMPUTE's drain by one cycle.
+  // ==================================================================
+  logic                         rd_issued_q = 1'b0;   // read's DATA is on the bus
+  logic                         rd_issued_d1;  // delayed rd_issued_q (pb_pixel_r valid)
+  logic                         rd_issued_d2;  // delayed rd_issued_d1 (a_packed_r valid)
+
+  // Unpack pixel buffer read data into per-lane values (combinational, used for registration)
+  logic [DATA_WIDTH-1:0] pb_pixel [0:N_LANES-1];
+  generate
+    for (genvar g = 0; g < N_LANES; g++) begin : G_PB_UNPACK
+      assign pb_pixel[g] = pb_rd_data[g*DATA_WIDTH +: DATA_WIDTH];
+    end
+  endgenerate
+
+  // Dual-MAC Combinational Packing
+  logic signed [9:0]  act1_adj [0:(N_LANES/2)-1];
+  logic signed [24:0] a_packed [0:(N_LANES/2)-1];
+  logic signed [32:0] p_packed_comb [0:N_OC-1][0:(N_LANES/2)-1];
+  logic signed [8:0]  act_diff [0:N_LANES-1];
+
+  always_comb begin
+    for (int i = 0; i < N_LANES; i++) begin
+      act_diff[i] = $signed({1'b0, pb_pixel_r[i]}) - $signed({1'b0, zp_in_lane[i]});
+    end
+    for (int p = 0; p < N_LANES/2; p++) begin
+      act1_adj[p] = $signed(act_diff[p*2 + 1]) - $signed({1'b0, act_diff[p*2][8]});
+      a_packed[p] = $signed({act1_adj[p][8:0], {7{act_diff[p*2][8]}}, act_diff[p*2]});
+    end
+    for (int oc = 0; oc < N_OC; oc++) begin
+      for (int p = 0; p < N_LANES/2; p++) begin
+        // Use stage-2.5 registered operands so the multiply sees clean flip-flop inputs
+        // and Vivado maps it to a DSP48 P-register rather than fabric CARRY4 chains.
+        p_packed_comb[oc][p] = a_packed_r[p] * w_rd_data_rr[oc];
+      end
+    end
+  end
+
+  // Generate block to map each element to a dedicated DSP multiplier/register
+  generate
+    for (genvar oc = 0; oc < N_OC; oc++) begin : G_DSP_OC
+      for (genvar p = 0; p < N_LANES/2; p++) begin : G_DSP_P
+        // DECLARATION INITIALISER (2026-09-03), same rationale as ppu.sv's:
+        // no reset keeps this out of the async-reset cone, but simulation then
+        // starts it X and that X reaches acc on the very first accumulate.
+        // Xilinx honours SV initialisers as the flop INIT attribute -- the
+        // power-up state silicon already had -- so this is synthesisable and
+        // changes nothing on hardware.
+        (* use_dsp = "yes" *) logic signed [32:0] p_reg = '0;
+        always_ff @(posedge clk) begin
+          if (rd_issued_d2) begin
+            p_reg <= p_packed_comb[oc][p];
+          end
+        end
+        assign p_packed_reg[oc][p] = p_reg;
+      end
+    end
+  endgenerate
+
+  // ------------------------------------------------------------
+  // N_LANES PPUs (reused across OCs sequentially)
+  // ------------------------------------------------------------
+  logic                              ppu_valid_in;
+  logic signed [ACC_WIDTH-1:0]       ppu_acc_in    [0:N_LANES-1] = '{default:'0};
+  logic [DATA_WIDTH-1:0]             ppu_pixel_out [0:N_LANES-1];
+  logic [N_LANES-1:0]                ppu_valid_out_vec;
+
+  // PPU params (latched from param BRAM)
+  logic signed [31:0] ppu_bias_q;
+  logic [23:0]        ppu_mult_q;  // 24-bit: INT8 mult always fits, saves DSPs
+  logic [7:0]         ppu_shift_q;
+
+  generate
+    for (genvar g = 0; g < N_LANES; g++) begin : G_PPU
+      ppu #(.DATA_WIDTH(DATA_WIDTH), .ACC_WIDTH(ACC_WIDTH)) u_ppu (
+        .clk(clk), .rst_n(rst_n),
+        .relu_en(relu_en_r),
+        .mult_conv(ppu_mult_q), .shift_conv(ppu_shift_q), .bias_in(ppu_bias_q),
+        .zp_out(zp_out_r),
+        .valid_in(ppu_valid_in),
+        // EXPLICIT SIGN-EXTENSION (2026-09-03). ppu.sv declares conv_acc_in as
+        // 32 bits; ppu_acc_in is ACC_WIDTH (24) wide. The implicit connection
+        // left conv_acc_in[31:24] FLOATING, which simulates as X and poisoned
+        // acc_biased_s0 and therefore every PPU output -- the reason this core
+        // could never be data-checked. Synthesis ties the unconnected bits low,
+        // so on hardware this changes nothing; it makes simulation match.
+        .conv_acc_in(32'(ppu_acc_in[g])),
+        .pixel_out(ppu_pixel_out[g]), .valid_out(ppu_valid_out_vec[g])
+      );
+    end
+  endgenerate
+
+  wire ppu_valid_out = ppu_valid_out_vec[0];
+
+
+  // ============================================================
+  // VQ BRANCH  (USE_PW_VQ only)
+  //
+  // Snoops the PPU issue bus READ-ONLY. Nothing here can back-pressure or
+  // otherwise perturb the MAC, the accumulators or the drain FSM. In VQ mode
+  // the PPU still runs and its results are simply discarded by the output mux;
+  // in conv mode this whole block loses its readers and is stripped.
+  //
+  //   score_k = ||v_k||^2 - 2*acc_k        VQ_SCORE_W bits signed
+  //
+  // SCORE DYNAMIC RANGE -- the bound is a function of Dm, not of K.
+  //   Both u = zq - 128 and v = cq - 128 lie in [-128, +127]. Per dimension
+  //       score contribution = v^2 - 2*u*v
+  //   is maximised at u = +127, v = -128:  16384 + 2*127*128 = 48896
+  //   and minimised at v = u = -128:       16384 - 2*16384   = -16384.
+  //   Over Dm dimensions, therefore
+  //       score in [ -16384*Dm , +48896*Dm ]
+  //   and a signed N-bit register needs 2^(N-1) > 48896*Dm.
+  //
+  //       Dm =  8 (legacy M=8,K=16) : max  391168 -> 2^19 = 524288  -> N = 20
+  //       Dm = 16 (deployed M=4,K=64): max  782336 -> 2^20 = 1048576 -> N = 21
+  //
+  //   Dm = 16 OVERFLOWS the old 20-bit width, which is why VQ_SCORE_W is now a
+  //   parameter. The a_vq_score_fits assertion below checks the bound on every
+  //   single compare in simulation, so a wrong VQ_SCORE_W is loud, not silent.
+  //
+  //   ||v_k||^2 itself is 0 .. 16384*Dm = 262144 at Dm=16, which still fits the
+  //   20-bit AXI norm field; only the score needed widening. The 24-bit
+  //   accumulator holds |acc| <= 16384*Dm = 262144 with 5 bits to spare.
+  //
+  // WHY A DEDICATED NORM ROM AND NOT THE PARAM-BRAM BIAS PATH
+  //   The obvious reuse is to carry ||v_k||^2 on ppu_bias_q, which is already
+  //   read per OC at exactly the right cycle. tb_pw_bias_align.sv shows that
+  //   is NOT safe: the drain's bias latch is gated by
+  //   (ppu_issue_idx + 1) < ppu_drain_len, so the LAST OC of every batch is
+  //   presented with the SECOND-TO-LAST OC's bias. Convolution has never
+  //   noticed because this project programs bias == 0 for every channel
+  //   (surr_fill_dummy_params), but VQ would silently mis-score the last
+  //   codeword of every sub-codebook. Rather than modify the validated drain
+  //   FSM, the VQ branch carries its own norm ROM, VQ_NORM_D x VQ_SCORE_W bits
+  //   of distributed RAM; the drain FSM is untouched.
+  //
+  // CODEWORD / SUB-CODEBOOK INDEXING -- one expression covers both geometries.
+  //   Let abs = the ABSOLUTE output channel of the value being scored,
+  //       abs = batch * N_OC + oc.
+  //   Then, for any power-of-two K,
+  //       k = abs mod K = abs[VQ_KW-1:0]        the codeword within its sub-codebook
+  //       m = abs div K = abs[VQ_AW-1:VQ_KW]    which sub-codebook
+  //   The argmin therefore resets exactly every K issues and commits on the
+  //   last of them, at ANY K -- no separate "half" bit, no K=16 special case.
+  //
+  //   K = 16, N_OC = 32 : k = abs[3:0] = oc[3:0], m = {batch[1:0], oc[4]}
+  //                       -- character-for-character the old vq_k / vq_m.
+  //   K = 64, N_OC = 32 : k = abs[5:0] = {batch[0], oc[4:0]}, m = batch[2:1]
+  //                       -- one sub-codebook now spans TWO batches, and the
+  //                       running best survives the batch boundary because
+  //                       nothing but vq_first clears it.
+  //
+  // OC/BATCH SHADOWS
+  //   ppu_valid_in and ppu_acc_in are REGISTERED at issue, and ppu_issue_idx
+  //   increments on the same edge, so at the valid cycle the accumulator
+  //   belongs to OC (ppu_issue_idx - 1). A free-running one-cycle shadow gives
+  //   that index with no subtractor and no FSM change. ppu_oc_batch is
+  //   shadowed for the same reason: the last issue releases the drain to
+  //   P_IDLE, so S_BATCH_DONE can overwrite ppu_oc_batch on the very cycle the
+  //   last OC is presented.
+  //
+  // TIES: strict less-than keeps the LOWEST codeword index, matching
+  // vqpw_search_sub() and the retired vq_engine.sv comparator.
+  // ============================================================
+  localparam int VQ_BEATS   = N_LANES / 2;   // two 32-bit positions per beat
+  // Bits of index actually carried per position: M * VQ_KW, where the build's
+  // maximum M is VQ_NORM_D/VQ_K. K=16,M=8 -> 32 (full word); K=64,M=4 -> 24,
+  // and the top 8 bits of the 32-bit transport word are held at zero.
+  localparam int VQ_WORD_W  = VQ_KW * (VQ_NORM_D / VQ_K);
+
+  // PPU drain-issue index and batch. Declared HERE, above the VQ generate
+  // block, because that block snoops both. They used to be declared with the
+  // rest of the PPU state further down; Vivado 2025.1's xvlog tolerates the
+  // forward reference and 2020.2's synth_design does too, but 2020.2's xvlog
+  // rejects it outright (VRFC 10-3380), so the benches would not compile on
+  // the tool that produces this project's numbers.
+  logic [$clog2(N_OC>1?N_OC+1:2)-1:0]  ppu_issue_idx;
+  logic [11:0]                         ppu_oc_batch;  // OC batch being drained
+
+  logic [N_LANES*DATA_WIDTH-1:0] vq_pixel_out;
+  logic                          vq_valid_out;
+  wire  [N_LANES*DATA_WIDTH-1:0] ppu_pixel_bus;
+
+  generate
+    for (genvar g = 0; g < N_LANES; g++) begin : G_PX_PACK
+      assign ppu_pixel_bus[g*DATA_WIDTH +: DATA_WIDTH] = ppu_pixel_out[g];
+    end
+  endgenerate
+
+  generate
+  if (USE_PW_VQ != 0) begin : G_VQ
+    logic [$clog2(N_OC>1?N_OC+1:2)-1:0] vq_oc_r;
+    logic [11:0]                        vq_batch_r;
+    always_ff @(posedge clk) begin
+      vq_oc_r    <= ppu_issue_idx;
+      vq_batch_r <= ppu_oc_batch;
+    end
+
+    (* ram_style = "distributed" *) logic signed [VQ_SCORE_W-1:0] vq_norm [0:VQ_NORM_D-1];
+    always_ff @(posedge clk) if (vq_norm_we) vq_norm[vq_norm_addr] <= vq_norm_data;
+
+    // Absolute output channel = batch*N_OC + oc. N_OC is a power of two in
+    // every build this IP is used in, so the multiply is a concatenation.
+    wire [VQ_AW-1:0] vq_abs   = {vq_batch_r[VQ_BW-1:0], vq_oc_r[VQ_OCW-1:0]};
+    wire signed [VQ_SCORE_W-1:0] vq_norm_q = vq_norm[vq_abs];
+
+    wire [VQ_KW-1:0] vq_k     = vq_abs[VQ_KW-1:0];
+    wire [VQ_MW-1:0] vq_m     = vq_abs[VQ_AW-1:VQ_KW];
+    wire             vq_first = (vq_k == {VQ_KW{1'b0}});
+    wire             vq_lastk = (vq_k == {VQ_KW{1'b1}});
+    wire             vq_go    = vq_mode_r && ppu_valid_in;
+
+    logic signed [VQ_SCORE_W-1:0] vq_best  [0:N_LANES-1];
+    logic [VQ_KW-1:0]             vq_bestk [0:N_LANES-1];
+    logic [31:0]                  vq_word  [0:N_LANES-1];
+    wire signed [VQ_SCORE_W-1:0]  vq_score [0:N_LANES-1];
+    wire [N_LANES-1:0]            vq_take;
+    wire [VQ_KW-1:0]              vq_curk  [0:N_LANES-1];
+
+    for (genvar g = 0; g < N_LANES; g++) begin : G_VQ_LANE
+      wire signed [31:0] acc32 = 32'(ppu_acc_in[g]);
+      wire signed [31:0] sc32  = 32'(vq_norm_q) - (acc32 <<< 1);
+      assign vq_score[g] = sc32[VQ_SCORE_W-1:0];
+      assign vq_take[g]  = vq_first || (vq_score[g] < vq_best[g]);
+      assign vq_curk[g]  = vq_take[g] ? vq_k : vq_bestk[g];
+`ifndef SYNTHESIS
+      // The VQ_SCORE_W truncation must be exact -- that is the derivation
+      // above holding on real data, checked on every single compare. This is
+      // what catches a VQ_SCORE_W that is too narrow for the configured Dm.
+      always_ff @(posedge clk)
+        if (rst_n && vq_go)
+          a_vq_score_fits: assert (sc32 === 32'(vq_score[g]))
+            else $error("VQ score %0d does not fit %0d bits", sc32, VQ_SCORE_W);
+`endif
+    end
+
+    logic       vq_pending, vq_emit_busy;
+    logic [$clog2(VQ_BEATS)-1:0] vq_beat;
+
+    always_ff @(posedge clk) begin
+      if (!rst_n) begin
+        vq_pending <= 1'b0; vq_emit_busy <= 1'b0; vq_beat <= '0;
+        for (int i = 0; i < N_LANES; i++) begin
+          vq_best[i] <= '0; vq_bestk[i] <= '0; vq_word[i] <= 32'd0;
+        end
+      end else begin
+        if (vq_go) begin
+          for (int i = 0; i < N_LANES; i++) begin
+            if (vq_take[i]) vq_best[i] <= vq_score[i];
+            vq_bestk[i] <= vq_curk[i];
+            // Index field m occupies [VQ_KW*m +: VQ_KW]. At K=16 that is the
+            // old nibble packing exactly; at K=64 it is four 6-bit fields.
+            if (vq_lastk)
+              vq_word[i][VQ_KW*$unsigned(vq_m) +: VQ_KW] <= vq_curk[i];
+          end
+          // Last codeword of the LAST sub-codebook: every lane's word is
+          // complete on this edge. vq_m_last_r = cout_run/K - 1, latched at
+          // start, so this tracks the run's actual M rather than the build's.
+          if (vq_lastk && (vq_m == vq_m_last_r[VQ_MW-1:0]))
+            vq_pending <= 1'b1;
+        end
+
+        if (vq_pending && !vq_emit_busy) begin
+          vq_emit_busy <= 1'b1;
+          vq_beat      <= '0;
+          vq_pending   <= 1'b0;
+        end else if (vq_emit_busy && !out_stall) begin
+          if ($unsigned(vq_beat) + 1 == VQ_BEATS) vq_emit_busy <= 1'b0;
+          vq_beat <= vq_beat + 1'b1;
+        end
+      end
+    end
+
+    // Position 2i occupies the LOW 32 bits so the S2MM writes it to the lower
+    // address: little-endian, matching vqpw_encode_frame()'s idx_out[pos*4].
+    //
+    // TRANSPORT WORD. Always 32 bits per position, so the S2MM length, the
+    // cache ranges and the 4-beats-per-group output count are identical at
+    // every K. Only VQ_WORD_W of those bits carry index:
+    //     K=16, M=8 : 32 bits, fields at 4m      -- the word is full
+    //     K=64, M=4 : 24 bits, fields at 6m      -- bits [31:24] read as ZERO
+    // The mask makes that guarantee structural rather than a consequence of
+    // reset plus never-written, and folds to nothing when VQ_WORD_W == 32.
+    localparam logic [31:0] VQ_WORD_MASK =
+        (VQ_WORD_W >= 32) ? 32'hFFFF_FFFF : ((32'd1 << VQ_WORD_W) - 32'd1);
+    assign vq_pixel_out = {vq_word[{vq_beat, 1'b1}] & VQ_WORD_MASK,
+                           vq_word[{vq_beat, 1'b0}] & VQ_WORD_MASK};
+    assign vq_valid_out = vq_emit_busy && !out_stall;
+  end else begin : G_NO_VQ
+    assign vq_pixel_out = '0;
+    assign vq_valid_out = 1'b0;
+  end
+  endgenerate
+
+  // ---- output ownership mux ----
+  // Exactly one of the two sources drives the output FIFO, selected by the
+  // per-run latched mode. In conv builds the ternaries fold to ppu_*.
+  assign pixel_out = ((USE_PW_VQ != 0) && vq_mode_r) ? vq_pixel_out : ppu_pixel_bus;
+  assign valid_out = ((USE_PW_VQ != 0) && vq_mode_r) ? vq_valid_out : ppu_valid_out;
+
+  // ------------------------------------------------------------
+  // Counters
+  // ------------------------------------------------------------
+  // Main FSM
+  logic [31:0]                        grp_idx;
+  logic [$clog2(CIN_MAX)-1:0]        ic_idx;
+  logic [11:0]                        oc_batch_idx;
+  logic [W_AW-1:0]                    w_addr_base;
+
+  // ------------------------------------------------------------
+  // CONFIGURATION GUARD -- evaluated CONTINUOUSLY, sampled at start.
+  //
+  // The conditions are the ones that ALIAS SILENTLY rather than fail loudly:
+  //
+  //   cout_run > COUT_HW_MAX  the weight BRAM holds COUT_MAX/N_OC batches and
+  //                           that division FLOORS, so 240/32 = 7 -> 224, not
+  //                           240. Programming 225..240 used to wrap.
+  //   cin_run  > CIN_MAX      weight / pb_ram addresses wrap
+  //   VQ: cout_run > VQ_NORM_D        the norm ROM address wraps
+  //   VQ: vq_cin_load > CIN_MAX       the pb_ram write address wraps
+  //   VQ: cout_run not a multiple of VQ_K
+  //                           a partial sub-codebook would commit an argmin
+  //                           that never saw all K candidates
+  //   VQ: windows * cin_run > vq_cin_load
+  //           the batch windows would read past the channels actually loaded.
+  //           The window count is NOT cout_run/K: it is the number of times
+  //           vq_pb_step fires, batches / VQ_BPS. At K <= N_OC every batch
+  //           opens a window; at K > N_OC only every VQ_BPS-th does. Both
+  //           deployed geometries come to 4 x 16 = 64, which is vq_cin_load.
+  //
+  // WHY REGISTERED AND NOT IN THE S_IDLE NEXT-STATE CONE. The window-fit test
+  // contains a multiply, and evaluating it in the start_in -> st path made it
+  // the critical path of the entire IP. The geometry registers are written
+  // over AXI-lite several transactions before the CTRL write that produces
+  // start_in, so a two-cycle-old decision is always the decision for the run
+  // that is about to start -- a_cfg_decision_settled asserts that rather than
+  // assuming it.
+  // ------------------------------------------------------------
+  // How many DISTINCT input windows the run opens. One window per
+  // max(N_OC, VQ_K) output channels -- at K <= N_OC a batch opens a window and
+  // covers N_OC channels; at K > N_OC a window lasts VQ_BPS batches and covers
+  // VQ_K. max(N_OC, VQ_K) is a power of two, so this is a plain shift: no
+  // divider, and no ceiling needed because the multiple-of-VQ_K test above
+  // already rejects anything that is not a whole number of sub-codebooks.
+  //   K=16, N_OC=32 : cout 128 >> 5 = 4 windows
+  //   K=64, N_OC=32 : cout 256 >> 6 = 4 windows
+  localparam int VQ_WIN_SH = $clog2((VQ_K > N_OC) ? VQ_K : N_OC);
+  localparam int VQ_WINW   = 12 - VQ_WIN_SH;
+  wire [VQ_WINW-1:0] cfg_windows = cout_run[11:VQ_WIN_SH];
+
+  // windows is at most COUT_MAX/N_OC, so this is a small multiply. Left alone
+  // Vivado infers a DSP48E1, and a combinational DSP put ~2.9 ns into this
+  // path; as LUT logic it is a few shift-adds. Both matter -- see below.
+  (* use_dsp = "no" *) wire [23:0] cfg_win_chan =
+      24'($unsigned(cfg_windows)) * 24'($unsigned(cin_run));
+
+  // Combinational form. Synthesis strips it: the only reader is the
+  // a_cfg_decision_settled assertion, which is inside `ifndef SYNTHESIS.
+  wire cfg_bad_now =
+        (tile_pixels == 0) || (cin_run == 0) || (cout_run == 0)
+     || ($unsigned(cout_run) > COUT_HW_MAX)
+     || ($unsigned(cin_run)  > CIN_MAX)
+     || ((USE_PW_VQ != 0) && vq_mode &&
+         (($unsigned(cout_run) > VQ_NORM_D)
+          || ($unsigned(vq_cin_load) > CIN_MAX)
+          || (cout_run[VQ_KW-1:0] != '0)
+          || (cfg_win_chan > 24'($unsigned(vq_cin_load)))));
+
+  // TWO STAGES, and the reason is measured rather than assumed. Timing on this
+  // IP, out-of-context, xc7a200t, 10 ns constraint:
+  //
+  //   shipped RTL, no guard                        WNS  +1.915 ns
+  //   guard in the start_in -> next-state cone      WNS  -1.019 ns  CRITICAL
+  //   guard registered, one stage, DSP multiply     WNS  -0.789 ns  CRITICAL
+  //   guard registered, one stage, LUT multiply     WNS  +0.446 ns  critical
+  //   guard registered, TWO stages (this)           see the report
+  //
+  // The guard has no throughput role whatever -- it only has to be settled by
+  // the time start_in arrives, and the geometry registers are written over
+  // AXI-lite many cycles earlier. Spending two cycles on it is free, and it
+  // keeps a safety check from eating the headroom of the datapath it protects.
+  logic        cfg_simple_r;      // everything but the window-span test
+  logic [23:0] cfg_win_chan_r;    // windows * cin_run
+  logic [11:0] cfg_load_r;        // vq_cin_load, aligned with it
+  logic        cfg_vq_r;          // VQ mode, aligned with it
+  logic        cfg_bad_r;
+
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      cfg_simple_r   <= 1'b0;
+      cfg_win_chan_r <= 24'd0;
+      cfg_load_r     <= 12'd0;
+      cfg_vq_r       <= 1'b0;
+      cfg_bad_r      <= 1'b0;
+    end else begin
+      cfg_simple_r <=
+            (tile_pixels == 0) || (cin_run == 0) || (cout_run == 0)
+         || ($unsigned(cout_run) > COUT_HW_MAX)
+         || ($unsigned(cin_run)  > CIN_MAX)
+         || ((USE_PW_VQ != 0) && vq_mode &&
+             (($unsigned(cout_run) > VQ_NORM_D)
+              || ($unsigned(vq_cin_load) > CIN_MAX)
+              || (cout_run[VQ_KW-1:0] != '0)));
+      cfg_win_chan_r <= cfg_win_chan;
+      cfg_load_r     <= vq_cin_load;
+      cfg_vq_r       <= (USE_PW_VQ != 0) && vq_mode;
+
+      cfg_bad_r <= cfg_simple_r
+                || (cfg_vq_r && (cfg_win_chan_r > 24'($unsigned(cfg_load_r))));
+    end
+  end
+
+  // pb_ram READ index. In VQ mode the batch's window base is vq_pb_base.
+  wire [PB_AW-1:0] pb_rd_index = ((USE_PW_VQ != 0) && vq_mode_r)
+                               ? (vq_pb_base + ic_idx[PB_AW-1:0])
+                               : ic_idx[PB_AW-1:0];
+
+  // Does the NEXT batch open a new input window? True every batch when one
+  // batch holds whole sub-codebooks (VQ_BPS = 1), otherwise on the last batch
+  // of each sub-codebook. VQ_BPS is a power of two, so this is a bit test.
+  wire vq_pb_step = (VQ_BPS <= 1) ? 1'b1
+                  : (oc_batch_idx[VQ_BPSW-1:0] == VQ_BPSW'(VQ_BPS - 1));
+
+  logic                               rd_issued;
+  logic                               first_ic;
+  // mul_valid is declared above with prod_reg
+
+  // Load sub-FSM
+  logic [$clog2(CIN_MAX)-1:0]        load_ic_idx;
+
+  // ==================================================================
+  // INPUT HANDSHAKE -- fixed 2026-09-03.
+  //
+  // DEFECT L1 (beat latched one cycle before it is popped). Both load
+  // sites used to latch pixel_in on `valid_in` ALONE and only then assert
+  // consume_in. consume_in is a REGISTERED output and the wrapper drives
+  // the FWFT input FIFO's rd_en from it, so the pop only took effect the
+  // cycle AFTER the latch: dout still presented the same word, the core
+  // latched it a second time at the next address, and every channel from
+  // there on landed one address high. The last channel of every group was
+  // then never stored at all, because the load terminates on a beat count.
+  // Measured directly: pb_ram[i] held activation i-1 for all i >= 1.
+  //
+  // A beat is TRANSFERRED only on a cycle where the core is both offered a
+  // word and already asserting consume -- that is the cycle the wrapper
+  // pops it. Latch on that, and only that.
+  // ==================================================================
+  wire in_xfer = valid_in && consume_in;
+  logic                               next_grp_ready;
+
+  // PPU sub-FSM
+  // BUG FIX 2026-07-30 -- was $clog2(N_OC), which cannot REPRESENT N_OC when
+  // N_OC is a power of two: at N_OC=8 this was [2:0], max value 7, so the
+  // P_DRAIN guard `$unsigned(ppu_issue_idx) < N_OC` could never go false and
+  // the drain issued PPU beats forever. It stopped only when ppu_out_cnt
+  // caught up, i.e. after N_OC + PPU_LATENCY(9) issues: 17 beats/batch at
+  // N_OC=8, 25 at N_OC=16, both measured in sim. Every group therefore emitted
+  // ~2x its beats, produced_cnt hit the predicted total_groups_r at roughly
+  // half the input, TLAST fired early, and S2MM completed a garbage-tailed
+  // transfer looking perfectly healthy (Idle=1, IOC=1, no errors) while DW was
+  // left holding undelivered input -> "MM2S timeout".
+  // N_OC=30 was immune purely because 30 is NOT a power of two: $clog2(30)=5
+  // bits holds 30 and 31, so the guard worked. That is the only reason every
+  // build before N_OC=8 was correct, and why N_OC=16 is NOT a viable hedge.
+  // $clog2(N_OC+1) guarantees the terminal value is representable.
+  logic [31:0]                        ppu_out_cnt;
+
+  // ==================================================================
+  // SHADOW READ PORT -- rewritten 2026-09-03.
+  //
+  // DEFECT R1 (address one cycle late). The pair consumed at drain cycle j
+  // must be on doutb AT cycle j, so its read has to be ISSUED at cycle
+  // j-1. sha_rd_addr was a REGISTER assigned during cycle j-1, so it only
+  // reached the BRAM address bus at cycle j and its data arrived at j+1 --
+  // one cycle too late. sha_rd_parity, assigned in the same statement, was
+  // already correctly aligned to the consumption cycle, so the two drifted
+  // apart: issue j received pair (j-1)>>1 selected by parity j&1. Observed
+  // as odd issues landing on the right half of the wrong pair.
+  //
+  // Driving the address combinationally from the CURRENT issue index puts
+  // it on the bus in the same cycle the FSM decides it, one cycle ahead of
+  // the data, which is what a 1-cycle-latency BRAM needs.
+  //
+  // Stalls: out_stall drops sha_rd_en, so doutb HOLDS the pending pair for
+  // the whole stall and the resume cycle consumes exactly what it would
+  // have consumed unstalled. Holding the enable instead would re-read the
+  // already-advanced address and lose that pair.
+  // ==================================================================
+  wire [11:0] sha_rd_oc_next = (ppu_st == P_PARAM_WAIT)
+                             ? 12'd0                              // prefetch OC 0
+                             : (12'($unsigned(ppu_issue_idx)) + 12'd1);
+  assign sha_rd_en   = (ppu_st == P_PARAM_WAIT)
+                    || ((ppu_st == P_DRAIN) && !out_stall
+                        && (($unsigned(ppu_issue_idx) + 1) < $unsigned(ppu_drain_len)));
+  assign sha_rd_addr = {sha_rd_bank, SA_HIDX_W'(sha_rd_oc_next >> 1)};
+
+  // OPTION C (2026-08-07): the drain context is released when the last beat has
+  // been ISSUED, not when it has RETIRED, so a batch's outputs can still be
+  // inside the PPU pipeline after its successor has begun issuing. ppu_out_cnt
+  // is a per-batch counter and can no longer answer "is the run finished"; this
+  // occupancy counter can. +1 per ppu_valid_in, -1 per ppu_valid_out, maintained
+  // unconditionally outside the FSM so it stays correct across batch boundaries
+  // and while out_stall is held. Max occupancy is N_OC + PPU depth (~9).
+  logic [7:0]                         ppu_in_flight;
+
+  // ------------------------------------------------------------
+  // Main Controller
+  //   Three concurrent processes in one always_ff:
+  //   1. Main FSM (compute scheduling)
+  //   2. Load sub-FSM (background pixel preload)
+  //   3. PPU sub-FSM (background accumulator drain)
+  // ------------------------------------------------------------
+  integer li, oci;
+
+  always_ff @(posedge clk or negedge rst_n) begin
+    if (!rst_n) begin
+      st            <= S_IDLE;
+      done_out      <= 1'b0;
+      consume_in    <= 1'b0;
+      grp_idx       <= 32'd0;
+      ic_idx        <= '0;
+      oc_batch_idx  <= 12'd0;
+      w_addr_base   <= '0;
+      vq_pb_base    <= '0;
+      cfg_err       <= 1'b0;
+      cfg_err_stb   <= 1'b0;
+      w_rd_addr     <= '0;
+      w_rd_en       <= 1'b0;
+      rd_issued     <= 1'b0;
+      rd_issued_q   <= 1'b0;
+      rd_issued_d1  <= 1'b0;
+      rd_issued_d2  <= 1'b0;
+      mul_valid     <= 1'b0;
+      first_ic      <= 1'b1;
+      // Removed datapath array resets to fix high-fanout recovery violations
+      compute_buf     <= 1'b0;
+      load_st         <= L_IDLE;
+      load_ic_idx     <= '0;
+      next_grp_ready  <= 1'b0;
+      ppu_st          <= P_IDLE;
+      ppu_valid_in    <= 1'b0;
+      ppu_issue_idx   <= '0;
+      ppu_out_cnt     <= 32'd0;
+      ppu_in_flight   <= 8'd0;
+      ppu_drain_len   <= 12'd0;
+      cout_run_r      <= 12'd0;
+      ppu_oc_batch    <= 12'd0;
+      param_rd_addr   <= '0;
+      param_rd_en     <= 1'b0;
+      // ppu_bias_q / ppu_mult_q / ppu_shift_q intentionally omitted from async reset.
+      // They are always loaded from BRAM in P_PARAM_WAIT before ppu_valid_in fires,
+      // so their value at reset time is irrelevant. Including them drove the CLR pin
+      // of e.g. ppu_mult_q_reg[11] via a 9.2 ns routed path (fo=35270 reset net),
+      // causing a Recovery violation identical to the one already fixed above.
+      // shadow_copying/shadow_copy_idx/sha_wr_en: synchronous reset (separate block)
+      shadow_copy_trig <= 1'b0;
+      sha_rd_parity <= 1'b0;
+      sha_wr_bank <= 1'b0; sha_rd_bank <= 1'b0;
+
+
+      pb_a_wr_en <= 1'b0; pb_a_wr_addr <= '0; pb_a_wr_data <= '0;
+      pb_a_rd_en <= 1'b0; pb_a_rd_addr <= '0;
+      pb_b_wr_en <= 1'b0; pb_b_wr_addr <= '0; pb_b_wr_data <= '0;
+      pb_b_rd_en <= 1'b0; pb_b_rd_addr <= '0;
+    end else begin
+      // Default deasserts (active-high pulses cleared every cycle)
+      done_out     <= 1'b0;
+      consume_in   <= 1'b0;
+      w_rd_en      <= 1'b0;
+      ppu_valid_in <= 1'b0;
+      param_rd_en  <= 1'b0;
+      pb_a_wr_en   <= 1'b0;
+      pb_b_wr_en   <= 1'b0;
+      pb_a_rd_en   <= 1'b0;
+      pb_b_rd_en   <= 1'b0;
+      shadow_copy_trig <= 1'b0;  // default deassert; set in S_COMPUTE when batch done
+
+      // OPTION C: PPU pipeline occupancy. Maintained here, outside the FSM,
+      // because a batch's outputs retire after its drain context has already
+      // been handed to the next batch. ppu_valid_in is the registered issue
+      // strobe the PPU samples this edge, so incrementing on it counts exactly
+      // the beats the PPU accepted.
+      if (ppu_valid_in && !ppu_valid_out)
+        ppu_in_flight <= ppu_in_flight + 8'd1;
+      else if (!ppu_valid_in && ppu_valid_out)
+        ppu_in_flight <= ppu_in_flight - 8'd1;
+
+      // ========================================================
+      // [1] MAIN FSM
+      // ========================================================
+      // The strobe is one cycle wide: default it low here, and let S_IDLE
+      // raise it on the cycle it refuses a start.
+      cfg_err_stb <= 1'b0;
+
+      case (st)
+
+        // --------------------------------------------------------
+        // S_IDLE: wait for start
+        // --------------------------------------------------------
+        S_IDLE: begin
+          if (start_in) begin
+            // Latch derived constants (removes division from critical path)
+            tile_groups_r  <= tile_pixels >> LANE_SHIFT;
+            // ceil, not floor: with partial-batch drain N_OC may exceed cout,
+            // and floor would give zero batches and emit nothing.
+            cout_batches_r <= (cout_run + N_OC - 1) / N_OC;
+            vq_m_last_r    <= 12'((cout_run >> VQ_KW) - 12'd1);
+            cout_run_r     <= cout_run;
+            zp_in_r        <= zp_in;
+            zp_out_r       <= zp_out;
+            vq_mode_r      <= (USE_PW_VQ != 0) ? vq_mode : 1'b0;
+            vq_cin_load_r  <= vq_cin_load;
+            relu_en_r      <= relu_en;
+            /* start each run on a known bank so a previous run's parity
+             * cannot carry over (2026-07-30 double buffer) */
+
+
+            grp_idx        <= 32'd0;
+            ic_idx         <= '0;
+            oc_batch_idx   <= 12'd0;
+            w_addr_base    <= '0;
+            vq_pb_base     <= '0;
+            rd_issued      <= 1'b0;
+            first_ic       <= 1'b1;
+            compute_buf    <= 1'b0;
+            load_st        <= L_IDLE;
+            ppu_st         <= P_IDLE;
+            next_grp_ready <= 1'b0;
+            ppu_out_cnt    <= 32'd0;
+            // Defensive: S_DONE already guarantees the pipeline drained, but a
+            // run must never inherit occupancy from an aborted predecessor.
+            // Placed after the unconditional maintenance above so it wins.
+            ppu_in_flight  <= 8'd0;
+            // ------------------------------------------------------------
+            // SYNTHESISABLE CONFIGURATION GUARD.
+            //
+            // Until now the only checks here were the three zero tests, and
+            // the cout_run > COUT_MAX check lived ONLY in
+            // pw_pixel_major_core_SIMCOPY.sv, which is not the synthesised
+            // file. An over-range geometry therefore ran, aliased its weight
+            // or norm addresses, and produced a wrong frame with nothing set
+            // to say so. Every condition below is one that ALIASES SILENTLY:
+            //
+            //   cout_run > COUT_HW_MAX  weight BRAM holds COUT_MAX/N_OC
+            //                           batches and that division floors, so
+            //                           240/32 = 7 -> 224, not 240.
+            //   cin_run  > CIN_MAX      weight/pb address wraps
+            //   VQ: cout_run > VQ_NORM_D        norm ROM address wraps
+            //   VQ: vq_cin_load > CIN_MAX       pb_ram write address wraps
+            //   VQ: cout_run not a multiple of VQ_K
+            //                           a partial sub-codebook would commit an
+            //                           argmin that never saw all K candidates
+            //   VQ: windows * cin_run > vq_cin_load
+            //                           the batch windows would run off the end
+            //                           of the loaded channels (the condition
+            //                           a_vq_window_inside_load asserts in sim).
+            //                           The window count is NOT cout_run/K --
+            //                           it is the number of times vq_pb_step
+            //                           fires, i.e. batches / VQ_BPS. At
+            //                           K <= N_OC every batch opens a window
+            //                           (VQ_BPS = 1) and the count is the batch
+            //                           count; at K > N_OC it is the number of
+            //                           sub-codebooks. Both give 4 x 16 = 64
+            //                           for the two deployed geometries.
+            //
+            // On a violation the run is REFUSED -- no beats are emitted -- and
+            // cfg_err is raised for software to read at STATUS2. A legal start
+            // clears it, so it always describes the most recent start.
+            // ------------------------------------------------------------
+            if (cfg_bad_r) begin
+              cfg_err     <= 1'b1;
+              cfg_err_stb <= 1'b1;      // one cycle, every refusal
+              st          <= S_DONE;
+            end else begin
+              cfg_err <= 1'b0;
+              st      <= S_LOAD_FIRST;
+            end
+          end
+        end
+
+        // --------------------------------------------------------
+        // S_LOAD_FIRST: load very first pixel group into buffer A
+        //   (no compute to overlap with yet)
+        // --------------------------------------------------------
+        S_LOAD_FIRST: begin
+          // Request the next beat one cycle ahead, and drop the request on the
+          // beat that completes the group so the FIFO is never popped for a
+          // word this state will not store. See DEFECT L1 above.
+          consume_in <= valid_in &&
+                        !(in_xfer && (($unsigned(ic_idx) + 1) == cin_load));
+          if (in_xfer) begin
+            pb_a_wr_en   <= 1'b1;
+            pb_a_wr_addr <= ic_idx[PB_AW-1:0];
+            pb_a_wr_data <= pixel_in;
+
+            if (($unsigned(ic_idx) + 1) == cin_load) begin
+              // First group loaded - setup compute
+              ic_idx       <= '0;
+              oc_batch_idx <= 12'd0;
+              w_addr_base  <= '0;
+              vq_pb_base   <= '0;
+              rd_issued    <= 1'b0;
+              first_ic     <= 1'b1;
+              compute_buf  <= 1'b0;  // compute reads buffer A
+              // acc clear NOT needed: first_ic=1 makes S_COMPUTE
+              // use '0 on the first valid MAC (line 457)
+              // Start background preload of group 1 into buffer B
+              if ((grp_idx + 1) < tile_groups_r) begin
+                load_st        <= L_LOADING;
+                load_ic_idx    <= '0;
+                next_grp_ready <= 1'b0;
+              end
+              st <= S_COMPUTE;
+            end else begin
+              ic_idx <= ic_idx + 1'b1;
+            end
+          end
+        end
+
+        // --------------------------------------------------------
+        // S_COMPUTE: MAC accumulation for current OC batch
+        //   Cin cycles reading pixel buffer + weight BRAM
+        //   Load sub-FSM and PPU sub-FSM run concurrently
+        // --------------------------------------------------------
+        S_COMPUTE: begin
+          // Pipeline stage 4: accumulate from registered multiply output
+          if (mul_valid) begin
+            for (oci = 0; oci < N_OC; oci++) begin
+              for (int p = 0; p < N_LANES/2; p++) begin
+                // SIGNEDNESS FIX (2026-08-25) -- PACK_SIGNED_FIX
+                // The unsized literal '0 is UNSIGNED, so `first_ic ? '0 : acc`
+                // has unsigned type and forces the whole add into unsigned
+                // context, ZERO-extending a negative product instead of
+                // sign-extending it. xsim: -84 was accumulated as +65452.
+                // $signed() on the ternary restores signed context.
+                acc[oci][p*2]     <= $signed(first_ic ? '0 : acc[oci][p*2])
+                                     + $signed(p_packed_reg[oci][p][15:0]);
+                // DUAL-MAC BORROW FIX (2026-08-25) -- PACK_BORROW_FIX
+                // p[15:0] is a SIGNED 16-bit field; when negative it borrows 1
+                // from the high field, so p[32:16] reads a1*w - 1. Adding the
+                // low field's sign bit back cancels the borrow exactly.
+                acc[oci][p*2 + 1] <= $signed(first_ic ? '0 : acc[oci][p*2 + 1])
+                                     + $signed(p_packed_reg[oci][p][32:16])
+                                     + $signed({1'b0, p_packed_reg[oci][p][15]});
+              end
+            end
+            first_ic <= 1'b0;
+          end
+
+          // Pipeline stage 3: multiply (now in DSP48) and register result.
+          // Triggered one cycle later than before (rd_issued_d2) because the new
+          // stage 2.5 below captures a_packed_r/w_rd_data_rr first.
+          if (rd_issued_d2) begin
+            mul_valid <= 1'b1;
+          end else begin
+            mul_valid <= 1'b0;
+          end
+
+          // Pipeline stage 2.5: register packed activations and weights.
+          // Breaks the timing-critical path: previously a_packed (from
+          // pb_pixel_r and zp_in_lane via two 9-bit subtracts + packing)
+          // fed the multiply in the same cycle, causing 17 logic levels
+          // and -2.7 ns slack. Now only registered signals enter the DSP48.
+          rd_issued_d2 <= rd_issued_d1;
+
+          // Pipeline stage 2: register BRAM output (data arrived from read).
+          // rd_issued_q marks the cycle the DATA is valid; everything
+          // downstream hangs off it. See DEFECT M1 above.
+          rd_issued_q  <= rd_issued;
+          rd_issued_d1 <= rd_issued_q;
+
+          // Pipeline stage 1: issue BRAM reads
+          if ($unsigned(ic_idx) < cin_run) begin
+            // Read from active compute buffer
+            if (!compute_buf) begin
+              pb_a_rd_en   <= 1'b1;
+              pb_a_rd_addr <= pb_rd_index;
+            end else begin
+              pb_b_rd_en   <= 1'b1;
+              pb_b_rd_addr <= pb_rd_index;
+            end
+            w_rd_en    <= 1'b1;
+            w_rd_addr  <= w_addr_base + ic_idx;
+            rd_issued  <= 1'b1;
+            ic_idx     <= ic_idx + 1'b1;
+          end else begin
+            rd_issued <= 1'b0;
+            if (!rd_issued && !rd_issued_q && !rd_issued_d1 && !rd_issued_d2
+                && !mul_valid) begin
+              // DOUBLE-BUFFER CHANGE 2026-07-30. This used to require
+              // `ppu_st == P_IDLE`, i.e. batch N+1 could not finish its compute
+              // until batch N's PPU drain had fully RETIRED (N_OC issues plus
+              // ~9 cycles of PPU pipeline tail). That was the measured
+              // ~12.3 cycles/batch serialisation.
+              //
+              // With two banks the copy targets the bank the PPU is NOT
+              // draining, so it can proceed immediately. The only remaining
+              // requirement is that the copy engine itself is free.
+              // S_BATCH_DONE still gates the DRAIN on P_IDLE, which is what
+              // keeps at most one drain in flight and makes 2 banks sufficient.
+              if (!shadow_copying) begin
+                // Trigger shadow block to copy acc -> shadow BRAM
+                shadow_copy_trig <= 1'b1;
+                shadow_copy_len  <= (($unsigned(cout_run_r) - ($unsigned(oc_batch_idx) * N_OC)) < N_OC)
+                                    ? ($unsigned(cout_run_r) - ($unsigned(oc_batch_idx) * N_OC))
+                                    : N_OC;
+                st <= S_BATCH_DONE;
+              end
+            end
+          end
+        end
+
+        // --------------------------------------------------------
+        // S_BATCH_DONE: trigger PPU drain + decide next step
+        //   Waits for previous PPU drain to complete (if still busy)
+        // --------------------------------------------------------
+        S_BATCH_DONE: begin
+          if (ppu_st == P_IDLE) begin
+            sha_rd_bank <= sha_wr_bank;
+            sha_wr_bank <= ~sha_wr_bank;
+            // Hand the just-filled bank to the PPU and flip the write bank so
+            // the NEXT batch's copy lands in the one that is now free.
+
+
+            // Previous PPU drain (if any) is complete - safe to trigger new one
+            // Issue first param BRAM read for this batch
+            ppu_st        <= P_PARAM_WAIT;
+            ppu_oc_batch  <= oc_batch_idx;
+            // Valid channels remaining in this batch: full N_OC except possibly
+            // the last, which carries cout_run - oc_batch_idx*N_OC.
+            ppu_drain_len <= (($unsigned(cout_run_r) - ($unsigned(oc_batch_idx) * N_OC)) < N_OC)
+                             ? ($unsigned(cout_run_r) - ($unsigned(oc_batch_idx) * N_OC))
+                             : N_OC;
+            ppu_issue_idx <= '0;
+            ppu_out_cnt   <= 32'd0;
+            param_rd_en   <= 1'b1;
+            param_rd_addr <= oc_batch_idx * N_OC;
+
+            if (($unsigned(oc_batch_idx) + 1) < cout_batches_r) begin
+              // Not the last batch - start next batch immediately
+              oc_batch_idx <= oc_batch_idx + 12'd1;
+              w_addr_base  <= w_addr_base + cin_run;
+              // VQ activation window advances only on a sub-codebook
+              // boundary; at VQ_BPS = 1 that is every batch, i.e. exactly
+              // what w_addr_base does, so the legacy geometry is unchanged.
+              if (vq_pb_step) vq_pb_base <= vq_pb_base + cin_run[PB_AW-1:0];
+              ic_idx       <= '0;
+              rd_issued    <= 1'b0;
+              first_ic     <= 1'b1;
+              // acc clear NOT needed: first_ic handles it
+              st <= S_COMPUTE;
+            end else begin
+              // Last batch of this group - wait for PPU to finish
+              st <= S_WAIT_PPU;
+            end
+          end
+          // else: PPU still busy from previous batch - wait here
+        end
+
+        // --------------------------------------------------------
+        // S_WAIT_PPU: wait for last batch's PPU drain, then
+        //   either swap buffers for next group or finish
+        // --------------------------------------------------------
+        S_WAIT_PPU: begin
+          if (!shadow_copying) begin
+            // Last batch's PPU drain is complete.
+            //
+            // BUG FIX 2026-07-30 -- grp_idx used to increment HERE,
+            // unconditionally, outside both branches below. When the next pixel
+            // group was not yet preloaded the FSM correctly stayed in
+            // S_WAIT_PPU, but the group counter kept advancing ONE PER CLOCK
+            // while no input was consumed and no output produced. It free-ran
+            // to tile_groups_r and fell into S_DONE, so PW reported done with
+            // most of its input undelivered, stopped draining DW, DW's out FIFO
+            // filled, DW throttled, and MM2S could never complete.
+            //
+            // The "(rare)" in the old comment below was true only at N_OC=30,
+            // where PW spent max(cin_run, cout_rounded) = 30 cycles per group
+            // and DW stayed comfortably ahead. At N_OC=8 that drops to 8
+            // cycles, PW outruns DW, and the not-ready path became the COMMON
+            // case. Measured on hardware (surrogate pair 0, 720p, N_OC=8): DW
+            // stalled at consumed=44431 of 86400 with out_prog_full=1 while PW
+            // already read STATUS=done.
+            //
+            // grp_idx must advance only when a group is actually retired.
+            // Both branches below still test the pre-increment value, so the
+            // terminal condition and the (grp_idx + 2) preload lookahead keep
+            // exactly their original meaning.
+            if ((grp_idx + 1) >= tile_groups_r) begin
+              // All groups done -- but under Option C the drain context is
+              // released at issue completion, so the final batch's last beats
+              // may still be inside the PPU pipeline. Wait for the pipeline to
+              // empty before pulsing done, otherwise done leads the data.
+              // Costs a one-off ~9 cycles per RUN, not per batch.
+              if (ppu_in_flight == 8'd0) begin
+                grp_idx <= grp_idx + 32'd1;
+                st <= S_DONE;
+              end
+            end else if (next_grp_ready) begin
+              // Next group is preloaded - swap buffers and continue
+              grp_idx      <= grp_idx + 32'd1;
+              compute_buf  <= !compute_buf;
+              oc_batch_idx <= 12'd0;
+              w_addr_base  <= '0;
+              vq_pb_base   <= '0;
+              ic_idx       <= '0;
+              rd_issued    <= 1'b0;
+              first_ic     <= 1'b1;
+              // acc clear NOT needed: first_ic handles it
+              // Start preloading next-next group (if any)
+              next_grp_ready <= 1'b0;
+              if ((grp_idx + 2) < tile_groups_r) begin
+                load_st     <= L_LOADING;
+                load_ic_idx <= '0;
+              end else begin
+                load_st <= L_IDLE;
+              end
+              st <= S_COMPUTE;
+            end
+            // else: next group not ready yet -- wait here WITHOUT advancing
+            // grp_idx. This is the normal input-starved path, not a rare one.
+          end
+        end
+
+        // --------------------------------------------------------
+        // S_DONE: pulse done
+        // --------------------------------------------------------
+        S_DONE: begin
+          done_out <= 1'b1;
+          st       <= S_IDLE;
+        end
+
+        default: st <= S_IDLE;
+      endcase
+
+      // ========================================================
+      // [2] LOAD SUB-FSM (runs concurrently with main FSM)
+      //   Preloads next pixel group into inactive buffer
+      //   Only active during S_COMPUTE / S_BATCH_DONE / S_WAIT_PPU
+      // ========================================================
+      case (load_st)
+        L_IDLE:  begin end  // nothing to do
+        L_LOADING: begin
+          // Same one-cycle-ahead request as S_LOAD_FIRST; see DEFECT L1.
+          consume_in <= valid_in &&
+                        !(in_xfer && (($unsigned(load_ic_idx) + 1) == cin_load));
+          if (in_xfer) begin
+            // Write to inactive buffer (opposite of compute_buf)
+            if (compute_buf) begin
+              // Compute reads B ? load writes A
+              pb_a_wr_en   <= 1'b1;
+              pb_a_wr_addr <= load_ic_idx[PB_AW-1:0];
+              pb_a_wr_data <= pixel_in;
+            end else begin
+              // Compute reads A ? load writes B
+              pb_b_wr_en   <= 1'b1;
+              pb_b_wr_addr <= load_ic_idx[PB_AW-1:0];
+              pb_b_wr_data <= pixel_in;
+            end
+
+            if (($unsigned(load_ic_idx) + 1) == cin_load) begin
+              next_grp_ready <= 1'b1;
+              load_st        <= L_READY;
+            end else begin
+              load_ic_idx <= load_ic_idx + 1'b1;
+            end
+          end
+        end
+        L_READY: begin end  // hold until main FSM resets us
+        default: load_st <= L_IDLE;
+      endcase
+
+      // ========================================================
+      // [3] PPU SUB-FSM (runs concurrently with main FSM)
+      //   Drains shadow_acc through PPU instances in background
+      //   Triggered from S_BATCH_DONE, runs during S_COMPUTE
+      // ========================================================
+      case (ppu_st)
+        P_IDLE: begin end  // waiting for trigger
+
+        // 1-cycle wait for param BRAM read latency
+        // Also issue shadow BRAM pre-read for OC 0 (data arrives 1st cycle of P_DRAIN)
+        P_PARAM_WAIT: begin
+          ppu_bias_q  <= param_bias_data;
+          ppu_mult_q  <= param_mult_data[23:0];  // upper 8b ignored (INT8 quant fits in 24b)
+          ppu_shift_q <= param_shift_data;
+          // Pre-read OC 1 params
+          if (1 < $unsigned(ppu_drain_len)) begin
+            param_rd_en   <= 1'b1;
+            param_rd_addr <= ppu_oc_batch * N_OC + 1;
+          end
+          // Pre-read shadow BRAM OC 0 (1-cycle BRAM latency ? data ready at P_DRAIN cycle 0)
+          // The OC 0 pre-read is issued COMBINATIONALLY this cycle (see
+          // SHADOW READ PORT above); only the parity select is registered.
+          sha_rd_parity <= 1'b0;                     // issue 0 -> even half
+          ppu_st <= P_DRAIN;
+        end
+
+        // Feed shadow BRAM accumulators to PPU, one OC per cycle
+        P_DRAIN: begin
+          if (!out_stall) begin
+            if ($unsigned(ppu_issue_idx) < $unsigned(ppu_drain_len)) begin
+              ppu_valid_in <= 1'b1;
+              // Unpack sha_rd_data (arrived from pre-read issued previous cycle)
+              for (li = 0; li < N_LANES; li++)
+                ppu_acc_in[li] <= $signed(sha_rd_data[li*ACC_WIDTH +: ACC_WIDTH]);
+              ppu_issue_idx <= ppu_issue_idx + 1'b1;
+
+              // OPTION C (2026-08-07): release the drain context on ISSUE
+              // completion. This used to wait for ppu_out_cnt == N_OC, i.e. for
+              // the last beat to RETIRE, which cost the ~9-cycle PPU pipeline
+              // tail on every batch while S_BATCH_DONE sat blocked on P_IDLE.
+              // Safe because the PPU latches bias/mult/shift WITH the data at
+              // its stage 0, so the parameters may change as soon as the last
+              // valid_in has been sampled; and because the pipeline is strictly
+              // in-order, so the next batch's outputs cannot overtake this
+              // batch's. Shadow banks stay safe with 2 banks: a retiring beat
+              // has already read the shadow BRAM.
+              if (($unsigned(ppu_issue_idx) + 1) == $unsigned(ppu_drain_len))
+                ppu_st <= P_IDLE;
+
+              // OC j lives at half-index j>>1 in half (j&1). Both halves share
+              // one address bus, driven combinationally above so the read for
+              // OC j+1 is issued THIS cycle; only the parity that selects the
+              // half is registered, so it lands with the data it selects.
+              if (($unsigned(ppu_issue_idx) + 1) < $unsigned(ppu_drain_len)) begin
+                sha_rd_parity <= ($unsigned(ppu_issue_idx) + 1) & 1'b1;
+              end
+
+              // ==================================================
+              // PARAM PIPELINE -- DEFECT P1 fixed 2026-09-03.
+              //
+              // param_bias_data at drain cycle j holds OC j's parameters
+              // (the read for OC j was issued two cycles earlier), and the
+              // PPU consumes them the cycle AFTER issue j. So the latch has
+              // to happen on EVERY issue, j = 0 .. drain_len-1.
+              //
+              // It used to sit INSIDE the (issue+1 < drain_len) bound that
+              // belongs to the PRE-READ. On the last issue of every batch
+              // that test is false, so the latch was skipped and the final
+              // output channel was requantised with the parameters of OC
+              // drain_len-2 -- its bias, its multiplier and its shift.
+              // Measured by tb_pw_bias_align.sv before the fix:
+              //   "observations = 32, skewed = 1
+              //    -- bias 30 presented with OC 31's accumulator"
+              // At drain_len = 1 nothing was ever latched at all and the
+              // single channel used the stale P_PARAM_WAIT value.
+              //
+              // The identity-requantiser convolution check could not see
+              // this: it sets bias = 0, mult = 1<<16 and shift = 16 for
+              // every channel, so a swapped parameter set is invisible.
+              // gen_conv_vectors.c now emits a per-channel bias for exactly
+              // this reason.
+              //
+              // Only the PRE-READ needs a bound -- it must not address past
+              // the last output channel of the batch.
+              // ==================================================
+              ppu_bias_q  <= param_bias_data;
+              ppu_mult_q  <= param_mult_data[23:0];
+              ppu_shift_q <= param_shift_data;
+              if (($unsigned(ppu_issue_idx) + 2) < $unsigned(ppu_drain_len)) begin
+                param_rd_en   <= 1'b1;
+                param_rd_addr <= ppu_oc_batch * N_OC + ppu_issue_idx + 2;
+              end
+            end
+
+            // Count PPU outputs. Retained for debug only -- the P_IDLE exit is
+            // now driven by issue completion above, and run completion by
+            // ppu_in_flight. This counter no longer gates anything.
+            if (ppu_valid_out)
+              ppu_out_cnt <= ppu_out_cnt + 32'd1;
+          end
+        end
+
+        default: ppu_st <= P_IDLE;
+      endcase
+
+    end
+  end
+
+  // Synchronous-only datapath registers to map optimally to the DSP48 input pipeline
+  always_ff @(posedge clk) begin
+    // Gated on rd_issued_q, not rd_issued: the data for a read issued in
+    // cycle t lands on the bus in cycle t+1. See DEFECT M1 above.
+    if (rd_issued_q) begin
+      for (int li = 0; li < N_LANES; li++) begin
+        pb_pixel_r[li] <= pb_pixel[li];
+      end
+      for (int oci = 0; oci < N_OC; oci++) begin
+        w_rd_data_r[oci] <= w_rd_data[oci];
+      end
+    end
+    if (rd_issued_d1) begin
+      for (int p = 0; p < N_LANES/2; p++) begin
+        a_packed_r[p] <= a_packed[p];
+      end
+      for (int oci = 0; oci < N_OC; oci++) begin
+        w_rd_data_rr[oci] <= w_rd_data_r[oci];
+      end
+    end
+  end
+
+  // ---------------------------------------------------------------
+  // shadow_copy_idx / shadow_copying / sha_wr_en: synchronous reset only
+  //   Owned entirely by this block. main FSM issues shadow_copy_trig
+  //   to start a copy; this block runs it to completion.
+  //   Using synchronous reset removes these FFs from the async-reset
+  //   fanout cone, eliminating recovery-time violations on CLR pins.
+  // ---------------------------------------------------------------
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      shadow_copying  <= 1'b0;
+      shadow_copy_idx <= '0;
+      sha_copy_bank_r <= 1'b0;
+    end else begin
+      // Two OCs per cycle: 2i into the even half, 2i+1 into the odd half.
+      // The write PORT itself (address, data, both enables) is combinational
+      // and lives with the declarations above; this block only sequences the
+      // index. Pair 0 is written on the TRIGGER cycle via copy_idx_now, so
+      // the registered index starts at 1.
+      if (shadow_copy_trig) begin
+        sha_copy_bank_r <= sha_wr_bank;        // PRE-flip: the bank the drain reads
+        shadow_copying  <= ($unsigned(copy_pairs) > 12'd1);
+        shadow_copy_idx <= ($unsigned(copy_pairs) > 12'd1) ? SA_HIDX_W'(1) : '0;
+      end else if (shadow_copying) begin
+        if ($unsigned(shadow_copy_idx) >= (copy_pairs - 1)) begin
+          shadow_copying  <= 1'b0;
+          shadow_copy_idx <= '0;
+        end else begin
+          shadow_copy_idx <= shadow_copy_idx + 1'b1;
+        end
+      end
+    end
+  end
+
+`ifndef SYNTHESIS
+  // Step 10 safety properties. The MAC must never read a pb_ram entry the load
+  // did not write, which is exactly "the batch windows tile the loaded region".
+  always_ff @(posedge clk) begin
+    if (rst_n) begin
+      a_vq_off_when_not_compiled: assert (!((USE_PW_VQ == 0) && vq_mode))
+        else $error("vq_mode asserted but USE_PW_VQ = 0");
+      // The guard must never let an over-range geometry run. cfg_err and a
+      // non-idle FSM are mutually exclusive by construction; assert it anyway
+      // so a future edit to S_IDLE cannot quietly reopen the aliasing hole.
+      a_cfg_err_means_refused: assert (!(cfg_err && (st != S_IDLE) && (st != S_DONE)))
+        else $error("cfg_err raised but the run started anyway (st=%0d)", st);
+      // The registered guard decision must describe the geometry that is
+      // actually about to run. It would not if software wrote a geometry
+      // register in the very cycle before start_in -- impossible over AXI-lite,
+      // but asserted rather than assumed.
+      a_cfg_decision_settled: assert (!(start_in && (cfg_bad_r !== cfg_bad_now)))
+        else $error("geometry changed within 2 cycles of start_in");
+      // Exclude S_DONE: a run REFUSED by the cfg guard parks there with
+      // vq_mode_r latched and the offending geometry still on the inputs,
+      // and re-reporting what the guard already caught is just noise.
+      if (vq_mode_r && (st != S_IDLE) && (st != S_DONE) && !cfg_err) begin
+        a_vq_window_inside_load: assert ($unsigned(vq_pb_base) + $unsigned(cin_run)
+                                         <= $unsigned(cin_load))
+          else $error("VQ window %0d+%0d overruns the %0d channels loaded",
+                      vq_pb_base, cin_run, cin_load);
+        a_vq_weight_inside_bram: assert ($unsigned(w_addr_base) + $unsigned(cin_run)
+                                         <= W_DEPTH)
+          else $error("VQ weight window %0d+%0d overruns W_DEPTH %0d",
+                      w_addr_base, cin_run, W_DEPTH);
+        a_vq_load_fits_pb: assert ($unsigned(cin_load) <= CIN_MAX)
+          else $error("vq_cin_load %0d exceeds CIN_MAX %0d", cin_load, CIN_MAX);
+      end
+    end
+  end
+`endif
+
+endmodule
+
+`default_nettype wire

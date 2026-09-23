@@ -1,0 +1,237 @@
+Design-space enumeration, latency model from spec. L=8 Q=32 W_DMA=8 R_sh=2, 100 MHz
+
+VALIDATION (Q=32)
+  16-48-64  T_HW ms                              got 13.446       want 13.446       ok
+  16-48-64  MMAC                                 got 120.269      want 120.269      ok
+  16-48-64  weights                              got 4491         want 4491         ok
+  16-32-32-32-64-64  T_HW ms                     got 17.695       want 17.695       ok
+  16-32-32-32-64-64  MMAC                        got 193.766      want 193.766      ok
+  16-32-32-32-64-64  weights                     got 10363        want 10363        ok
+  16-16-64-64  T_HW ms                           got 13.909       want 13.909       ok
+  16-16-48-32-64  T_HW ms                        got 13.988       want 13.988       ok
+  16-16-16-16-32-64  T_HW ms                     got 13.952       want 13.952       ok
+  16-48-64  per-block cycles                     got [518400, 469300, 356932] want [518400, 469300, 356932] ok
+  16-48-64  bottlenecks                          got PW-DW-DW     want PW-DW-DW     ok
+
+LABELING DISCREPANCY: which sequence gives 17.766 ms?
+  16-48-48-64          15.6783 ms   159.667 MMAC    7227 weights  PW-DW-DW-PW  
+  16-48-48-48-64       17.7663 ms   199.066 MMAC    9963 weights  PW-DW-DW-PW-PW  <-- 17.766
+  -> 17.766 ms is 16-48-48-48-64
+  all validation values match
+
+CROSS-CHECK against the frozen repo model (Run B covers Run A)
+  spec implementation vs model/service_model.py: 0 of 1360 sequences disagree
+
+==============================================================================
+RUN A: 340 sequences (255 feasible on the current bitstream)
+==============================================================================
+latency range 11.1010 .. 23.2607 ms;  MMAC range 57.139 .. 353.664
+
+16-32-32-32-64-64: 17.6950 ms, 193.766 MMAC, 10363 weights, PW-DW-DW-PW-PW-PW
+  latency: 189 of 340 sequences are faster, 3 tie -> rank 190; faster than 43.2% of the space
+  MMAC   : 129 of 340 have more MACs -> above 60.0% of the space
+
+16-48-64: 13.4463 ms, 120.269 MMAC, 4491 weights, PW-DW-DW
+  latency: 10 of 340 sequences are faster, 0 tie -> rank 11; faster than 96.8% of the space
+  MMAC   : 297 of 340 have more MACs -> above 12.4% of the space
+
+frontier (MMAC): 31 points
+  16-16-64             11.1010 ms     57.139 MMAC    1643 w  PW-DW-PW           
+  16-32-64             12.2590 ms     88.704 MMAC    3067 w  PW-DW-DW           
+  16-16-48-64          13.3036 ms    103.910 MMAC    4891 w  PW-DW-DW-PW        
+  16-48-64             13.4463 ms    120.269 MMAC    4491 w  PW-DW-DW           
+  16-16-64-64          13.9090 ms    124.416 MMAC    6315 w  PW-DW-PW-PW        
+  16-16-64-32-64       14.3050 ms    128.563 MMAC    6603 w  PW-DW-PW-PW-PW     
+  16-32-48-64          14.4910 ms    131.789 MMAC    6059 w  PW-DW-DW-PW        
+  16-64-64             14.8367 ms    151.834 MMAC    5915 w  PW-PW-DW           INFEASIBLE (b3 G*Cin=2560)
+  16-32-64-64          15.0670 ms    155.981 MMAC    7739 w  PW-DW-DW-PW        
+  16-32-64-32-64       15.4630 ms    160.128 MMAC    8027 w  PW-DW-DW-PW-PW     
+  16-16-48-64-64       16.1116 ms    171.187 MMAC    9563 w  PW-DW-DW-PW-PW     
+  16-48-64-64          16.2543 ms    187.546 MMAC    9163 w  PW-DW-DW-PW        
+  16-48-64-32-64       16.6503 ms    191.693 MMAC    9451 w  PW-DW-DW-PW-PW     
+  16-16-64-32-64-64    17.1130 ms    195.840 MMAC   11275 w  PW-DW-PW-PW-PW-PW  
+  16-32-48-64-64       17.2990 ms    199.066 MMAC   10731 w  PW-DW-DW-PW-PW     
+  16-32-64-32-48-64    17.5510 ms    203.213 MMAC   11019 w  PW-DW-DW-PW-PW-PW  
+  16-48-64-32-32-64    17.6223 ms    210.586 MMAC   10763 w  PW-DW-DW-PW-PW-PW  
+  16-64-64-64          17.6447 ms    219.110 MMAC   10587 w  PW-PW-DW-PW        INFEASIBLE (b3 G*Cin=2560)
+  16-32-64-64-64       17.8750 ms    223.258 MMAC   12411 w  PW-DW-DW-PW-PW     
+  16-32-64-32-64-64    18.2710 ms    227.405 MMAC   12699 w  PW-DW-DW-PW-PW-PW  
+  16-48-64-32-48-64    18.7383 ms    234.778 MMAC   12443 w  PW-DW-DW-PW-PW-PW  
+  16-16-48-64-64-64    18.9196 ms    238.464 MMAC   14235 w  PW-DW-DW-PW-PW-PW  
+  16-64-64-32-32-64    19.0127 ms    242.150 MMAC   12187 w  PW-PW-DW-PW-PW-PW  INFEASIBLE (b3 G*Cin=2560)
+  16-48-64-64-64       19.0623 ms    254.822 MMAC   13835 w  PW-DW-DW-PW-PW     
+  16-48-64-32-64-64    19.4583 ms    258.970 MMAC   14123 w  PW-DW-DW-PW-PW-PW  
+  16-32-48-64-64-64    20.1070 ms    266.342 MMAC   15403 w  PW-DW-DW-PW-PW-PW  
+  16-64-64-64-64       20.4527 ms    286.387 MMAC   15259 w  PW-PW-DW-PW-PW     INFEASIBLE (b3 G*Cin=2560)
+  16-32-64-64-64-64    20.6830 ms    290.534 MMAC   17083 w  PW-DW-DW-PW-PW-PW  
+  16-48-48-64-64-64    21.2943 ms    294.221 MMAC   16571 w  PW-DW-DW-PW-PW-PW  
+  16-48-64-64-64-64    21.8703 ms    322.099 MMAC   18507 w  PW-DW-DW-PW-PW-PW  
+  16-64-64-64-64-64    23.2607 ms    353.664 MMAC   19931 w  PW-PW-DW-PW-PW-PW  INFEASIBLE (b3 G*Cin=2560)
+  16-48-64 IS on the MMAC frontier
+  16-32-32-32-64-64 is NOT on the MMAC frontier; 9 sequences are as fast and larger, e.g. 16-64-64-64 (17.6447 ms, 219.110 MMAC)
+
+frontier (weights): 27 points
+  16-16-64             11.1010 ms     57.139 MMAC    1643 w  PW-DW-PW           
+  16-32-64             12.2590 ms     88.704 MMAC    3067 w  PW-DW-DW           
+  16-16-32-64          12.7276 ms     83.405 MMAC    3467 w  PW-DW-DW-PW        
+  16-16-48-64          13.3036 ms    103.910 MMAC    4891 w  PW-DW-DW-PW        
+  16-16-64-64          13.9090 ms    124.416 MMAC    6315 w  PW-DW-PW-PW        
+  16-16-64-32-64       14.3050 ms    128.563 MMAC    6603 w  PW-DW-PW-PW-PW     
+  16-16-48-32-32-64    14.9596 ms    134.323 MMAC    7003 w  PW-DW-DW-PW-PW-PW  
+  16-32-64-64          15.0670 ms    155.981 MMAC    7739 w  PW-DW-DW-PW        
+  16-16-64-32-32-64    15.2770 ms    147.456 MMAC    7915 w  PW-DW-PW-PW-PW-PW  
+  16-32-64-32-64       15.4630 ms    160.128 MMAC    8027 w  PW-DW-DW-PW-PW     
+  16-16-32-64-64       15.5356 ms    150.682 MMAC    8139 w  PW-DW-DW-PW-PW     
+  16-16-32-64-32-64    15.9316 ms    154.829 MMAC    8427 w  PW-DW-DW-PW-PW-PW  
+  16-16-64-48-64       15.9970 ms    160.128 MMAC    8795 w  PW-DW-PW-PW-PW     
+  16-16-48-64-64       16.1116 ms    171.187 MMAC    9563 w  PW-DW-DW-PW-PW     
+  16-16-64-32-48-64    16.3930 ms    171.648 MMAC    9595 w  PW-DW-PW-PW-PW-PW  
+  16-16-48-64-32-64    16.5076 ms    175.334 MMAC    9851 w  PW-DW-DW-PW-PW-PW  
+  16-16-64-64-64       16.7170 ms    191.693 MMAC   10987 w  PW-DW-PW-PW-PW     
+  16-16-64-32-64-64    17.1130 ms    195.840 MMAC   11275 w  PW-DW-PW-PW-PW-PW  
+  16-32-64-64-64       17.8750 ms    223.258 MMAC   12411 w  PW-DW-DW-PW-PW     
+  16-32-64-32-64-64    18.2710 ms    227.405 MMAC   12699 w  PW-DW-DW-PW-PW-PW  
+  16-16-32-64-64-64    18.3436 ms    217.958 MMAC   12811 w  PW-DW-DW-PW-PW-PW  
+  16-16-64-48-64-64    18.8050 ms    227.405 MMAC   13467 w  PW-DW-PW-PW-PW-PW  
+  16-16-48-64-64-64    18.9196 ms    238.464 MMAC   14235 w  PW-DW-DW-PW-PW-PW  
+  16-16-64-64-64-64    19.5250 ms    258.970 MMAC   15659 w  PW-DW-PW-PW-PW-PW  
+  16-32-64-64-64-64    20.6830 ms    290.534 MMAC   17083 w  PW-DW-DW-PW-PW-PW  
+  16-48-64-64-64-64    21.8703 ms    322.099 MMAC   18507 w  PW-DW-DW-PW-PW-PW  
+  16-64-64-64-64-64    23.2607 ms    353.664 MMAC   19931 w  PW-PW-DW-PW-PW-PW  INFEASIBLE (b3 G*Cin=2560)
+  16-48-64 is NOT on the weights frontier; 1 sequences are as fast and larger, e.g. 16-16-48-64 (13.3036 ms, 4891 weights)
+  16-32-32-32-64-64 is NOT on the weights frontier; 12 sequences are as fast and larger, e.g. 16-16-64-32-64-64 (17.1130 ms, 11275 weights)
+
+latency spread at similar MMAC (window +/-5% around the reference):
+  around 16-48-64           (120.3 MMAC): n=18  latency 13.446 .. 16.182 ms (x1.20)  fastest 16-48-64, slowest 16-48-16-32-16-64
+  around 16-32-32-32-64-64  (193.8 MMAC): n=48  latency 16.254 .. 19.409 ms (x1.19)  fastest 16-48-64-64, slowest 16-64-16-16-64-64
+  10 equal-width MMAC bins:
+       57.1-   86.8 MMAC  n=9    latency 11.101 .. 13.808 ms  (x1.24)
+       86.8-  116.4 MMAC  n=33   latency 12.259 .. 15.750 ms  (x1.28)
+      116.4-  146.1 MMAC  n=55   latency 13.446 .. 17.573 ms  (x1.31)
+      146.1-  175.7 MMAC  n=75   latency 14.837 .. 18.689 ms  (x1.26)
+      175.7-  205.4 MMAC  n=63   latency 16.254 .. 19.409 ms  (x1.19)
+      205.4-  235.1 MMAC  n=50   latency 17.622 .. 20.957 ms  (x1.19)
+      235.1-  264.7 MMAC  n=31   latency 18.920 .. 21.677 ms  (x1.15)
+      264.7-  294.4 MMAC  n=19   latency 20.107 .. 22.109 ms  (x1.10)
+      294.4-  324.0 MMAC  n=4    latency 21.870 .. 22.685 ms  (x1.04)
+
+Spearman rho(MMAC, T_HW)    = +0.9520  (p = 6.67e-176, n = 340)
+Spearman rho(weights, T_HW) = +0.8860  (p = 7.62e-115, n = 340)
+bottleneck patterns: PW-DW-DW-PW-PW-PW x176, PW-PW-DW-PW-PW-PW x64, PW-DW-DW-PW-PW x44, PW-PW-DW-PW-PW x16, PW-DW-PW-PW-PW-PW x16, PW-DW-DW-PW x11, PW-DW-PW-PW-PW x4, PW-PW-DW-PW x4
+
+==============================================================================
+RUN B: 1360 sequences (255 feasible on the current bitstream)
+==============================================================================
+latency range 11.1010 .. 51.4934 ms;  MMAC range 57.139 .. 588.672
+
+16-32-32-32-64-64: 17.6950 ms, 193.766 MMAC, 10363 weights, PW-DW-DW-PW-PW-PW
+  latency: 189 of 1360 sequences are faster, 3 tie -> rank 190; faster than 85.8% of the space
+  MMAC   : 1008 of 1360 have more MACs -> above 25.3% of the space
+
+16-48-64: 13.4463 ms, 120.269 MMAC, 4491 weights, PW-DW-DW
+  latency: 10 of 1360 sequences are faster, 0 tie -> rank 11; faster than 99.2% of the space
+  MMAC   : 1309 of 1360 have more MACs -> above 3.7% of the space
+
+frontier (MMAC): 47 points
+  16-16-64             11.1010 ms     57.139 MMAC    1643 w  PW-DW-PW           
+  16-32-64             12.2590 ms     88.704 MMAC    3067 w  PW-DW-DW           
+  16-16-48-64          13.3036 ms    103.910 MMAC    4891 w  PW-DW-DW-PW        
+  16-48-64             13.4463 ms    120.269 MMAC    4491 w  PW-DW-DW           
+  16-16-64-64          13.9090 ms    124.416 MMAC    6315 w  PW-DW-PW-PW        
+  16-16-64-32-64       14.3050 ms    128.563 MMAC    6603 w  PW-DW-PW-PW-PW     
+  16-32-48-64          14.4910 ms    131.789 MMAC    6059 w  PW-DW-DW-PW        
+  16-64-64             14.8367 ms    151.834 MMAC    5915 w  PW-PW-DW           INFEASIBLE (b3 G*Cin=2560)
+  16-32-64-64          15.0670 ms    155.981 MMAC    7739 w  PW-DW-DW-PW        
+  16-32-64-32-64       15.4630 ms    160.128 MMAC    8027 w  PW-DW-DW-PW-PW     
+  16-16-48-64-64       16.1116 ms    171.187 MMAC    9563 w  PW-DW-DW-PW-PW     
+  16-48-64-64          16.2543 ms    187.546 MMAC    9163 w  PW-DW-DW-PW        
+  16-48-64-32-64       16.6503 ms    191.693 MMAC    9451 w  PW-DW-DW-PW-PW     
+  16-16-64-32-64-64    17.1130 ms    195.840 MMAC   11275 w  PW-DW-PW-PW-PW-PW  
+  16-32-48-64-64       17.2990 ms    199.066 MMAC   10731 w  PW-DW-DW-PW-PW     
+  16-32-64-32-48-64    17.5510 ms    203.213 MMAC   11019 w  PW-DW-DW-PW-PW-PW  
+  16-48-64-32-32-64    17.6223 ms    210.586 MMAC   10763 w  PW-DW-DW-PW-PW-PW  
+  16-64-64-64          17.6447 ms    219.110 MMAC   10587 w  PW-PW-DW-PW        INFEASIBLE (b3 G*Cin=2560)
+  16-32-64-64-64       17.8750 ms    223.258 MMAC   12411 w  PW-DW-DW-PW-PW     
+  16-32-64-32-64-64    18.2710 ms    227.405 MMAC   12699 w  PW-DW-DW-PW-PW-PW  
+  16-48-64-32-48-64    18.7383 ms    234.778 MMAC   12443 w  PW-DW-DW-PW-PW-PW  
+  16-16-48-64-64-64    18.9196 ms    238.464 MMAC   14235 w  PW-DW-DW-PW-PW-PW  
+  16-64-64-32-32-64    19.0127 ms    242.150 MMAC   12187 w  PW-PW-DW-PW-PW-PW  INFEASIBLE (b3 G*Cin=2560)
+  16-48-64-64-64       19.0623 ms    254.822 MMAC   13835 w  PW-DW-DW-PW-PW     
+  16-48-64-32-64-64    19.4583 ms    258.970 MMAC   14123 w  PW-DW-DW-PW-PW-PW  
+  16-32-48-64-64-64    20.1070 ms    266.342 MMAC   15403 w  PW-DW-DW-PW-PW-PW  
+  16-64-64-64-64       20.4527 ms    286.387 MMAC   15259 w  PW-PW-DW-PW-PW     INFEASIBLE (b3 G*Cin=2560)
+  16-32-64-64-64-64    20.6830 ms    290.534 MMAC   17083 w  PW-DW-DW-PW-PW-PW  
+  16-48-48-64-64-64    21.2943 ms    294.221 MMAC   16571 w  PW-DW-DW-PW-PW-PW  
+  16-48-64-64-64-64    21.8703 ms    322.099 MMAC   18507 w  PW-DW-DW-PW-PW-PW  
+  16-64-64-64-64-64    23.2607 ms    353.664 MMAC   19931 w  PW-PW-DW-PW-PW-PW  INFEASIBLE (b3 G*Cin=2560)
+  32-64-64-64-64       29.5362 ms    364.723 MMAC   16475 w  PW-DW-DW-PW-PW     INFEASIBLE (b2 G*Cin=2560;b3 G*Cin=2560)
+  32-64-64-32-64-64    29.9322 ms    368.870 MMAC   16763 w  PW-DW-DW-PW-PW-PW  INFEASIBLE (b2 G*Cin=2560;b3 G*Cin=2560)
+  32-64-64-48-48-64    30.9042 ms    372.557 MMAC   17019 w  PW-DW-DW-PW-PW-PW  INFEASIBLE (b2 G*Cin=2560;b3 G*Cin=2560)
+  32-48-64-64-64-64    31.1569 ms    385.690 MMAC   19467 w  PW-DW-DW-PW-PW-PW  INFEASIBLE (b2 G*Cin=2560)
+  32-64-64-48-64-64    31.6242 ms    400.435 MMAC   18955 w  PW-DW-DW-PW-PW-PW  INFEASIBLE (b2 G*Cin=2560;b3 G*Cin=2560)
+  32-64-64-64-64-64    32.3442 ms    432.000 MMAC   21147 w  PW-DW-DW-PW-PW-PW  INFEASIBLE (b2 G*Cin=2560;b3 G*Cin=2560)
+  48-64-64-64-64       39.3988 ms    443.059 MMAC   17691 w  PW-DW-DW-PW-PW     INFEASIBLE (b2 G*Cin=3840;b3 G*Cin=2560)
+  48-64-64-32-64-64    39.7948 ms    447.206 MMAC   17979 w  PW-DW-DW-PW-PW-PW  INFEASIBLE (b2 G*Cin=3840;b3 G*Cin=2560)
+  48-64-64-48-48-64    40.7668 ms    450.893 MMAC   18235 w  PW-DW-DW-PW-PW-PW  INFEASIBLE (b2 G*Cin=3840;b3 G*Cin=2560)
+  48-64-64-48-64-64    41.4868 ms    478.771 MMAC   20171 w  PW-DW-DW-PW-PW-PW  INFEASIBLE (b2 G*Cin=3840;b3 G*Cin=2560)
+  48-64-64-64-64-64    42.2068 ms    510.336 MMAC   22363 w  PW-DW-DW-PW-PW-PW  INFEASIBLE (b2 G*Cin=3840;b3 G*Cin=2560)
+  64-64-64-64-64       48.6854 ms    521.395 MMAC   18907 w  PW-DW-DW-PW-PW     INFEASIBLE (b2 G*Cin=5120;b3 G*Cin=2560)
+  64-64-64-32-64-64    49.0814 ms    525.542 MMAC   19195 w  PW-DW-DW-PW-PW-PW  INFEASIBLE (b2 G*Cin=5120;b3 G*Cin=2560)
+  64-64-64-48-48-64    50.0534 ms    529.229 MMAC   19451 w  PW-DW-DW-PW-PW-PW  INFEASIBLE (b2 G*Cin=5120;b3 G*Cin=2560)
+  64-64-64-48-64-64    50.7734 ms    557.107 MMAC   21387 w  PW-DW-DW-PW-PW-PW  INFEASIBLE (b2 G*Cin=5120;b3 G*Cin=2560)
+  64-64-64-64-64-64    51.4934 ms    588.672 MMAC   23579 w  PW-DW-DW-PW-PW-PW  INFEASIBLE (b2 G*Cin=5120;b3 G*Cin=2560)
+  16-48-64 IS on the MMAC frontier
+  16-32-32-32-64-64 is NOT on the MMAC frontier; 9 sequences are as fast and larger, e.g. 16-64-64-64 (17.6447 ms, 219.110 MMAC)
+
+frontier (weights): 30 points
+  16-16-64             11.1010 ms     57.139 MMAC    1643 w  PW-DW-PW           
+  16-32-64             12.2590 ms     88.704 MMAC    3067 w  PW-DW-DW           
+  16-16-32-64          12.7276 ms     83.405 MMAC    3467 w  PW-DW-DW-PW        
+  16-16-48-64          13.3036 ms    103.910 MMAC    4891 w  PW-DW-DW-PW        
+  16-16-64-64          13.9090 ms    124.416 MMAC    6315 w  PW-DW-PW-PW        
+  16-16-64-32-64       14.3050 ms    128.563 MMAC    6603 w  PW-DW-PW-PW-PW     
+  16-16-48-32-32-64    14.9596 ms    134.323 MMAC    7003 w  PW-DW-DW-PW-PW-PW  
+  16-32-64-64          15.0670 ms    155.981 MMAC    7739 w  PW-DW-DW-PW        
+  16-16-64-32-32-64    15.2770 ms    147.456 MMAC    7915 w  PW-DW-PW-PW-PW-PW  
+  16-32-64-32-64       15.4630 ms    160.128 MMAC    8027 w  PW-DW-DW-PW-PW     
+  16-16-32-64-64       15.5356 ms    150.682 MMAC    8139 w  PW-DW-DW-PW-PW     
+  16-16-32-64-32-64    15.9316 ms    154.829 MMAC    8427 w  PW-DW-DW-PW-PW-PW  
+  16-16-64-48-64       15.9970 ms    160.128 MMAC    8795 w  PW-DW-PW-PW-PW     
+  16-16-48-64-64       16.1116 ms    171.187 MMAC    9563 w  PW-DW-DW-PW-PW     
+  16-16-64-32-48-64    16.3930 ms    171.648 MMAC    9595 w  PW-DW-PW-PW-PW-PW  
+  16-16-48-64-32-64    16.5076 ms    175.334 MMAC    9851 w  PW-DW-DW-PW-PW-PW  
+  16-16-64-64-64       16.7170 ms    191.693 MMAC   10987 w  PW-DW-PW-PW-PW     
+  16-16-64-32-64-64    17.1130 ms    195.840 MMAC   11275 w  PW-DW-PW-PW-PW-PW  
+  16-32-64-64-64       17.8750 ms    223.258 MMAC   12411 w  PW-DW-DW-PW-PW     
+  16-32-64-32-64-64    18.2710 ms    227.405 MMAC   12699 w  PW-DW-DW-PW-PW-PW  
+  16-16-32-64-64-64    18.3436 ms    217.958 MMAC   12811 w  PW-DW-DW-PW-PW-PW  
+  16-16-64-48-64-64    18.8050 ms    227.405 MMAC   13467 w  PW-DW-PW-PW-PW-PW  
+  16-16-48-64-64-64    18.9196 ms    238.464 MMAC   14235 w  PW-DW-DW-PW-PW-PW  
+  16-16-64-64-64-64    19.5250 ms    258.970 MMAC   15659 w  PW-DW-PW-PW-PW-PW  
+  16-32-64-64-64-64    20.6830 ms    290.534 MMAC   17083 w  PW-DW-DW-PW-PW-PW  
+  16-48-64-64-64-64    21.8703 ms    322.099 MMAC   18507 w  PW-DW-DW-PW-PW-PW  
+  16-64-64-64-64-64    23.2607 ms    353.664 MMAC   19931 w  PW-PW-DW-PW-PW-PW  INFEASIBLE (b3 G*Cin=2560)
+  32-64-64-64-64-64    32.3442 ms    432.000 MMAC   21147 w  PW-DW-DW-PW-PW-PW  INFEASIBLE (b2 G*Cin=2560;b3 G*Cin=2560)
+  48-64-64-64-64-64    42.2068 ms    510.336 MMAC   22363 w  PW-DW-DW-PW-PW-PW  INFEASIBLE (b2 G*Cin=3840;b3 G*Cin=2560)
+  64-64-64-64-64-64    51.4934 ms    588.672 MMAC   23579 w  PW-DW-DW-PW-PW-PW  INFEASIBLE (b2 G*Cin=5120;b3 G*Cin=2560)
+  16-48-64 is NOT on the weights frontier; 1 sequences are as fast and larger, e.g. 16-16-48-64 (13.3036 ms, 4891 weights)
+  16-32-32-32-64-64 is NOT on the weights frontier; 12 sequences are as fast and larger, e.g. 16-16-64-32-64-64 (17.1130 ms, 11275 weights)
+
+latency spread at similar MMAC (window +/-5% around the reference):
+  around 16-48-64           (120.3 MMAC): n=24  latency 13.446 .. 30.250 ms (x2.25)  fastest 16-48-64, slowest 48-16-64
+  around 16-32-32-32-64-64  (193.8 MMAC): n=108 latency 16.254 .. 42.873 ms (x2.64)  fastest 16-48-64-64, slowest 64-16-16-48-16-64
+  10 equal-width MMAC bins:
+       57.1-  110.3 MMAC  n=39   latency 11.101 .. 22.662 ms  (x2.04)
+      110.3-  163.4 MMAC  n=160  latency 13.446 .. 39.537 ms  (x2.94)
+      163.4-  216.6 MMAC  n=275  latency 16.112 .. 43.359 ms  (x2.69)
+      216.6-  269.8 MMAC  n=297  latency 17.645 .. 45.627 ms  (x2.59)
+      269.8-  322.9 MMAC  n=235  latency 20.453 .. 46.779 ms  (x2.29)
+      322.9-  376.1 MMAC  n=161  latency 23.261 .. 47.961 ms  (x2.06)
+      376.1-  429.2 MMAC  n=107  latency 31.157 .. 48.543 ms  (x1.56)
+      429.2-  482.4 MMAC  n=60   latency 32.344 .. 49.586 ms  (x1.53)
+      482.4-  535.5 MMAC  n=22   latency 42.207 .. 50.341 ms  (x1.19)
+      535.5-  588.7 MMAC  n=4    latency 50.773 .. 51.493 ms  (x1.01)
+
+Spearman rho(MMAC, T_HW)    = +0.8089  (p = 1.37e-315, n = 1360)
+Spearman rho(weights, T_HW) = +0.4612  (p = 1.44e-72, n = 1360)
+bottleneck patterns: PW-DW-DW-PW-PW-PW x896, PW-DW-DW-PW-PW x224, PW-DW-PW-PW-PW-PW x64, PW-PW-DW-PW-PW-PW x64, PW-DW-DW-PW x56, PW-DW-PW-PW-PW x16, PW-PW-DW-PW-PW x16, PW-DW-DW x11

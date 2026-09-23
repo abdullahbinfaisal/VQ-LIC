@@ -1,0 +1,149 @@
+========================================
+ Real DW/PW full-network runner
+========================================
+[MODE] OOS service-model sweep.
+[MODE] NO VQ, NO range coding, NO frame rate, NO power.
+[MODE] Set RUN_OOS_VALIDATION 0 for the edge-encoder run.
+
+================================================================
+ OUT-OF-SAMPLE SERVICE-MODEL VALIDATION
+ one bitstream, one binary, 6 candidates, 3 warm + 80 measured
+ boundary: PL/DMA service window per block (t_end - t_hw0)
+ excluded: pack, coefficient programming, cache, VQ, range coding,
+           image load, HWC->CHW
+================================================================
+[OOS] synthetic planar input built once and reused for all frames
+
+#BLOCKCSV,role,candidate,nblocks,block,cout,hout,wout,groups,frames,mean_cyc,mean_ms,min_ms,max_ms,sd_ms
+#CANDCSV,role,candidate,nblocks,frames,mean_ms,min_ms,max_ms,sd_ms,sum_of_blocks_ms
+
+---------------- [CTRL-A] candidate 1/6 ----------------
+[SCHED] selected [0] 16-48-64 : 3 pairs, max G*Cin = 1920 / 2048
+[EDGE] gm_in[0] @ 0x33000000 mapped NORM_NONCACHE across 4 MB
+[EDGE] gm_in[1] @ 0x33800000 mapped NORM_NONCACHE across 4 MB
+[EDGE] schedule=[0] 16-48-64, 3 pairs, latent in chainA @ 0x28000000
+[EDGE] max G*C over DW layers = 1920 (MAX_CG_PRODUCT must be >= this)
+[OOS] CTRL-A  16-48-64  (3 blocks)
+[OOS] blk Cout    HxW    groups     mean ms    min ms    max ms     sd ms
+[OOS]   1   16  360x640    28800      5.1988    5.1987    5.1992   0.00008
+#BLOCKCSV,CTRL-A,16-48-64,3,1,16,360,640,28800,80,519884.8,5.198848,5.198721,5.199168,0.000085
+[OOS]   2   48  180x320     7200      4.7028    4.7027    4.7029   0.00003
+#BLOCKCSV,CTRL-A,16-48-64,3,2,48,180,320,7200,80,470276.0,4.702760,4.702704,4.702860,0.000033
+[OOS]   3   64   90x160     1800      3.5799    3.5798    3.5800   0.00004
+#BLOCKCSV,CTRL-A,16-48-64,3,3,64,90,160,1800,80,357987.9,3.579879,3.579795,3.579969,0.000038
+[OOS] TOTAL T_svc = 13.4815 ms   (min 13.4813  max 13.4818  sd 0.00010)
+#CANDCSV,CTRL-A,16-48-64,3,80,13.481488,13.481292,13.481841,0.000100,13.481488
+
+---------------- [CTRL-B] candidate 2/6 ----------------
+[SCHED] selected [1] 16-32-32-32-64-64 : 6 pairs, max G*Cin = 1280 / 2048
+[EDGE] gm_in[0] @ 0x33000000 mapped NORM_NONCACHE across 4 MB
+[EDGE] gm_in[1] @ 0x33800000 mapped NORM_NONCACHE across 4 MB
+[EDGE] schedule=[1] 16-32-32-32-64-64, 6 pairs, latent in chainB @ 0x39000000
+[EDGE] max G*C over DW layers = 1280 (MAX_CG_PRODUCT must be >= this)
+[OOS] CTRL-B  16-32-32-32-64-64  (6 blocks)
+[OOS] blk Cout    HxW    groups     mean ms    min ms    max ms     sd ms
+[OOS]   1   16  360x640    28800      5.1989    5.1987    5.1992   0.00011
+#BLOCKCSV,CTRL-B,16-32-32-32-64-64,6,1,16,360,640,28800,80,519886.8,5.198868,5.198697,5.199228,0.000109
+[OOS]   2   32  180x320     7200      4.7025    4.7024    4.7028   0.00009
+#BLOCKCSV,CTRL-B,16-32-32-32-64-64,6,2,32,180,320,7200,80,470251.8,4.702518,4.702422,4.702800,0.000090
+[OOS]   3   32   90x160     1800      2.3916    2.3915    2.3919   0.00007
+#BLOCKCSV,CTRL-B,16-32-32-32-64-64,6,3,32,90,160,1800,80,239161.6,2.391616,2.391546,2.391867,0.000074
+[OOS]   4   32   90x160     1800      1.0067    1.0065    1.0068   0.00008
+#BLOCKCSV,CTRL-B,16-32-32-32-64-64,6,4,32,90,160,1800,80,100670.8,1.006708,1.006485,1.006845,0.000084
+[OOS]   5   64   90x160     1800      1.7087    1.7085    1.7088   0.00007
+#BLOCKCSV,CTRL-B,16-32-32-32-64-64,6,5,64,90,160,1800,80,170870.1,1.708701,1.708509,1.708848,0.000070
+[OOS]   6   64   90x160     1800      2.8681    2.8679    2.8683   0.00009
+#BLOCKCSV,CTRL-B,16-32-32-32-64-64,6,6,64,90,160,1800,80,286810.2,2.868102,2.867856,2.868297,0.000090
+[OOS] TOTAL T_svc = 17.8765 ms   (min 17.8761  max 17.8769  sd 0.00020)
+#CANDCSV,CTRL-B,16-32-32-32-64-64,6,80,17.876513,17.876111,17.876936,0.000201,17.876513
+
+---------------- [OOS-A] candidate 3/6 ----------------
+[SCHED] selected [2] 16-16-16-16-32-64 : 6 pairs, max G*Cin = 1280 / 2048
+[EDGE] gm_in[0] @ 0x33000000 mapped NORM_NONCACHE across 4 MB
+[EDGE] gm_in[1] @ 0x33800000 mapped NORM_NONCACHE across 4 MB
+[EDGE] schedule=[2] 16-16-16-16-32-64, 6 pairs, latent in chainB @ 0x39000000
+[EDGE] max G*C over DW layers = 1280 (MAX_CG_PRODUCT must be >= this)
+[OOS] OOS-A  16-16-16-16-32-64  (6 blocks)
+[OOS] blk Cout    HxW    groups     mean ms    min ms    max ms     sd ms
+[OOS]   1   16  360x640    28800      5.1988    5.1987    5.1991   0.00009
+#BLOCKCSV,OOS-A,16-16-16-16-32-64,6,1,16,360,640,28800,80,519883.3,5.198833,5.198697,5.199147,0.000086
+[OOS]   2   16  180x320     7200      4.7025    4.7024    4.7027   0.00004
+#BLOCKCSV,OOS-A,16-16-16-16-32-64,6,2,16,180,320,7200,80,470247.3,4.702473,4.702410,4.702716,0.000042
+[OOS]   3   16   90x160     1800      1.2029    1.2028    1.2029   0.00002
+#BLOCKCSV,OOS-A,16-16-16-16-32-64,6,3,16,90,160,1800,80,120286.0,1.202860,1.202820,1.202913,0.000021
+[OOS]   4   16   90x160     1800      0.5698    0.5698    0.5699   0.00002
+#BLOCKCSV,OOS-A,16-16-16-16-32-64,6,4,16,90,160,1800,80,56984.8,0.569848,0.569805,0.569883,0.000018
+[OOS]   5   32   90x160     1800      0.7150    0.7150    0.7151   0.00002
+#BLOCKCSV,OOS-A,16-16-16-16-32-64,6,5,32,90,160,1800,80,71502.3,0.715023,0.714981,0.715077,0.000016
+[OOS]   6   64   90x160     1800      1.7088    1.7087    1.7089   0.00004
+#BLOCKCSV,OOS-A,16-16-16-16-32-64,6,6,64,90,160,1800,80,170876.3,1.708763,1.708683,1.708854,0.000042
+[OOS] TOTAL T_svc = 14.0978 ms   (min 14.0976  max 14.0981  sd 0.00010)
+#CANDCSV,OOS-A,16-16-16-16-32-64,6,80,14.097799,14.097633,14.098143,0.000104,14.097799
+
+---------------- [OOS-B] candidate 4/6 ----------------
+[SCHED] selected [3] 16-16-48-32-64 : 5 pairs, max G*Cin = 1280 / 2048
+[EDGE] gm_in[0] @ 0x33000000 mapped NORM_NONCACHE across 4 MB
+[EDGE] gm_in[1] @ 0x33800000 mapped NORM_NONCACHE across 4 MB
+[EDGE] schedule=[3] 16-16-48-32-64, 5 pairs, latent in chainA @ 0x28000000
+[EDGE] max G*C over DW layers = 1280 (MAX_CG_PRODUCT must be >= this)
+[OOS] OOS-B  16-16-48-32-64  (5 blocks)
+[OOS] blk Cout    HxW    groups     mean ms    min ms    max ms     sd ms
+[OOS]   1   16  360x640    28800      5.1988    5.1987    5.1990   0.00005
+#BLOCKCSV,OOS-B,16-16-48-32-64,5,1,16,360,640,28800,80,519884.0,5.198840,5.198679,5.198979,0.000054
+[OOS]   2   16  180x320     7200      4.7025    4.7024    4.7028   0.00004
+#BLOCKCSV,OOS-B,16-16-48-32-64,5,2,16,180,320,7200,80,470249.1,4.702491,4.702449,4.702770,0.000039
+[OOS]   3   48   90x160     1800      1.2032    1.2031    1.2032   0.00002
+#BLOCKCSV,OOS-B,16-16-48-32-64,5,3,48,90,160,1800,80,120315.4,1.203154,1.203099,1.203207,0.000022
+[OOS]   4   32   90x160     1800      1.2984    1.2984    1.2986   0.00004
+#BLOCKCSV,OOS-B,16-16-48-32-64,5,4,32,90,160,1800,80,129842.5,1.298425,1.298355,1.298562,0.000043
+[OOS]   5   64   90x160     1800      1.7087    1.7087    1.7089   0.00003
+#BLOCKCSV,OOS-B,16-16-48-32-64,5,5,64,90,160,1800,80,170874.0,1.708740,1.708695,1.708854,0.000029
+[OOS] TOTAL T_svc = 14.1116 ms   (min 14.1115  max 14.1120  sd 0.00009)
+#CANDCSV,OOS-B,16-16-48-32-64,5,80,14.111650,14.111454,14.111988,0.000089,14.111650
+
+---------------- [OOS-C] candidate 5/6 ----------------
+[SCHED] selected [4] 16-16-64-64 : 4 pairs, max G*Cin = 1280 / 2048
+[EDGE] gm_in[0] @ 0x33000000 mapped NORM_NONCACHE across 4 MB
+[EDGE] gm_in[1] @ 0x33800000 mapped NORM_NONCACHE across 4 MB
+[EDGE] schedule=[4] 16-16-64-64, 4 pairs, latent in chainB @ 0x39000000
+[EDGE] max G*C over DW layers = 1280 (MAX_CG_PRODUCT must be >= this)
+[OOS] OOS-C  16-16-64-64  (4 blocks)
+[OOS] blk Cout    HxW    groups     mean ms    min ms    max ms     sd ms
+[OOS]   1   16  360x640    28800      5.1988    5.1987    5.1991   0.00005
+#BLOCKCSV,OOS-C,16-16-64-64,4,1,16,360,640,28800,80,519882.9,5.198829,5.198697,5.199060,0.000050
+[OOS]   2   16  180x320     7200      4.7025    4.7024    4.7025   0.00003
+#BLOCKCSV,OOS-C,16-16-64-64,4,2,16,180,320,7200,80,470246.3,4.702463,4.702401,4.702545,0.000028
+[OOS]   3   64   90x160     1800      1.2405    1.2404    1.2408   0.00006
+#BLOCKCSV,OOS-C,16-16-64-64,4,3,64,90,160,1800,80,124046.5,1.240465,1.240404,1.240755,0.000060
+[OOS]   4   64   90x160     1800      2.8681    2.8679    2.8683   0.00009
+#BLOCKCSV,OOS-C,16-16-64-64,4,4,64,90,160,1800,80,286813.5,2.868135,2.867880,2.868291,0.000089
+[OOS] TOTAL T_svc = 14.0099 ms   (min 14.0096  max 14.0102  sd 0.00011)
+#CANDCSV,OOS-C,16-16-64-64,4,80,14.009892,14.009607,14.010165,0.000114,14.009892
+
+---------------- [OOS-D] candidate 6/6 ----------------
+[SCHED] selected [5] 16-32-48-64-32-64 : 6 pairs, max G*Cin = 1280 / 2048
+[EDGE] gm_in[0] @ 0x33000000 mapped NORM_NONCACHE across 4 MB
+[EDGE] gm_in[1] @ 0x33800000 mapped NORM_NONCACHE across 4 MB
+[EDGE] schedule=[5] 16-32-48-64-32-64, 6 pairs, latent in chainB @ 0x39000000
+[EDGE] max G*C over DW layers = 1280 (MAX_CG_PRODUCT must be >= this)
+[OOS] OOS-D  16-32-48-64-32-64  (6 blocks)
+[OOS] blk Cout    HxW    groups     mean ms    min ms    max ms     sd ms
+[OOS]   1   16  360x640    28800      5.1988    5.1987    5.1990   0.00006
+#BLOCKCSV,OOS-D,16-32-48-64-32-64,6,1,16,360,640,28800,80,519883.1,5.198831,5.198664,5.198988,0.000058
+[OOS]   2   32  180x320     7200      4.7025    4.7024    4.7028   0.00006
+#BLOCKCSV,OOS-D,16-32-48-64-32-64,6,2,32,180,320,7200,80,470249.4,4.702494,4.702422,4.702806,0.000056
+[OOS]   3   48   90x160     1800      2.3906    2.3905    2.3908   0.00012
+#BLOCKCSV,OOS-D,16-32-48-64-32-64,6,3,48,90,160,1800,80,239057.1,2.390571,2.390469,2.390826,0.000118
+[OOS]   4   64   90x160     1800      2.2883    2.2882    2.2886   0.00005
+#BLOCKCSV,OOS-D,16-32-48-64-32-64,6,4,64,90,160,1800,80,228828.9,2.288289,2.288193,2.288559,0.000053
+[OOS]   5   32   90x160     1800      1.5899    1.5899    1.5901   0.00004
+#BLOCKCSV,OOS-D,16-32-48-64-32-64,6,5,32,90,160,1800,80,158994.2,1.589942,1.589856,1.590108,0.000042
+[OOS]   6   64   90x160     1800      1.7087    1.7087    1.7088   0.00003
+#BLOCKCSV,OOS-D,16-32-48-64-32-64,6,6,64,90,160,1800,80,170873.5,1.708735,1.708680,1.708833,0.000027
+[OOS] TOTAL T_svc = 17.8789 ms   (min 17.8786  max 17.8793  sd 0.00016)
+#CANDCSV,OOS-D,16-32-48-64-32-64,6,80,17.878861,17.878580,17.879255,0.000156,17.878861
+[SCHED] selected [0] 16-48-64 : 3 pairs, max G*Cin = 1920 / 2048
+
+[OOS] sweep complete; schedule restored to [0] 16-48-64
+[OOS] copy every #BLOCKCSV / #CANDCSV line into results/ for analysis
+main() returning 0

@@ -1,0 +1,181 @@
+/* ============================================================================
+ * gen_vq_vectors.c -- emit $readmemh vectors for tb_pw_vq.sv from the SAME
+ * golden model the firmware will use, so the RTL is checked against
+ * vqpw_encode_frame() and not against a second re-derivation.
+ *
+ *   gcc -O2 -I../src -o gen_vq_vectors gen_vq_vectors.c ../src/vq_pw.c
+ *   ./gen_vq_vectors <ngroups> <scenario> <outdir>
+ *
+ * scenario: 0 = random, 1 = tie storm (codewords duplicated in pairs, so every
+ *           search has co-minimal candidates and the lowest index must win),
+ *           2 = INT8 extremes (latent and codebook at the corners),
+ *           3 = LOW-ENTROPY LATENT. Uniform random activations are the least
+ *           tie-prone data there is: 64 dimensions of independent noise put
+ *           the best and second-best codeword far apart, so an argmin that is
+ *           slightly wrong still lands on the right answer. A real analysis
+ *           map is nothing like that -- it is quantised, spatially smooth and
+ *           uses a small part of the INT8 range, so near-ties are common and
+ *           a one-LSB disagreement in the score changes the winner. This
+ *           draws the latent from a narrow set with spatial correlation,
+ *           which is the regime the board actually runs in.
+ *           4 = SATURATED. Every latent byte 255, so u = +127 in every
+ *           dimension. This is the exact vector the board failed on: its
+ *           [VQDIAG] reproducer printed u[m=0] = 127 x 16 and every one of the
+ *           581 mismatches was that same vector, always 7 -> 14 in m=0.
+ *
+ * Files (all hex, one value per line):
+ *   latent.hex   ngroups*64  x 64-bit stream beats, in the order the DMA
+ *                            delivers them: for each group, one beat per
+ *                            channel, lane l in byte l.
+ *   weights.hex  32*64       x 8-bit, oc-major: line (oc*64 + addr), where
+ *                            addr = w_addr_base + ic = 16*batch + ic.
+ *   norms.hex    128         x 20-bit, absolute OC order (batch*32 + oc).
+ *   expect.hex   ngroups*4   x 64-bit expected output beats: two packed
+ *                            32-bit positions per beat, low half = lower
+ *                            position (little-endian, as the S2MM writes it).
+ * ==========================================================================*/
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include "vq_pw.h"
+
+static uint32_t st = 0x2468ACEu;
+static uint32_t xs(void){ uint32_t x=st; x^=x<<13; x^=x>>17; x^=x<<5; return st=x; }
+
+static int8_t  cb[VQPW_M * VQPW_K * VQPW_DSUB];
+static int8_t  wimg[VQPW_W_BYTES];
+static int32_t nimg[VQPW_COUT_TOTAL];
+static uint8_t latent[(size_t)VQPW_NGROUPS * VQPW_DIM * VQPW_LANES];
+static uint8_t idx[VQPW_IDX_BYTES];
+
+static FILE *xopen(const char *dir, const char *name)
+{
+    char path[512];
+    snprintf(path, sizeof path, "%s/%s", dir, name);
+    FILE *f = fopen(path, "w");
+    if (!f) { perror(path); exit(1); }
+    return f;
+}
+
+int main(int argc, char **argv)
+{
+    const int ng       = (argc > 1) ? atoi(argv[1]) : 64;
+    const int scenario = (argc > 2) ? atoi(argv[2]) : 0;
+    const char *dir    = (argc > 3) ? argv[3] : ".";
+    vqpw_ctx_t ctx;
+
+    if (ng < 1 || ng > VQPW_NGROUPS) { fprintf(stderr, "bad ngroups\n"); return 1; }
+    st = 0x2468ACEu + (uint32_t)scenario * 7919u;
+
+    /* ---- codebook ---- */
+    for (int i = 0; i < VQPW_M * VQPW_K * VQPW_DSUB; i++) cb[i] = (int8_t)(xs() & 0xFF);
+    if (scenario == 1) {
+        for (int m = 0; m < VQPW_M; m++)
+            for (int k = 0; k < VQPW_K; k += 2)
+                memcpy(cb + ((size_t)m * VQPW_K + k + 1) * VQPW_DSUB,
+                       cb + ((size_t)m * VQPW_K + k)     * VQPW_DSUB, VQPW_DSUB);
+    } else if (scenario == 2) {
+        for (int i = 0; i < VQPW_M * VQPW_K * VQPW_DSUB; i++)
+            cb[i] = (int8_t)((xs() & 1) ? -128 : 127);
+    } else if (scenario == 5) {
+        /* SLOT PROBE -- the same codebook vq_pw_pl_probe_slots() loads on the
+         * board. Non-zero in dimension 0 only, a_k = -128 + 4k, which makes
+         *
+         *     score(k) = (a_k - u[0])^2 - u[0]^2
+         *
+         * so each sub-codebook is a step-4 scalar quantiser on its window's
+         * first channel and the index is a verbatim read-out of that byte.
+         * Paired with the marker latent below, the expected index NAMES the
+         * group whose beat is in the slot, so a lag shows up as an index that
+         * is low by exactly the number of groups it lags. */
+        for (int i = 0; i < VQPW_M * VQPW_K * VQPW_DSUB; i++) cb[i] = 0;
+        for (int m = 0; m < VQPW_M; m++)
+            for (int k = 0; k < VQPW_K; k++)
+                cb[((size_t)m * VQPW_K + k) * VQPW_DSUB + 0] = (int8_t)(-128 + 4 * k);
+    }
+    if (vqpw_init(&ctx, cb, 128) != 0) { fprintf(stderr, "init failed\n"); return 1; }
+    vqpw_build_weights(&ctx, wimg);
+    vqpw_build_norms(&ctx, nimg);
+
+    /* ---- latent ---- */
+    const size_t nbytes = (size_t)ng * VQPW_DIM * VQPW_LANES;
+    if (scenario == 5) {
+        /* Zero point everywhere -- those dimensions meet weight 0 and cannot
+         * reach the score -- except each window's first channel, which carries
+         * a byte that identifies the group. 4*(8 + g mod 8) keeps every marker
+         * inside the ladder at both profiles (K=16 reaches only byte 62). */
+        for (size_t i = 0; i < nbytes; i++) latent[i] = 128u;
+        for (int g = 0; g < ng; g++) {
+            const uint8_t b = (uint8_t)(4 * (8 + (g & 7)));
+            for (int m = 0; m < VQPW_M; m++)
+                for (int l = 0; l < VQPW_LANES; l++)
+                    latent[((size_t)g * VQPW_DIM + m * VQPW_DSUB) * VQPW_LANES + l] = b;
+        }
+    } else if (scenario == 4) {
+        for (size_t i = 0; i < nbytes; i++) latent[i] = 255u;
+    } else if (scenario == 3) {
+        /* Quantised and spatially smooth: a few distinct levels near the zero
+         * point, held across neighbouring positions. Produces frequent
+         * near-ties in every sub-codebook. */
+        static const uint8_t lvl[8] = {120u,124u,126u,128u,130u,132u,136u,140u};
+        for (int g = 0; g < ng; g++)
+            for (int c = 0; c < VQPW_DIM; c++) {
+                const uint8_t base = lvl[(xs() >> 3) & 7u];
+                for (int l = 0; l < VQPW_LANES; l++) {
+                    const uint8_t jitter = (uint8_t)((xs() & 1u) ? 1u : 0u);
+                    latent[((size_t)g * VQPW_DIM + c) * VQPW_LANES + l] =
+                        (uint8_t)(base + jitter);
+                }
+            }
+    } else {
+        for (size_t i = 0; i < nbytes; i++) {
+            latent[i] = (scenario == 2) ? (uint8_t)((xs() & 1) ? 255u : 0u)
+                                        : (uint8_t)(xs() & 0xFF);
+        }
+    }
+    vqpw_encode_frame(&ctx, latent, idx);   /* full-frame model; we use ng groups */
+
+    /* ---- latent.hex : stream beats ---- */
+    FILE *f = xopen(dir, "latent.hex");
+    for (int g = 0; g < ng; g++)
+        for (int c = 0; c < VQPW_DIM; c++) {
+            const uint8_t *b = latent + ((size_t)g * VQPW_DIM + c) * VQPW_LANES;
+            /* lane l in byte l -> byte 0 is the LOW byte of the 64-bit beat */
+            for (int l = VQPW_LANES - 1; l >= 0; l--) fprintf(f, "%02x", b[l]);
+            fputc('\n', f);
+        }
+    fclose(f);
+
+    /* ---- weights.hex : oc-major ---- */
+    f = xopen(dir, "weights.hex");
+    for (int oc = 0; oc < VQPW_N_OC; oc++)
+        for (int a = 0; a < VQPW_W_PER_BANK; a++)
+            fprintf(f, "%02x\n",
+                    (unsigned)(uint8_t)wimg[(size_t)oc * VQPW_W_PER_BANK + a]);
+    fclose(f);
+
+    /* ---- norms.hex : absolute OC order ---- */
+    f = xopen(dir, "norms.hex");
+    for (int i = 0; i < VQPW_COUT_TOTAL; i++)
+        fprintf(f, "%05x\n", (unsigned)(nimg[i] & 0xFFFFF));
+    fclose(f);
+
+    /* ---- expect.hex : two positions per 64-bit beat ---- */
+    f = xopen(dir, "expect.hex");
+    for (int g = 0; g < ng; g++)
+        for (int beat = 0; beat < VQPW_LANES / 2; beat++) {
+            const int p0 = g * VQPW_LANES + 2 * beat;
+            const int p1 = p0 + 1;
+            uint32_t w0 = 0, w1 = 0;
+            for (int j = 3; j >= 0; j--) {
+                w0 = (w0 << 8) | idx[(size_t)p0 * 4 + j];
+                w1 = (w1 << 8) | idx[(size_t)p1 * 4 + j];
+            }
+            fprintf(f, "%08x%08x\n", (unsigned)w1, (unsigned)w0); /* hi = p1 */
+        }
+    fclose(f);
+
+    printf("scenario %d: %d groups, %d positions -> %s\n",
+           scenario, ng, ng * VQPW_LANES, dir);
+    return 0;
+}
